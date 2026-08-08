@@ -1,0 +1,15 @@
+# 1. Ignore EVERYTHING in this directory by default
+*
+
+# 2. Track essential source files
+!*.py
+!README.md
+!.gitignore
+
+# 3. Explicit safety net: Never track secrets or virtual environments
+Tokens And APIs.txt
+env/
+__pycache__/
+my_test_song/
+output_folder/
+Gemini_mess/
