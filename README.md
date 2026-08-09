@@ -1,146 +1,317 @@
 # **Feedpak Builder Pipeline**
 
-This pipeline processes stems (audio files) and Guitar Pro (.gp5) files, running them through transcription, pitch tracking, and dynamic time warping (DTW) to generate a packaged .feedpak archive.
+An automated toolchain to convert raw audio stems and Guitar Pro files (`.gp5`) into a fully compliant [Feedpak](https://got-feedback.github.io/feedpak-spec/) format (`.feedpak` ZIP archive).
 
-## **1\. Environment & Setup**
+**Current v1 Features:**
+- ✅ Vocal extraction (WhisperX): lyrics + speaker diarization + word timestamps
+- ✅ Pitch tracking (CREPE): discrete MIDI per word + continuous Hz contour
+- ✅ Guitar Pro parsing + DTW alignment to real audio
+- ✅ Drum tab extraction (reduced 7-piece kit: kick/snare/hihat/tom1/tom2/crash/ride — no note is ever dropped, every GM percussion note resolves to the closest of these)
+- ✅ Hand-position anchors
+- ✅ Key signature + real tempo/beat timeline (measure boundaries read directly from the GP file)
+- ✅ **Automatic 4-beat count-in:** if a stem starts with no real lead-in silence, the pipeline pads all stems with a silent 4-beat count-in (sized to the song's actual BPM) and shifts every chart timestamp to match — audio and chart data stay in sync automatically
 
-Because this pipeline relies on machine learning models (WhisperX, CREPE) alongside audio processing tools, setting up the environment requires a few prerequisites.
+---
+
+## **1. Environment & Setup**
 
 ### **System Requirements**
 
-> * **Windows Developer Mode:** Developer Mode should be enabled in Windows.  
-> * **CUDA / GPU:** A CUDA-compatible NVIDIA GPU is highly recommended. The scripts default to \--device cuda.
+- **Windows Developer Mode:** Recommended (Settings → Privacy & Security → For developers → toggle on)
+- **CUDA / GPU:** A CUDA-capable NVIDIA GPU is strongly recommended. The scripts default to `--device cuda`.
+  - Without GPU, WhisperX and CREPE run ~10× slower on CPU.
 
-### **Step 1: Install FFmpeg via winget**
+### **Step 1: Install FFmpeg via winget (Windows)**
 
-FFmpeg is required for audio processing operations. Install it easily via Windows Package Manager:
+FFmpeg is required for audio I/O:
 
-> 1. Open PowerShell and run:  
->    PowerShell  
->    winget install Gyan.FFmpeg
+```powershell
+winget install Gyan.FFmpeg
+```
 
-> 2. Close and reopen PowerShell, then run ffmpeg \-version to confirm the installation works.
+Close and reopen PowerShell, then verify:
+```powershell
+ffmpeg -version
+```
 
 ### **Step 2: Hugging Face Token & Gated Model Access**
 
-process\_vocals.py uses whisperx for speaker diarization, which relies on gated Pyannote models hosted on Hugging Face.
+`process_vocals.py` uses WhisperX, which requires the Pyannote speaker diarization model (gated on Hugging Face).
 
-> 1. Create or log in to your account at [Hugging Face](https://huggingface.co/).  
-> 2. **Accept Model Conditions (Crucial):** Visit each of the following gated model pages and accept their user conditions:  
-   * [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)  
-   * [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)  
-> 3. Generate an Access Token via **User Settings $\\rightarrow$ Access Tokens** (a *Read* token is sufficient).  
-> 4. Save this token to pass into your environment later.
+1. Create or log in at [huggingface.co](https://huggingface.co/).
+2. **Accept model conditions** at each of these pages (click "Access repository"):
+   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+3. Generate a **Read** access token via **User Settings → Access Tokens**.
+4. Save this token — you'll use it when running the pipeline.
 
 ### **Step 3: Create & Activate a Virtual Environment**
 
-Open PowerShell, navigate to your project directory, and initialize a virtual environment:
+```powershell
+# Create virtual environment
+python -m venv env
 
-PowerShell  
-\# Create virtual environment named 'env'  
-python \-m venv env
+# Activate it
+.\env\Scripts\Activate.ps1
 
-\# Activate the virtual environment  
-.\\env\\Scripts\\Activate.ps1
+# If you get a script execution error, run this once:
+# Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+```
 
-**Note:** If PowerShell throws a script execution error, run Set-ExecutionPolicy \-ExecutionPolicy RemoteSigned \-Scope Process in your session first.
+### **Step 4: Install PyTorch (with CUDA) & Dependencies**
 
-### **Step 4: Install CUDA-Enabled PyTorch & Dependencies**
+Install PyTorch with explicit CUDA support first (standard `pip install torch` installs CPU-only):
 
-Standard pip install torch often installs CPU-only binaries. Install PyTorch with explicit CUDA support first, then install the remaining project dependencies:
+```powershell
+# PyTorch with CUDA 12.4
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-PowerShell  
-\# 1\. Install PyTorch with CUDA 12.4 support  
-pip install torch torchvision torchaudio \--index-url https://download.pytorch.org/whl/cu124
+# ML models & audio processing
+pip install whisperx torchcrepe librosa scipy soundfile pyyaml
 
-\# 2\. Install ML & Vocal dependencies  
-pip install whisperx torchcrepe pyannote.audio
+# Guitar Pro parsing
+pip install pyguitarpro
 
-\# 3\. Install GP5 parsing & Audio/DTW dependencies  
-pip install pyguitarpro librosa scipy numpy
+# Utilities
+pip install jsonschema
+```
 
-\# 4\. Install Utility & Manifest dependencies  
-pip install jsonschema pyyaml soundfile
+### **Step 5: Verify CUDA**
 
-### **Step 5: Verify CUDA Availability**
+```powershell
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
+```
 
-Run this quick snippet to ensure PyTorch recognizes your GPU:
+Expected output: `CUDA: True` and your GPU name (e.g., "NVIDIA RTX 3060").
 
-PowerShell  
-python \-c "import torch; print('CUDA Available:', torch.cuda.is\_available()); print('GPU:', torch.cuda.get\_device\_name(0) if torch.cuda.is\_available() else 'None')"
+---
 
-> * **Expected Output:** CUDA Available: True and the name of your NVIDIA GPU.
+## **2. Environment Variables**
 
-## **2\. Setting Environment Variables**
+Set your Hugging Face token **before running the pipeline**:
 
-The pipeline expects your Hugging Face access token to be set prior to execution. How you supply this depends on your terminal environment:
+**PowerShell:**
+```powershell
+$env:HF_TOKEN = "hf_your_actual_token_here"
+```
 
-> * **PowerShell:**  
->   PowerShell  
->   $env:HF\_TOKEN="hf\_your\_actual\_token\_here"
+**Command Prompt (cmd.exe):**
+```cmd
+set HF_TOKEN=hf_your_actual_token_here
+```
 
-> * **Command Prompt (CMD):**  
->   DOS  
->   set HF\_TOKEN=your\_token\_here
+---
 
-## **3\. Expected Folder Structure**
+## **3. Project Folder Structure**
 
-Your input directory should contain your target song folder with the required audio stems, Guitar Pro file, and metadata.
+Create a folder for each song. The folder must contain:
 
-Plaintext  
-my\_test\_song\\  
-├── song.gp5              \# Requires exactly one .gp5 file (or pyguitarpro supported format)  
-├── vocals.ogg            \# Required for vocals/pitch processing  
-├── drums.ogg             \# Required for DTW timing alignment  
-├── bass.ogg              \# Optional  
-├── guitar.ogg            \# Optional  
-├── full.ogg              \# Optional (Full mixdown)  
-└── metadata.json         \# Required for manifest generation
+```
+my_test_song/
+├── song.gp5              (required: Guitar Pro file, .gp5/.gp4/.gp3)
+├── vocals.ogg            (optional: vocal stem, required for lyrics/pitch)
+├── drums.ogg             (optional: drum stem, required for DTW alignment)
+├── bass.ogg              (optional)
+├── guitar.ogg            (optional)
+├── full.ogg              (optional: complete mix/backing)
+├── cover.jpg             (optional: album art)
+└── metadata.json         (optional: song metadata)
+```
 
-*Note: Stems can be in .ogg, .wav, or .flac format.*
+### **Audio Format**
 
-### **Sample metadata.json**
+- Supported: `.ogg`, `.wav`, `.flac`
+- Recommended: `.ogg` (good compression)
+- Sample rate: 44.1 kHz or higher, mono or stereo
 
-Place a metadata.json file inside your song folder so the builder can generate the final manifest:
+### **metadata.json (Optional)**
 
-JSON  
-{  
-  "title": "Test Song",  
-  "artist": "Test Artist",  
-  "album": "Test Album",  
-  "year": 2024,  
-  "genres": \["test"\]  
+Create this file in your song folder to populate the manifest. If omitted, defaults to "Unknown Title" / "Unknown Artist":
+
+```json
+{
+  "title": "My Song",
+  "artist": "My Band",
+  "album": "Album Name",
+  "year": 2024,
+  "genres": ["rock"]
 }
+```
 
-## **4\. Running the Pipeline**
+---
 
-### **Automatic Processing (Recommended)**
+## **4. Running the Pipeline**
 
-The build\_feedpak.py script acts as an orchestrator. It automatically executes process\_vocals.py and process\_gp\_alignment.py as subprocesses, converts their JSON outputs, generates the manifest.yaml, and packages everything into a .feedpak archive.  
-**In PowerShell:**
+### **Full Pipeline (Recommended)**
 
-PowerShell  
-python build\_feedpak.py my\_test\_song output\_folder \--device cuda \--hf-token $env:HF\_TOKEN
+```powershell
+python build_feedpak.py my_test_song output_folder --device cuda --hf-token $env:HF_TOKEN
+```
 
-**In Command Prompt (CMD):**
+**Arguments:**
+- `my_test_song` — Song folder (contains stems + `song.gp5`)
+- `output_folder` — Where to save the `.feedpak` archive
+- `--device cuda` — Use GPU (`cpu` if no CUDA available)
+- `--hf-token <token>` — Your Hugging Face token
+- `--vocals-stem vocals` — Name of vocal stem file (default: `vocals`)
+- `--drums-stem drums` — Name of drum stem file (default: `drums`)
+- `--skip-vocals` — Skip vocal processing
+- `--skip-gp` — Skip GP parsing + alignment
 
-DOS  
-python build\_feedpak.py my\_test\_song output\_folder \--device cuda \--hf-token %HF\_TOKEN%
+**Output:**
+```
+output_folder/
+└── My Band - My Song.feedpak
+```
 
-### **Manual Step-by-Step Processing (Debugging)**
+### **Step-by-Step Testing (Debugging)**
 
-If you need to debug specific scripts individually, you can run them manually:  
-**1\. Process Vocals (Script 1):**
+If you need to debug individual stages:
 
-PowerShell  
-python process\_vocals.py my\_test\_song\\vocals.ogg \--out my\_test\_song\\intermediate\_vocals.json \--device cuda \--hf-token $env:HF\_TOKEN
+**Step 1: Vocal Processing**
+```powershell
+python process_vocals.py my_test_song\vocals.ogg --out my_test_song\intermediate_vocals.json --device cuda --hf-token $env:HF_TOKEN
+```
 
-**2\. Process Guitar Pro Alignment (Script 2):**
+Check `intermediate_vocals.json` for lyrics, pitches, contours per speaker.
 
-PowerShell  
-python process\_gp\_alignment.py my\_test\_song\\song.gp5 my\_test\_song\\drums.ogg \--out my\_test\_song\\intermediate\_arrangements.json
+**Step 2: GP Alignment + DTW**
+```powershell
+python process_gp_alignment.py my_test_song\song.gp5 my_test_song\drums.ogg --out my_test_song\intermediate_arrangements.json
+```
 
-**3\. Package Final Archive (Script 3):**
+Check `intermediate_arrangements.json` for warped note times, anchors, drum hits.
 
-PowerShell  
-python build\_feedpak.py my\_test\_song output\_folder \--device cuda \--hf-token $env:HF\_TOKEN  
+**Step 3: Build the Feedpak**
+```powershell
+python build_feedpak.py my_test_song output_folder --device cuda --hf-token $env:HF_TOKEN
+```
+
+---
+
+## **5. Output: The `.feedpak` Archive**
+
+The `.feedpak` is a ZIP containing:
+
+```
+song.feedpak/
+├── manifest.yaml                      (metadata + file index)
+├── stems/
+│   ├── vocals.ogg
+│   ├── drums.ogg
+│   └── ...
+├── arrangements/
+│   ├── lead.json                      (fretted notes)
+│   ├── bass.json
+│   └── notation_piano.json            (staff notation if keyboard exists)
+├── lyrics.json                        (flat word list with timestamps)
+├── vocal_pitch.json                   (discrete MIDI per word)
+├── vocal_pitch_contour.json           (continuous Hz contour)
+├── drum_tab.json                      (drum hits + piece labels)
+├── song_timeline.json                 (tempo + beat timeline)
+├── keys.json                          (key signature changes)
+└── cover.jpg                          (if provided)
+```
+
+All files conform to the [Feedpak v1 schema](https://got-feedback.github.io/feedpak-spec/).
+
+---
+
+## **6. Known Issues & v1 Limitations**
+
+### **Audio Timing (v1)**
+
+**4-beat count-in is automatic.** Before running Script 1/2, the pipeline checks one reference stem (the full mix if present, else `drums.ogg`, else whichever stem it finds first) for leading silence. If that stem starts "cold" (less than ~0.15s of silence before the first transient), it prepends a silent 4-beat count-in — sized to the song's actual tempo, read from the `.gp5` file — to **every** stem uniformly, and shifts every nominal chart timestamp (notes, drum hits, key changes, song timeline, keyboard notation) by the same amount before DTW alignment runs. If a stem already has a real lead-in gap, nothing is padded.
+
+You don't need to do anything for this — it's automatic. The padded stems (not the originals) are what ends up in the final `.feedpak`; your original files in the song folder are never modified.
+
+**DTW Alignment Lag:** If tab notes still appear offset from audio after this, the DTW warp itself may have drifted on a long or tempo-heavy section. Check that `drums.ogg` is a proper isolated drum stem (not the full mix). Try running with `--sr 16000` for faster DTW on long songs.
+
+### **Vocals (v1)**
+
+- **Flat lyrics only:** Currently writes a single `lyrics.json` with all speakers' words merged and time-sorted. No per-speaker attribution in the lyrics file itself (check `intermediate_vocals.json` for speaker info).
+- **Per-speaker lyric_tracks:** Will be added in v2 (manifest `lyric_tracks[]` structure exists but is not yet populated by Script 3).
+
+### **Not Yet Extracted**
+
+- Technique fields (slides, bends, hammer-on/pull-off, fingering)
+- Chord hand-shapes / diagrams
+- Harmony / chord progression estimation
+- Rig / amp-effects chains
+- Extended drum kits beyond the reduced 7-piece set (kick/snare/hihat/tom1/tom2/crash/ride) — auxiliary percussion (cowbell, tambourine, etc.) folds into the nearest of these rather than getting its own piece
+
+---
+
+## **7. Troubleshooting**
+
+### "Module not found: whisperx / torchcrepe / librosa"
+
+```powershell
+pip install --upgrade whisperx torchcrepe librosa
+```
+
+### "A required privilege is not held" (Windows, during model download)
+
+Either:
+1. Enable Developer Mode (Settings → Privacy & Security → For developers), or
+2. Disable symlinking: `$env:HF_HUB_DISABLE_SYMLINKS = "1"`
+
+Then re-run.
+
+### "DiarizationPipeline() got unexpected keyword argument"
+
+Update WhisperX:
+```powershell
+pip install --upgrade whisperx
+```
+
+### DTW Takes Very Long
+
+- Use a proper isolated drum stem (not the full mix)
+- Try lower sample rate: `python process_gp_alignment.py song.gp5 drums.ogg --out inter.json --sr 16000`
+- For very long songs, consider splitting into sections
+
+### No .gp5 File Found
+
+- Ensure `song.gp5` is in the root of your song folder (not in a subfolder)
+- Filename must match exactly (case-sensitive on Linux/macOS)
+
+### Vocals Detected as Wrong Language
+
+- WhisperX detects based on audio content, not file name
+- Check the audio itself; detection is usually correct
+- Explicit language selection will be added in a future release
+
+---
+
+## **8. Performance Tips**
+
+- **GPU is essential:** Use `--device cuda`. Without it, expect 5–10× slowdown.
+- **Sample rate:** Lower `--sr 16000` if DTW is slow.
+- **Skip unnecessary stages:** Use `--skip-vocals` or `--skip-gp` to test one part.
+- **Batch processing:** Loop over multiple song folders in a script.
+
+---
+
+## **9. References**
+
+- **Feedpak Specification:** https://got-feedback.github.io/feedpak-spec/
+- **WhisperX GitHub:** https://github.com/m-bain/whisperx
+- **CREPE (PyTorch):** https://github.com/marl/torchcrepe
+- **pyguitarpro:** https://github.com/nferretti/guitarpro
+- **Librosa:** https://librosa.org/
+
+---
+
+## **10. Support**
+
+If you encounter issues, provide:
+1. Full error traceback
+2. Your `metadata.json` and folder structure
+3. The exact command you ran
+4. Output of `python --version` and `pip list`
+5. GPU name/driver version (if using CUDA)
+
+---
+
+**Happy transcribing!** 🎸🎤

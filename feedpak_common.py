@@ -13,6 +13,8 @@ import re
 import sys
 import time
 
+import numpy as np
+
 
 # --------------------------------------------------------------------------
 # Progress logging
@@ -126,23 +128,41 @@ def remap_string_index(gp_string_number, string_count):
 
 GM_DRUM_PIECE_MAP = {
     35: "kick", 36: "kick",
-    38: "snare", 40: "snare",
-    37: "snare_rim",
-    41: "tom_floor_low", 43: "tom_floor_high",
-    45: "tom_low", 47: "tom_mid", 48: "tom_high", 50: "tom_high",
-    42: "hihat_closed", 44: "hihat_pedal", 46: "hihat_open",
+    38: "snare", 40: "snare", 37: "snare",
+    42: "hihat", 44: "hihat", 46: "hihat",
+    41: "tom2", 43: "tom2", 45: "tom2",   # low/floor toms -> tom2
+    47: "tom1", 48: "tom1", 50: "tom1",   # mid/high toms -> tom1
     49: "crash", 57: "crash",
-    51: "ride", 59: "ride",
-    52: "china",
-    53: "ride_bell",
-    54: "tambourine",
-    55: "splash",
+    52: "crash",   # china -> crash (closest in character: loud, trashy accent)
+    55: "crash",   # splash -> crash
+    51: "ride", 59: "ride", 53: "ride",   # ride, ride 2, ride bell -> ride
+}
+
+# Representative note for each reduced-kit piece, used only as a numeric
+# fallback for percussion notes not in GM_DRUM_PIECE_MAP above (auxiliary
+# percussion, cowbell, tambourine, vendor-specific extras, etc.) so that
+# gm_drum_to_piece() never drops a note — everything resolves to the
+# closest of these seven pieces.
+_REDUCED_KIT_REFERENCE_NOTE = {
+    "kick": 36, "snare": 38, "hihat": 42,
+    "tom2": 43, "tom1": 48, "crash": 49, "ride": 51,
 }
 
 
 def gm_drum_to_piece(gm_note):
-    """Returns a piece label for a GM percussion note, or None if unmapped."""
-    return GM_DRUM_PIECE_MAP.get(gm_note)
+    """
+    Maps any incoming GM percussion note to one of the reduced kit's
+    seven pieces (kick, snare, hihat, tom1, tom2, crash, ride). Known GM
+    percussion notes use the semantic table above (china/splash -> crash,
+    ride bell -> ride, etc.); anything else falls back to whichever
+    reference note is numerically closest, so no drum hit is ever
+    silently dropped for having an unrecognized note number.
+    """
+    piece = GM_DRUM_PIECE_MAP.get(gm_note)
+    if piece is not None:
+        return piece
+    return min(_REDUCED_KIT_REFERENCE_NOTE.items(),
+               key=lambda kv: abs(kv[1] - gm_note))[0]
 
 
 # --------------------------------------------------------------------------
@@ -280,3 +300,48 @@ def to_posix_relpath(*parts):
     if not is_valid_relpath(path):
         raise ValueError(f"Generated path is not a valid feedpak relpath: {path!r}")
     return path
+
+
+# --------------------------------------------------------------------------
+# Count-in padding: detect whether a stem starts "cold" (no lead-in
+# silence) and, if so, prepend one so audio and chart data can both carry
+# a real 4-beat count-in instead of starting exactly on beat 1.
+# --------------------------------------------------------------------------
+
+def detect_leading_silence_seconds(audio_path, threshold_amplitude=0.02,
+                                    max_scan_seconds=10.0):
+    """
+    Returns how many seconds of near-silence precede the first transient
+    in `audio_path`, capped at max_scan_seconds. threshold_amplitude is
+    on a 0..1 float-sample scale (0.02 ~= -34dBFS) — deliberately loose,
+    since a "silent" count-in bar can still carry faint bleed/noise floor
+    and we only care whether there's a real gap before the song starts.
+    """
+    import soundfile as sf
+
+    with sf.SoundFile(audio_path) as f:
+        sr = f.samplerate
+        frames_to_scan = min(f.frames, int(max_scan_seconds * sr))
+        data = f.read(frames_to_scan, dtype="float32", always_2d=True)
+
+    amplitude = np.abs(data).max(axis=1)  # mono-mixdown peak per sample
+    above = np.where(amplitude > threshold_amplitude)[0]
+    if len(above) == 0:
+        return max_scan_seconds  # entire scanned window is silent
+    return above[0] / sr
+
+
+def pad_audio_with_silence(src_path, dst_path, pad_seconds):
+    """
+    Writes a copy of src_path to dst_path with pad_seconds of silence
+    prepended, preserving sample rate and channel count. Format is
+    inferred from dst_path's extension (matches src's extension by
+    convention — see build_feedpak.py's usage).
+    """
+    import soundfile as sf
+
+    data, sr = sf.read(src_path, dtype="float32", always_2d=True)
+    pad_samples = int(round(pad_seconds * sr))
+    silence = np.zeros((pad_samples, data.shape[1]), dtype="float32")
+    padded = np.concatenate([silence, data], axis=0)
+    sf.write(dst_path, padded, sr)
