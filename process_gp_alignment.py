@@ -98,32 +98,56 @@ def build_key_signature_events(song, tempo_events, first_tick):
 
 def build_song_timeline(song, tempo_events, first_tick):
     """
-    Real bar/beat-boundary data for song_timeline.json — measure start
-    times straight from GP's own measureHeaders (song-timeline.schema.json
-    §7.4: tempos[], time_signatures[], beats[]). GP already gives us
-    explicit measure boundaries, so — unlike a MIDI source, which has to
-    derive them from a time-signature map and tick math (see
-    build_measure_boundaries() in an earlier MIDI-based converter this
-    project also uses) — we can just read them directly per measure.
+    Bar-boundary data for song_timeline.json. Each beat entry also
+    carries the active time-signature numerator (ts_num), because the
+    ACTUAL bar-subdivision signal a working reference feedpak relies on
+    isn't a sparse authored-tempo list or a bare beats[] array — it's a
+    DENSE per-measure tempo curve: one tempos[] entry per measure, with
+    the BPM back-computed from how long that measure actually took in
+    real (post-DTW) audio. That's built in process() after warping,
+    once we know each measure's real duration; this function only
+    supplies the nominal (pre-warp) measure boundaries + numerators it
+    needs to do that.
     """
-    tempos = [{"t_gp": 0.0, "bpm": float(tempo_events[0][1])}]
-    for tick, bpm in tempo_events[1:]:
-        tempos.append({"t_gp": fc.tick_to_seconds(tick - first_tick, tempo_events),
-                        "bpm": float(bpm)})
-
     time_signatures = []
     beats = []
     last_ts = None
+    active_num = 4
     for header in song.measureHeaders:
         t_gp = fc.tick_to_seconds(header.start - first_tick, tempo_events)
-        beats.append({"t_gp": t_gp, "measure": header.number})
         if header.timeSignature:
             ts = (header.timeSignature.numerator, header.timeSignature.denominator.value)
             if ts != last_ts:
                 time_signatures.append({"t_gp": t_gp, "ts": list(ts)})
                 last_ts = ts
+            active_num = ts[0]
+        beats.append({"t_gp": t_gp, "measure": header.number, "ts_num": active_num})
 
-    return {"tempos": tempos, "time_signatures": time_signatures, "beats": beats}
+    return {"time_signatures": time_signatures, "beats": beats}
+
+
+def compute_dense_measure_tempos(warped_beats, fallback_bpm):
+    """
+    One BPM per measure, back-computed from the real (warped) duration
+    between consecutive measure downbeats: bpm = ts_num * 60 / duration.
+    This is what a working reference feedpak's song_timeline.json
+    actually contains (168 entries for a ~168-measure song, each
+    reflecting that measure's real, DTW-observed tempo) — not a sparse
+    list of only the tempo events the GP file happens to declare. The
+    last measure has no "next" downbeat to diff against, so it just
+    repeats the previous measure's effective BPM.
+    """
+    dense = []
+    for i, b in enumerate(warped_beats):
+        if i + 1 < len(warped_beats):
+            duration = warped_beats[i + 1]["time"] - b["time"]
+            bpm = round(b["ts_num"] * 60.0 / duration, 3) if duration > 0 else \
+                (dense[-1]["bpm"] if dense else fallback_bpm)
+        else:
+            bpm = dense[-1]["bpm"] if dense else fallback_bpm
+        dense.append({"time": b["time"], "bpm": bpm})
+    return dense
+
 
 
 def shift_nominal_times(entries, offset, time_key="t_gp"):
@@ -519,8 +543,7 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
     key_events_gp = build_key_signature_events(song, tempo_events, first_tick)
     song_timeline_gp = build_song_timeline(song, tempo_events, first_tick)
     fc.log(f"{len(key_events_gp)} key change event(s), "
-           f"{len(song_timeline_gp['beats'])} measure boundaries, "
-           f"{len(song_timeline_gp['tempos'])} tempo event(s)", indent=1)
+           f"{len(song_timeline_gp['beats'])} measure boundaries", indent=1)
 
     # Apply the count-in offset to every nominal (GP-clock) time before
     # DTW, so the synthetic click track (built from these same nominal
@@ -532,7 +555,6 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
         data["anchors"] = shift_nominal_times(data["anchors"], count_in_offset, time_key="time")
     drum_hits_gp = shift_nominal_times(drum_hits_gp, count_in_offset)
     key_events_gp = shift_nominal_times(key_events_gp, count_in_offset)
-    song_timeline_gp["tempos"] = shift_nominal_times(song_timeline_gp["tempos"], count_in_offset)
     song_timeline_gp["time_signatures"] = shift_nominal_times(
         song_timeline_gp["time_signatures"], count_in_offset)
     song_timeline_gp["beats"] = shift_nominal_times(song_timeline_gp["beats"], count_in_offset)
@@ -549,13 +571,20 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
 
     drum_hits = apply_warp(drum_hits_gp, warp_fn)
     key_events = apply_warp(key_events_gp, warp_fn)
+
+    warped_beats = [
+        {"time": round(warp_fn(e["t_gp"]), 4), "measure": e["measure"], "ts_num": e["ts_num"]}
+        for e in song_timeline_gp["beats"]
+    ]
+    dense_tempos = compute_dense_measure_tempos(warped_beats, fallback_bpm=float(tempo_events[0][1]))
+    fc.log(f"{len(dense_tempos)} per-measure tempo event(s) computed from real (warped) "
+           f"bar durations — this is the actual bar-subdivision data a renderer draws "
+           f"from, not a sparse authored-tempo list", indent=1)
     song_timeline = {
-        "tempos": [{"time": round(warp_fn(e["t_gp"]), 4), "bpm": e["bpm"]}
-                   for e in song_timeline_gp["tempos"]],
+        "tempos": dense_tempos,
         "time_signatures": [{"time": round(warp_fn(e["t_gp"]), 4), "ts": e["ts"]}
                              for e in song_timeline_gp["time_signatures"]],
-        "beats": [{"time": round(warp_fn(e["t_gp"]), 4), "measure": e["measure"]}
-                  for e in song_timeline_gp["beats"]],
+        "beats": [{"time": b["time"], "measure": b["measure"]} for b in warped_beats],
     }
 
     fc.log_step(5, 5, "Applying warp to all tracks")

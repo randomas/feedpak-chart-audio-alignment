@@ -129,34 +129,54 @@ def remap_string_index(gp_string_number, string_count):
 GM_DRUM_PIECE_MAP = {
     35: "kick", 36: "kick",
     38: "snare", 40: "snare", 37: "snare",
-    42: "hihat", 44: "hihat", 46: "hihat",
-    41: "tom2", 43: "tom2", 45: "tom2",   # low/floor toms -> tom2
-    47: "tom1", 48: "tom1", 50: "tom1",   # mid/high toms -> tom1
-    49: "crash", 57: "crash",
-    52: "crash",   # china -> crash (closest in character: loud, trashy accent)
-    55: "crash",   # splash -> crash
-    51: "ride", 59: "ride", 53: "ride",   # ride, ride 2, ride bell -> ride
+    42: "hh_closed", 44: "hh_closed", 46: "hh_closed",
+    41: "tom_floor", 43: "tom_floor",             # floor toms
+    45: "tom_mid", 47: "tom_mid",                 # low/low-mid toms
+    48: "tom_hi", 50: "tom_hi",                   # high-mid/high toms
+    49: "crash_r", 57: "crash_r",
+    52: "crash_r",   # china -> crash (closest in character: loud, trashy accent)
+    55: "crash_r",   # splash -> crash
+    51: "ride", 59: "ride", 53: "ride",           # ride, ride 2, ride bell -> ride
 }
 
 # Representative note for each reduced-kit piece, used only as a numeric
 # fallback for percussion notes not in GM_DRUM_PIECE_MAP above (auxiliary
 # percussion, cowbell, tambourine, vendor-specific extras, etc.) so that
 # gm_drum_to_piece() never drops a note — everything resolves to the
-# closest of these seven pieces.
+# closest of these eight pieces.
 _REDUCED_KIT_REFERENCE_NOTE = {
-    "kick": 36, "snare": 38, "hihat": 42,
-    "tom2": 43, "tom1": 48, "crash": 49, "ride": 51,
+    "kick": 36, "snare": 38, "hh_closed": 42,
+    "tom_floor": 42, "tom_mid": 46, "tom_hi": 49,
+    "crash_r": 49, "ride": 51,
 }
+
+# Target kit: 1 kick + 4 pads (snare, tom_hi, tom_mid, tom_floor) + 3
+# cymbals (hh_closed, crash_r, ride) — a Rock Band 3 Pro Drums-style
+# reduced kit. Every drum note in the source, regardless of its original
+# GM number, gets translated (exact table match, or nearest-neighbor
+# fallback) to one of these eight. Order and ids/names match a working
+# reference feedpak's drum_tab.json `kit` array exactly.
+REDUCED_DRUM_KIT = [
+    {"id": "kick", "name": "Kick"},
+    {"id": "snare", "name": "Snare"},
+    {"id": "hh_closed", "name": "Hi-hat (closed)"},
+    {"id": "tom_hi", "name": "High Tom"},
+    {"id": "ride", "name": "Ride"},
+    {"id": "tom_mid", "name": "Mid Tom"},
+    {"id": "crash_r", "name": "Crash (right)"},
+    {"id": "tom_floor", "name": "Floor Tom"},
+]
 
 
 def gm_drum_to_piece(gm_note):
     """
     Maps any incoming GM percussion note to one of the reduced kit's
-    seven pieces (kick, snare, hihat, tom1, tom2, crash, ride). Known GM
-    percussion notes use the semantic table above (china/splash -> crash,
-    ride bell -> ride, etc.); anything else falls back to whichever
-    reference note is numerically closest, so no drum hit is ever
-    silently dropped for having an unrecognized note number.
+    eight pieces (kick, snare, hh_closed, tom_hi, tom_mid, tom_floor,
+    crash_r, ride). Known GM percussion notes use the semantic table
+    above (china/splash -> crash_r, ride bell -> ride, etc.); anything
+    else falls back to whichever reference note is numerically closest,
+    so no drum hit is ever silently dropped for having an unrecognized
+    note number.
     """
     piece = GM_DRUM_PIECE_MAP.get(gm_note)
     if piece is not None:
@@ -334,9 +354,15 @@ def detect_leading_silence_seconds(audio_path, threshold_amplitude=0.02,
 def pad_audio_with_silence(src_path, dst_path, pad_seconds):
     """
     Writes a copy of src_path to dst_path with pad_seconds of silence
-    prepended, preserving sample rate and channel count. Format is
-    inferred from dst_path's extension (matches src's extension by
-    convention — see build_feedpak.py's usage).
+    prepended, preserving sample rate and channel count.
+
+    dst_path should use a .wav extension regardless of src_path's
+    format — libsndfile (which soundfile wraps) has a known crash
+    writing large OGG Vorbis files (confirmed: a ~3.5 minute stereo
+    44.1kHz file segfaults on write, while the identical audio writes
+    fine as WAV). Re-encoding to OGG would also cost a lossy
+    decode/re-encode generation loss on top of that risk, so padded
+    stems are written as WAV — lossless, and avoids the crash entirely.
     """
     import soundfile as sf
 
@@ -344,4 +370,4 @@ def pad_audio_with_silence(src_path, dst_path, pad_seconds):
     pad_samples = int(round(pad_seconds * sr))
     silence = np.zeros((pad_samples, data.shape[1]), dtype="float32")
     padded = np.concatenate([silence, data], axis=0)
-    sf.write(dst_path, padded, sr)
+    sf.write(dst_path, padded, sr, format="WAV")

@@ -121,23 +121,31 @@ def probe_duration_seconds(audio_path):
 # --------------------------------------------------------------------------
 
 def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
-                                 no_silence_threshold=0.15):
+                                 min_pad_epsilon=0.005):
     """
-    If the audio starts "cold" (no real lead-in silence), prepends a
-    4-beat count-in of silence to every stem — all of them, uniformly,
-    since they're all cuts of the same original recording and have to
-    stay in sync with each other — and returns how much padding was
-    applied, so process_gp_alignment.py can shift every nominal GP time
-    by the same amount (see its --count-in-offset).
+    Ensures every stem has a full 4-beat count-in of silence before the
+    song starts, padding with only as much silence as is missing —
+    top-up, not a binary gate. (An earlier version only padded when
+    leading silence was under a small fixed threshold like 0.15s; that
+    meant a song with, say, exactly 0.15s of real lead-in was judged
+    "already padded" even though it needs a full 4-beat count-in, not a
+    fraction of one. Comparing directly against count_in_seconds fixes
+    that.)
 
-    Detection uses ONE reference stem (preferring the full mix, else
-    drums, else whatever's first) rather than checking every stem
-    independently — silence has to be a property of the recording as a
-    whole, not something that could differ stem-to-stem.
+    All stems are padded identically — they're all cuts of the same
+    original recording and have to stay in sync with each other — using
+    ONE reference stem's leading silence to decide how much is missing
+    (preferring the full mix, else drums, else whatever's first).
 
     Padded copies are written into work_dir/stems/, never overwriting
     the originals in song_folder. Returns (count_in_seconds, stems_dir,
-    padded_paths) where padded_paths maps original stem id -> new path.
+    padded_paths) where padded_paths maps original stem id -> new path,
+    and count_in_seconds is the offset process_gp_alignment.py needs
+    (via --count-in-offset) to shift every nominal GP time to match —
+    always the FULL 4-beat count-in duration, even when only part of it
+    was actually added as new silence, since that's how much every
+    chart time needs to move to land after the now-guaranteed-full
+    count-in.
     """
     stems_out_dir = os.path.join(work_dir, "stems")
     os.makedirs(stems_out_dir, exist_ok=True)
@@ -155,29 +163,42 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
         fc.log("No .gp5 file to read tempo from; assuming 120 BPM for count-in sizing", indent=1)
     count_in_seconds = COUNT_IN_BEATS * (60.0 / bpm)
 
-    needs_padding = leading_silence < no_silence_threshold
-    fc.log(f"Reference stem '{reference['id']}' has {leading_silence:.3f}s of leading "
-           f"silence; {'padding' if needs_padding else 'no padding'} needed "
-           f"({'below' if needs_padding else 'above'} {no_silence_threshold}s threshold)",
-           indent=1)
+    pad_seconds = max(0.0, count_in_seconds - leading_silence)
+    if pad_seconds < min_pad_epsilon:
+        pad_seconds = 0.0
 
-    pad_seconds = count_in_seconds if needs_padding else 0.0
-    if pad_seconds:
-        fc.log(f"Prepending a {COUNT_IN_BEATS}-beat count-in "
-               f"({pad_seconds:.3f}s at {bpm:.0f} BPM) to every stem", indent=1)
+    fc.log(f"Reference stem '{reference['id']}' has {leading_silence:.3f}s of leading "
+           f"silence; needs {count_in_seconds:.3f}s for a full {COUNT_IN_BEATS}-beat "
+           f"count-in at {bpm:.0f} BPM -> padding {pad_seconds:.3f}s", indent=1)
 
     padded_paths = {}
     for stem in stems:
         src = os.path.join(song_folder, os.path.basename(stem["file"]))
-        dst = os.path.join(stems_out_dir, os.path.basename(stem["file"]))
+        src_basename = os.path.basename(stem["file"])
         if pad_seconds:
+            # Padded stems are written as WAV regardless of source format
+            # — see pad_audio_with_silence()'s docstring for why. Update
+            # both the on-disk filename and this stem's manifest `file`
+            # entry to match, so the archive and the manifest agree.
+            new_basename = os.path.splitext(src_basename)[0] + ".wav"
+            dst = os.path.join(stems_out_dir, new_basename)
             fc.pad_audio_with_silence(src, dst, pad_seconds)
+            stem["file"] = fc.to_posix_relpath("stems", new_basename)
         else:
             import shutil
+            dst = os.path.join(stems_out_dir, src_basename)
             shutil.copyfile(src, dst)
         padded_paths[stem["id"]] = dst
 
-    return pad_seconds, stems_out_dir, padded_paths
+    # The offset Script 2 needs is simply "how much silence precedes the
+    # real content after padding" — max(existing, count_in_seconds)
+    # covers all three cases uniformly: cold start (existing=0, pad up to
+    # count_in_seconds), partial lead-in (top up to count_in_seconds),
+    # and lead-in that's already MORE than a full count-in (no padding
+    # needed, but the chart still has to shift to match wherever the
+    # real content actually starts, not stay at zero).
+    count_in_offset = max(leading_silence, count_in_seconds)
+    return count_in_offset, stems_out_dir, padded_paths
 
 
 # --------------------------------------------------------------------------
@@ -348,10 +369,20 @@ def write_notation_files(gp_data, work_dir):
 
 
 def write_drum_tab(gp_data, work_dir):
+    """
+    Declares the kit explicitly (matches a working reference feedpak's
+    drum_tab.json exactly: kick/snare/hh_closed/tom_hi/ride/tom_mid/
+    crash_r/tom_floor). Every hit's `p` value is guaranteed to be one of
+    these eight — see gm_drum_to_piece() in feedpak_common.py — so the
+    kit array here is a complete, closed set, not just "whatever pieces
+    happened to appear."
+    """
     drum_tab = gp_data.get("drum_tab")
     if not drum_tab or not drum_tab.get("hits"):
         return None
-    fc.write_json(os.path.join(work_dir, "drum_tab.json"), drum_tab)
+    out = {"version": 1, "name": "Drums", "kit": fc.REDUCED_DRUM_KIT,
+           "hits": drum_tab["hits"]}
+    fc.write_json(os.path.join(work_dir, "drum_tab.json"), out)
     return "drum_tab.json"
 
 

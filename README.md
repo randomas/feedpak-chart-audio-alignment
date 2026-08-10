@@ -6,7 +6,7 @@ An automated toolchain to convert raw audio stems and Guitar Pro files (`.gp5`) 
 - ✅ Vocal extraction (WhisperX): lyrics + speaker diarization + word timestamps
 - ✅ Pitch tracking (CREPE): discrete MIDI per word + continuous Hz contour
 - ✅ Guitar Pro parsing + DTW alignment to real audio
-- ✅ Drum tab extraction (reduced 7-piece kit: kick/snare/hihat/tom1/tom2/crash/ride — no note is ever dropped, every GM percussion note resolves to the closest of these)
+- ✅ Drum tab extraction (Rock Band 3 Pro Drums-style 8-piece kit: kick, snare, 3 toms, 3 cymbals — no note is ever dropped, every GM percussion note resolves to the closest of these, and the kit is explicitly declared in `drum_tab.json`)
 - ✅ Hand-position anchors
 - ✅ Key signature + real tempo/beat timeline (measure boundaries read directly from the GP file)
 - ✅ **Automatic 4-beat count-in:** if a stem starts with no real lead-in silence, the pipeline pads all stems with a silent 4-beat count-in (sized to the song's actual BPM) and shifts every chart timestamp to match — audio and chart data stay in sync automatically
@@ -208,12 +208,16 @@ song.feedpak/
 ├── vocal_pitch.json                   (discrete MIDI per word)
 ├── vocal_pitch_contour.json           (continuous Hz contour)
 ├── drum_tab.json                      (drum hits + piece labels)
-├── song_timeline.json                 (tempo + beat timeline)
+├── song_timeline.json                 (dense per-measure tempo curve + beat boundaries)
 ├── keys.json                          (key signature changes)
 └── cover.jpg                          (if provided)
 ```
 
 All files conform to the [Feedpak v1 schema](https://got-feedback.github.io/feedpak-spec/).
+
+### **How bar/beat data works**
+
+`song_timeline.json`'s `tempos[]` isn't a sparse list of just the tempo changes the `.gp5` file happens to declare — it's a **dense, one-entry-per-measure curve**. Each entry's BPM is back-computed from how long that measure actually took in the real, DTW-aligned audio (`bpm = beats_per_measure * 60 / real_measure_duration`), not just the authored tempo. That's what lets a renderer draw accurate bar lines even through a performance with natural tempo drift — a fixed/sparse tempo map can't do that on its own. `beats[]` also carries an explicit `{time, measure}` entry per measure for renderers that want it directly.
 
 ---
 
@@ -221,7 +225,9 @@ All files conform to the [Feedpak v1 schema](https://got-feedback.github.io/feed
 
 ### **Audio Timing (v1)**
 
-**4-beat count-in is automatic.** Before running Script 1/2, the pipeline checks one reference stem (the full mix if present, else `drums.ogg`, else whichever stem it finds first) for leading silence. If that stem starts "cold" (less than ~0.15s of silence before the first transient), it prepends a silent 4-beat count-in — sized to the song's actual tempo, read from the `.gp5` file — to **every** stem uniformly, and shifts every nominal chart timestamp (notes, drum hits, key changes, song timeline, keyboard notation) by the same amount before DTW alignment runs. If a stem already has a real lead-in gap, nothing is padded.
+**4-beat count-in is automatic.** Before running Script 1/2, the pipeline checks one reference stem (the full mix if present, else `drums.ogg`, else whichever stem it finds first) for leading silence, and tops it up — not just gates on a threshold — to a full 4-beat count-in sized to the song's actual tempo (read from the `.gp5` file): `pad = max(0, count_in_seconds - existing_silence)`. So a stem with no lead-in gets the full count-in; a stem with a partial gap only gets topped up the rest of the way; a stem that already has more than a full count-in isn't padded, but the chart still shifts to match where the audio actually starts. Every stem is padded identically, and every nominal chart timestamp (notes, drum hits, key changes, song timeline, keyboard notation) shifts by the same amount before DTW alignment runs.
+
+Padded stems are written as WAV, not re-encoded to the original compressed format — decoding then re-encoding to OGG Vorbis would both cost a lossy generation and, on top of that, a large OGG Vorbis write has a confirmed libsndfile crash on some platforms. A stem that didn't need padding is copied byte-for-byte in its original format.
 
 You don't need to do anything for this — it's automatic. The padded stems (not the originals) are what ends up in the final `.feedpak`; your original files in the song folder are never modified.
 
@@ -238,7 +244,7 @@ You don't need to do anything for this — it's automatic. The padded stems (not
 - Chord hand-shapes / diagrams
 - Harmony / chord progression estimation
 - Rig / amp-effects chains
-- Extended drum kits beyond the reduced 7-piece set (kick/snare/hihat/tom1/tom2/crash/ride) — auxiliary percussion (cowbell, tambourine, etc.) folds into the nearest of these rather than getting its own piece
+- Auxiliary percussion beyond the 8-piece kit (cowbell, tambourine, extra toms, etc.) folds into the nearest of kick/snare/hh_closed/tom_hi/tom_mid/tom_floor/crash_r/ride rather than getting its own piece
 
 ---
 
