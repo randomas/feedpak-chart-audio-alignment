@@ -1,3 +1,4 @@
+
 """
 process_vocals.py
 
@@ -29,79 +30,181 @@ except ImportError:
     torchcrepe = None
     torch = None
 
+try:
+    import pyphen
+except ImportError:
+    pyphen = None
+
 
 CREPE_CONFIDENCE_THRESHOLD = 0.5
 CREPE_HOP_SECONDS = 0.010  # 10ms hop, per architecture doc
+
+# WhisperX language codes -> pyphen dictionary names. Falls back to
+# en_US for anything not listed (pyphen's dictionary set is smaller than
+# Whisper's language list, and a wrong-language hyphenation dictionary
+# fails safe anyway — see syllabify_word()'s fallback).
+_PYPHEN_LANG_MAP = {
+    "en": "en_US", "de": "de_DE", "fr": "fr_FR", "es": "es_ES", "it": "it_IT",
+    "pt": "pt_PT", "nl": "nl_NL", "sv": "sv_SE", "ru": "ru_RU", "pl": "pl_PL",
+    "da": "da_DK", "fi": "fi_FI", "nb": "nb_NO", "el": "el_GR",
+}
+_SYLLABLE_STRIP_CHARS = ".,!?;:\"'()[]"
 
 
 # --------------------------------------------------------------------------
 # Pure aggregation logic (testable without whisperx/torchcrepe installed)
 # --------------------------------------------------------------------------
 
-def aggregate_pitch_for_window(start, end, contour_times, contour_hz, contour_confidence,
-                                confidence_threshold=CREPE_CONFIDENCE_THRESHOLD):
+def get_syllable_dictionary(whisper_language_code):
     """
-    Given a word's [start, end) time window and full-song CREPE contour
-    arrays, returns the median Hz across confident frames in that window,
-    or None if no frame in the window clears the confidence threshold.
+    Returns a pyphen.Pyphen dictionary for the detected transcription
+    language, or None if pyphen isn't installed or the language has no
+    dictionary — callers must treat None as "don't syllabify" (see
+    syllabify_word()), not raise, since a missing hyphenation dictionary
+    shouldn't take down the whole vocal pipeline.
     """
-    hz_in_window = [
-        hz for t, hz, conf in zip(contour_times, contour_hz, contour_confidence)
-        if start <= t < end and conf >= confidence_threshold and hz > 0
-    ]
-    if not hz_in_window:
+    if pyphen is None:
         return None
-    hz_in_window.sort()
-    n = len(hz_in_window)
-    return hz_in_window[n // 2] if n % 2 else (hz_in_window[n // 2 - 1] + hz_in_window[n // 2]) / 2.0
+    lang = _PYPHEN_LANG_MAP.get(whisper_language_code, "en_US")
+    try:
+        return pyphen.Pyphen(lang=lang)
+    except KeyError:
+        try:
+            return pyphen.Pyphen(lang="en_US")
+        except KeyError:
+            return None
 
 
-def build_speaker_structure(diarized_words, contour_times, contour_hz, contour_confidence,
-                             confidence_threshold=CREPE_CONFIDENCE_THRESHOLD):
+def syllabify_word(word, dic):
     """
-    diarized_words: list of {"speaker": str, "start": float, "end": float, "word": str}
-    Returns: {"speakers": {speaker_id: {"words": [...], "contour": [...]}}}
-
-    Diarization is kept intact per speaker_id all the way through export —
-    the feedpak lyrics/vocal-pitch schemas have no per-word speaker field,
-    so the split into per-speaker files has to happen upstream (in Script
-    3, from this structure), not be reconstructed later from a flat list.
+    Splits a transcribed word into syllables (e.g. "Montreux" ->
+    ["Mon-", "treux"]), matching the standard vocal-chart convention of
+    a trailing hyphen on every syllable but the last. Falls back to the
+    whole word as a single "syllable" — no hyphen — whenever splitting
+    isn't safe: no dictionary available, the word has no alphabetic
+    core (numbers, pure punctuation), it's short enough that a split
+    would be spurious, or the dictionary finds no break point.
     """
-    speakers = {}
+    if dic is None:
+        return [word]
 
-    for w in diarized_words:
-        spk = w["speaker"]
-        speakers.setdefault(spk, {"words": [], "contour_indices": set()})
+    leading = ""
+    trailing = ""
+    core = word
+    while core and core[0] in _SYLLABLE_STRIP_CHARS:
+        leading += core[0]
+        core = core[1:]
+    while core and core[-1] in _SYLLABLE_STRIP_CHARS:
+        trailing = core[-1] + trailing
+        core = core[:-1]
 
-        median_hz = aggregate_pitch_for_window(
-            w["start"], w["end"], contour_times, contour_hz, contour_confidence,
-            confidence_threshold=confidence_threshold,
-        )
-        entry = {
-            "t": round(w["start"], 4),
-            "d": round(w["end"] - w["start"], 4),
-            "w": w["word"],
-        }
-        if median_hz is not None:
-            midi = fc.hz_to_midi(median_hz)
-            entry["midi"] = round(midi)
-        speakers[spk]["words"].append(entry)
+    if not core.isalpha() or len(core) <= 3:
+        return [word]
 
-        for i, t in enumerate(contour_times):
-            if w["start"] <= t < w["end"]:
-                speakers[spk]["contour_indices"].add(i)
+    hyphenated = dic.inserted(core, hyphen="\x01")
+    parts = [p for p in hyphenated.split("\x01") if p]
+    if len(parts) <= 1:
+        return [word]
 
-    result = {"speakers": {}}
-    for spk, data in speakers.items():
-        contour = [
-            {"t": round(contour_times[i], 4), "hz": round(contour_hz[i], 3)}
-            for i in sorted(data["contour_indices"])
-            if contour_confidence[i] >= confidence_threshold and contour_hz[i] > 0
-        ]
-        result["speakers"][spk] = {
-            "words": sorted(data["words"], key=lambda e: e["t"]),
-            "contour": contour,
-        }
+    parts[0] = leading + parts[0]
+    parts[-1] = parts[-1] + trailing
+    return [p + "-" for p in parts[:-1]] + [parts[-1]]
+
+
+def distribute_word_time_across_syllables(start, end, syllables):
+    """
+    Splits a word's [start, end) alignment window into one sub-window
+    per syllable, proportional to each syllable's character count (we
+    only have word-level timestamps from forced alignment, not
+    phoneme-level, so this is a deliberate approximation — good enough
+    to place syllable onsets in the right neighborhood, not a claim of
+    phonetic precision). Returns [(syl_start, syl_end, syllable_text), ...].
+    """
+    core_lens = [max(1, len(s.rstrip("-"))) for s in syllables]
+    total = sum(core_lens)
+    duration = end - start
+    spans = []
+    t = start
+    for syl, clen in zip(syllables, core_lens):
+        d = duration * (clen / total)
+        spans.append((t, t + d, syl))
+        t += d
+    return spans
+
+
+def segment_contour_into_notes(times, hz, confidence, conf_threshold=CREPE_CONFIDENCE_THRESHOLD,
+                                min_note_seconds=0.12, semitone_tolerance=0.75):
+    """
+    Groups contiguous confident CREPE frames into monophonic note
+    segments (runs of stable pitch). Used within a single syllable's
+    time window to detect melisma: if a syllable's window contains more
+    than one of these, the syllable is being sung across more than one
+    pitch, and every segment past the first becomes a "+" continuation
+    entry — the standard vocal-chart notation for a sustained note
+    changing pitch without new lyric text.
+    """
+    segments = []
+    current = None
+    for t, h, c in zip(times, hz, confidence):
+        if c < conf_threshold or h <= 0:
+            if current:
+                segments.append(current)
+                current = None
+            continue
+        midi = fc.hz_to_midi(h)
+        if current is None:
+            current = {"start": t, "end": t, "midis": [midi]}
+        elif abs(midi - (sum(current["midis"]) / len(current["midis"]))) <= semitone_tolerance:
+            current["end"] = t
+            current["midis"].append(midi)
+        else:
+            segments.append(current)
+            current = {"start": t, "end": t, "midis": [midi]}
+    if current:
+        segments.append(current)
+
+    out = []
+    for seg in segments:
+        if seg["end"] - seg["start"] < min_note_seconds:
+            continue
+        sorted_midis = sorted(seg["midis"])
+        median_midi = sorted_midis[len(sorted_midis) // 2]
+        out.append({"start": seg["start"], "end": seg["end"], "midi": round(median_midi)})
+    return out
+
+
+def expand_word(word_entry, syllable_dic):
+    syllables=syllabify_word(word_entry["word"],syllable_dic)
+    spans=distribute_word_time_across_syllables(word_entry["start"],word_entry["end"],syllables)
+    return [{"t":round(a,4),"d":round(b-a,4),"w":w} for a,b,w in spans]
+
+
+def representative_pitch(syllable,times,hz,confidence,threshold=CREPE_CONFIDENCE_THRESHOLD):
+    start=syllable["t"]; end=start+syllable["d"]
+    vals=sorted(fc.hz_to_midi(h) for t,h,c in zip(times,hz,confidence)
+                if start<=t<end and c>=threshold and h>0)
+    return int(round(vals[len(vals)//2])) if vals else None
+
+
+def build_speaker_structure(diarized_words,contour_times,contour_hz,contour_confidence,
+                             confidence_threshold=CREPE_CONFIDENCE_THRESHOLD,
+                             whisper_language_code="en"):
+    dic=get_syllable_dictionary(whisper_language_code); speakers={}
+    for word in diarized_words:
+        sp=word["speaker"]; speakers.setdefault(sp,{"words":[],"indices":set()})
+        speakers[sp]["words"].extend(expand_word(word,dic))
+        for i,t in enumerate(contour_times):
+            if word["start"]<=t<word["end"]: speakers[sp]["indices"].add(i)
+    result={"language":whisper_language_code,"speakers":{}}
+    for sp,data in speakers.items():
+        words=sorted(data["words"],key=lambda x:x["t"]); notes=[]
+        for syl in words:
+            midi=representative_pitch(syl,contour_times,contour_hz,contour_confidence,confidence_threshold)
+            if midi is not None: notes.append({"t":syl["t"],"d":syl["d"],"midi":midi})
+        contour=[{"t":round(contour_times[i],4),"hz":round(contour_hz[i],3)}
+                 for i in sorted(data["indices"])
+                 if contour_confidence[i]>=confidence_threshold and contour_hz[i]>0]
+        result["speakers"][sp]={"words":words,"pitch_notes":notes,"contour":contour}
     return result
 
 
@@ -127,7 +230,8 @@ def run_whisperx(audio_path, device="cuda", batch_size=16, compute_type="float16
 
     with fc.timed_step("Transcribing", indent=1):
         result = model.transcribe(audio, batch_size=batch_size)
-    fc.log(f"Detected language: {result.get('language', '?')}", indent=1)
+    detected_language = result["language"]
+    fc.log(f"Detected language: {detected_language}", indent=1)
 
     with fc.timed_step("Loading forced-alignment model", indent=1):
         align_model, metadata = whisperx.load_align_model(
@@ -160,7 +264,7 @@ def run_whisperx(audio_path, device="cuda", batch_size=16, compute_type="float16
     speakers_found = sorted({w["speaker"] for w in words})
     fc.log(f"Got {len(words)} timed words across {len(speakers_found)} speaker(s) "
            f"{speakers_found} ({skipped} words skipped, no timing)", indent=1)
-    return words
+    return words, detected_language
 
 
 def run_crepe(audio_path, device="cuda", hop_seconds=CREPE_HOP_SECONDS):
@@ -203,18 +307,15 @@ def run_crepe(audio_path, device="cuda", hop_seconds=CREPE_HOP_SECONDS):
 def process(vocals_path, device="cuda", hf_token=None):
     fc.log(f"Processing vocal stem: {vocals_path}")
     fc.log_step(1, 3, "WhisperX (transcribe + align + diarize)")
-    words = run_whisperx(vocals_path, device=device, hf_token=hf_token)
+    words, language = run_whisperx(vocals_path, device=device, hf_token=hf_token)
 
     fc.log_step(2, 3, "CREPE pitch tracking")
     times, hz, confidence = run_crepe(vocals_path, device=device)
 
-    fc.log_step(3, 3, "Aggregating pitch per word, splitting by speaker")
-    result = build_speaker_structure(words, times, hz, confidence)
+    fc.log_step(3, 3, "Splitting into syllables, detecting melisma, splitting by speaker")
+    result = build_speaker_structure(words, times, hz, confidence, whisper_language_code=language)
     for speaker_id, data in result["speakers"].items():
-        with_pitch = sum(1 for w in data["words"] if "midi" in w)
-        fc.log(f"{speaker_id}: {len(data['words'])} words "
-               f"({with_pitch} with a resolved pitch), "
-               f"{len(data['contour'])} contour samples", indent=1)
+        fc.log(f"{speaker_id}: {len(data['words'])} syllables, {len(data.get('pitch_notes',[]))} pitch notes, {len(data['contour'])} contour samples",indent=1)
     return result
 
 

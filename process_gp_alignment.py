@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import json
+import math
 
 import numpy as np
 
@@ -148,6 +149,211 @@ def compute_dense_measure_tempos(warped_beats, fallback_bpm):
         dense.append({"time": b["time"], "bpm": bpm})
     return dense
 
+
+
+def _event_times(entries, key="t_gp"):
+    return sorted({float(e[key]) for e in entries if key in e})
+
+
+def _keyboard_onsets(notation):
+    times=[]
+    for measure in notation.get("measures", []):
+        for stave in measure.get("staves", {}).values():
+            for voice in stave.get("voices", []):
+                times.extend(b["t_gp"] for b in voice.get("beats", []) if "t_gp" in b)
+    return sorted(set(times))
+
+
+def _source_band(source, sr):
+    nyquist=sr/2.0
+    if source == "bass": return 30.0, min(1200.0, nyquist)
+    if source == "piano": return 45.0, min(6000.0, nyquist)
+    return 30.0, nyquist
+
+
+def _source_click_frequency(source):
+    return {"bass": 90.0, "piano": 880.0, "drums": 180.0}.get(source, 180.0)
+
+
+def compute_warp_candidate(event_times, audio_path, source, sr=22050, band_rad=0.25):
+    """Build one instrument-specific DTW candidate without altering chart timing."""
+    if librosa is None or interp1d is None or not event_times or not audio_path:
+        return None
+    y, actual_sr=librosa.load(audio_path, sr=sr, mono=True)
+    duration=len(y)/actual_sr
+    synth=synthesize_click_track(event_times, actual_sr, duration,
+                                 freq=_source_click_frequency(source))
+    fmin,fmax=_source_band(source,actual_sr)
+    # Symmetric representation: real and synthetic use the same Mel band.
+    real_mel=librosa.feature.melspectrogram(y=y,sr=actual_sr,fmin=fmin,fmax=fmax)
+    synth_mel=librosa.feature.melspectrogram(y=synth,sr=actual_sr,fmin=fmin,fmax=fmax)
+    real_db=librosa.power_to_db(real_mel,ref=np.max)
+    synth_db=librosa.power_to_db(synth_mel,ref=np.max)
+    onset_real=librosa.onset.onset_strength(S=real_db,sr=actual_sr)
+    onset_synth=librosa.onset.onset_strength(S=synth_db,sr=actual_sr)
+    _,wp=librosa.sequence.dtw(X=onset_synth[np.newaxis,:],Y=onset_real[np.newaxis,:],
+                              global_constraints=True,band_rad=band_rad)
+    fs=wp[::-1,0]; fr=wp[::-1,1]
+    ts=librosa.frames_to_time(fs,sr=actual_sr)
+    tr=librosa.frames_to_time(fr,sr=actual_sr)
+    x,yv=fc.dedupe_monotonic_path(list(ts),list(tr))
+    if len(x)<2: return None
+    interp=interp1d(x,yv,kind="linear",bounds_error=False,fill_value=(yv[0],yv[-1]))
+    def warp(t): return float(interp(t))
+    real_onsets=librosa.onset.onset_detect(onset_envelope=onset_real,sr=actual_sr,
+                                           units="time",backtrack=False)
+    residuals=[]
+    if len(real_onsets):
+        real_onsets=np.asarray(real_onsets,dtype=float)
+        for t in event_times:
+            m=warp(t); pos=int(np.searchsorted(real_onsets,m)); choices=[]
+            if pos<len(real_onsets): choices.append(abs(real_onsets[pos]-m))
+            if pos>0: choices.append(abs(real_onsets[pos-1]-m))
+            if choices: residuals.append(min(choices)*1000.0)
+    median=float(np.median(residuals)) if residuals else 1000.0
+    p95=float(np.percentile(residuals,95)) if residuals else 1500.0
+    max_frames=max(len(onset_synth),len(onset_real),1)
+    limit=max(1.0,band_rad*max_frames)
+    dist=np.abs(wp[:,0].astype(float)-wp[:,1].astype(float))
+    edge=float(np.mean(dist>=0.9*limit)*100.0) if len(dist) else 100.0
+    event_span=max(event_times[-1]-event_times[0],1e-6)
+    coverage=max(0.0,min(1.0,(float(x[-1])-float(x[0]))/event_span))
+    score=1.5*coverage-median/180.0-p95/600.0-edge/35.0+0.12*math.log1p(len(event_times))
+    diag={"source":source,"audio":str(audio_path),"event_count":len(event_times),
+          "frequency_band_hz":[fmin,fmax],"median_residual_ms":round(median,3),
+          "p95_residual_ms":round(p95,3),"coverage":round(coverage,4),
+          "band_edge_percent":round(edge,3),"quality_score":round(score,6),
+          "nominal_anchor_start":round(float(x[0]),6),
+          "nominal_anchor_end":round(float(x[-1]),6)}
+    return {"source":source,"warp":warp,"score":score,"diagnostics":diag}
+
+
+def _candidate_agreement(candidates, sample_times):
+    """Pairwise disagreement at shared measure boundaries, in milliseconds."""
+    pairs=[]
+    for i in range(len(candidates)):
+        for j in range(i+1,len(candidates)):
+            diffs=np.asarray([abs(candidates[i]["warp"](t)-candidates[j]["warp"](t))*1000.0
+                              for t in sample_times],dtype=float)
+            if len(diffs):
+                pairs.append({"sources":[candidates[i]["source"],candidates[j]["source"]],
+                              "median_ms":round(float(np.median(diffs)),3),
+                              "p95_ms":round(float(np.percentile(diffs,95)),3),
+                              "max_ms":round(float(np.max(diffs)),3)})
+    return pairs
+
+
+def choose_probabilistic_warp(candidates, sample_times, selection_threshold=0.55,
+                              agreement_median_ms=75.0, agreement_p95_ms=200.0,
+                              agreement_max_ms=400.0):
+    valid=[c for c in candidates if c]
+    if not valid:
+        fn=lambda t:t
+        fn.alignment_diagnostics={"mode":"identity","reason":"no usable alignment reference",
+                                  "candidates":[],"agreement":[]}
+        return fn
+    scores=np.asarray([c["score"] for c in valid],dtype=float)
+    weights=np.exp(scores-np.max(scores)); weights/=np.sum(weights)
+    for c,w in zip(valid,weights): c["diagnostics"]["probability"]=round(float(w),6)
+    agreement=_candidate_agreement(valid,sample_times)
+    agree=all(p["median_ms"]<=agreement_median_ms and p["p95_ms"]<=agreement_p95_ms
+              and p["max_ms"]<=agreement_max_ms for p in agreement)
+    best=int(np.argmax(weights))
+    if len(valid)==1 or weights[best]>=selection_threshold or not agree:
+        chosen=valid[best]; fn=chosen["warp"]
+        mode="selected" if agree or len(valid)==1 else "selected_due_to_disagreement"
+        fn.alignment_diagnostics={"mode":mode,"selected_source":chosen["source"],
+                                  "candidates":[c["diagnostics"] for c in valid],
+                                  "agreement":agreement}
+        return fn
+    def fused(t): return float(sum(w*c["warp"](t) for c,w in zip(valid,weights)))
+    fused.alignment_diagnostics={"mode":"probability_fusion","selected_source":None,
+                                 "candidates":[c["diagnostics"] for c in valid],
+                                 "agreement":agreement}
+    return fused
+
+
+def sanitize_warped_downbeats(nominal, warped, min_ratio=0.30, max_ratio=2.00,
+                              min_seconds=0.20, max_bpm=400.0):
+    """Repair bounded local DTW failures before any tempo or beat output is built."""
+    n=min(len(nominal),len(warped)); clean=[dict(x) for x in warped[:n]]
+    bad=set(); reasons={}
+    for i in range(n-1):
+        nom=nominal[i+1]["t_gp"]-nominal[i]["t_gp"]
+        dur=clean[i+1]["time"]-clean[i]["time"]
+        ratio=dur/nom if nom>0 else 1.0
+        bpm=clean[i].get("ts_num",4)*60.0/dur if dur>0 else float("inf")
+        why=[]
+        if dur<=0: why.append("non_monotonic")
+        if dur<min_seconds: why.append("too_short")
+        if nom>0 and (ratio<min_ratio or ratio>max_ratio): why.append("stretch_ratio")
+        if bpm>max_bpm: why.append("extreme_bpm")
+        if why: bad.add(i); bad.add(i+1); reasons[i]=why
+    repairs=[]
+    if bad:
+        groups=[]
+        for idx in sorted(bad):
+            if not groups or idx>groups[-1][-1]+1: groups.append([idx])
+            else: groups[-1].append(idx)
+        for group in groups:
+            left=group[0]-1; right=group[-1]+1
+            if left<0 or right>=n:
+                continue
+            t0=clean[left]["time"]; t1=clean[right]["time"]
+            if t1<=t0: continue
+            nominal_span=nominal[right]["t_gp"]-nominal[left]["t_gp"]
+            if nominal_span<=0: continue
+            for k in range(left+1,right):
+                frac=(nominal[k]["t_gp"]-nominal[left]["t_gp"])/nominal_span
+                clean[k]["time"]=round(t0+frac*(t1-t0),4)
+            repairs.append({"from_measure":clean[group[0]]["measure"],
+                            "to_measure":clean[group[-1]]["measure"],
+                            "method":"bounded_linear_interpolation"})
+    # Final strict validation. No duplicate or backward boundaries may ship.
+    severe=[]
+    for i in range(n-1):
+        dur=clean[i+1]["time"]-clean[i]["time"]
+        if dur<=0 or dur<min_seconds:
+            severe.append({"measure":clean[i]["measure"],"duration":round(dur,6)})
+    return clean,{"detected_bad_indices":sorted(bad),"repairs":repairs,
+                  "unresolved_severe":severe,"original_reasons":reasons}
+
+
+def build_explicit_feedpak_beats(downbeats):
+    out=[]; previous=None
+    for i,b in enumerate(downbeats):
+        start=float(b["time"]); count=max(1,int(b.get("ts_num",4)))
+        duration=(float(downbeats[i+1]["time"])-start) if i+1<len(downbeats) else previous
+        if duration and duration>0: previous=duration
+        if out and start<=out[-1]["time"]: continue
+        out.append({"time":round(start,4),"measure":int(b["measure"])})
+        if not duration or duration<=0: continue
+        for j in range(1,count):
+            t=round(start+j*duration/count,4)
+            if t>out[-1]["time"]: out.append({"time":t,"measure":-1})
+    return out
+
+
+def analyze_alignment_quality(nominal,warped,warp_fn,sanitization):
+    warnings=[]; ratios=[]
+    for i in range(min(len(nominal),len(warped))-1):
+        nd=nominal[i+1]["t_gp"]-nominal[i]["t_gp"]
+        wd=warped[i+1]["time"]-warped[i]["time"]
+        if nd>0 and wd>0:
+            r=wd/nd; ratios.append(r)
+            if abs(r-1)>0.15: warnings.append({"level":"warning","kind":"measure_stretch",
+                                               "measure":warped[i]["measure"],"ratio":round(r,4)})
+    if sanitization["repairs"]:
+        warnings.append({"level":"warning","kind":"repaired_timeline",
+                         "repairs":sanitization["repairs"]})
+    if sanitization["unresolved_severe"]:
+        warnings.append({"level":"severe","kind":"unresolved_timeline",
+                         "items":sanitization["unresolved_severe"]})
+    levels={w["level"] for w in warnings}
+    severity="severe" if "severe" in levels else "warning" if "warning" in levels else "ok"
+    return {"version":1,"severity":severity,"decision":getattr(warp_fn,"alignment_diagnostics",{}),
+            "sanitization":sanitization,"min_stretch":round(min(ratios or [1]),4),
+            "max_stretch":round(max(ratios or [1]),4),"warnings":warnings}
 
 
 def shift_nominal_times(entries, offset, time_key="t_gp"):
@@ -499,7 +705,9 @@ def get_initial_tempo(gp_path):
     return float(song.tempo)
 
 
-def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
+def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_path=None,
+            sr=22050, count_in_offset=0.0, timeline_mode="both",
+            allow_severe_alignment=False):
     if guitarpro is None:
         raise RuntimeError("pyguitarpro is required: pip install pyguitarpro")
 
@@ -519,6 +727,8 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
     fc.log_step(2, 5, "Routing tracks (fretted / drum / keyboard)")
     fretted_tracks = {}
     drum_hits_gp = []
+    bass_alignment_events = []
+    piano_alignment_events = []
     notation_tracks = {}
 
     for track in song.tracks:
@@ -530,13 +740,15 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
             fc.log(f"{len(drum_hits_gp)} drum hits parsed", indent=2)
         elif _looks_like_keyboard(track):
             fc.log(f"'{track.name}' -> keyboard/notation track", indent=1)
-            notation_tracks[_safe_track_id(track)] = parse_keyboard_track(
-                track, tempo_events, first_tick
-            )
+            notation = parse_keyboard_track(track, tempo_events, first_tick)
+            notation_tracks[_safe_track_id(track)] = notation
+            piano_alignment_events.extend({"t_gp": t} for t in _keyboard_onsets(notation))
         else:
             fc.log(f"'{track.name}' -> fretted track", indent=1)
             data = parse_fretted_track(track, tempo_events, first_tick)
             fretted_tracks[_safe_track_id(track)] = data
+            if "bass" in (track.name or "").lower() or "bass" in data["name"].lower():
+                bass_alignment_events.extend({"t_gp": n["t_gp"]} for n in data["notes"])
             fc.log(f"{len(data['notes'])} notes, {len(data['anchors'])} anchors", indent=2)
 
     fc.log_step(3, 5, "Reading key signatures + building song timeline")
@@ -554,20 +766,30 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
         data["notes"] = shift_nominal_times(data["notes"], count_in_offset)
         data["anchors"] = shift_nominal_times(data["anchors"], count_in_offset, time_key="time")
     drum_hits_gp = shift_nominal_times(drum_hits_gp, count_in_offset)
+    bass_alignment_events = shift_nominal_times(bass_alignment_events, count_in_offset)
+    piano_alignment_events = shift_nominal_times(piano_alignment_events, count_in_offset)
     key_events_gp = shift_nominal_times(key_events_gp, count_in_offset)
     song_timeline_gp["time_signatures"] = shift_nominal_times(
         song_timeline_gp["time_signatures"], count_in_offset)
     song_timeline_gp["beats"] = shift_nominal_times(song_timeline_gp["beats"], count_in_offset)
 
     fc.log_step(4, 5, "DTW-aligning nominal GP timing to real audio")
-    if drum_hits_gp:
-        fc.log(f"Reference: {drums_audio_path}", indent=1)
-        with fc.timed_step("Computing DTW warp function", indent=1):
-            warp_fn = compute_warp_function(drum_hits_gp, drums_audio_path, sr=sr)
-    else:
-        fc.log("No drum hits parsed from the GP file — skipping DTW, "
-               "using identity mapping (nominal GP timing unchanged).", indent=1)
-        warp_fn = lambda t: t
+    specs=[("drums",_event_times(drum_hits_gp),drums_audio_path),
+           ("bass",_event_times(bass_alignment_events),bass_audio_path),
+           ("piano",_event_times(piano_alignment_events),piano_audio_path)]
+    candidates=[]
+    for source,event_times,audio_path in specs:
+        if event_times and audio_path:
+            fc.log(f"Building {source} alignment candidate from {len(event_times)} onsets",indent=1)
+            candidates.append(compute_warp_candidate(event_times,audio_path,source,sr=sr))
+    sample_times=[b["t_gp"] for b in song_timeline_gp["beats"]]
+    warp_fn=choose_probabilistic_warp(candidates,sample_times)
+    decision=warp_fn.alignment_diagnostics
+    fc.log(f"Alignment decision: {decision.get('mode')} {decision.get('selected_source') or ''}",indent=1)
+    for c in decision.get("candidates",[]):
+        fc.log(f"{c['source']}: p={c.get('probability',0):.3f}, median={c.get('median_residual_ms',0):.1f}ms, coverage={c.get('coverage',0):.2f}",indent=2)
+    for pair in decision.get("agreement",[]):
+        fc.log(f"Agreement {pair['sources']}: median={pair['median_ms']:.1f}ms, p95={pair['p95_ms']:.1f}ms",indent=2)
 
     drum_hits = apply_warp(drum_hits_gp, warp_fn)
     key_events = apply_warp(key_events_gp, warp_fn)
@@ -576,16 +798,26 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
         {"time": round(warp_fn(e["t_gp"]), 4), "measure": e["measure"], "ts_num": e["ts_num"]}
         for e in song_timeline_gp["beats"]
     ]
-    dense_tempos = compute_dense_measure_tempos(warped_beats, fallback_bpm=float(tempo_events[0][1]))
-    fc.log(f"{len(dense_tempos)} per-measure tempo event(s) computed from real (warped) "
-           f"bar durations — this is the actual bar-subdivision data a renderer draws "
-           f"from, not a sparse authored-tempo list", indent=1)
-    song_timeline = {
-        "tempos": dense_tempos,
-        "time_signatures": [{"time": round(warp_fn(e["t_gp"]), 4), "ts": e["ts"]}
-                             for e in song_timeline_gp["time_signatures"]],
-        "beats": [{"time": b["time"], "measure": b["measure"]} for b in warped_beats],
+    warped_beats,sanitization=sanitize_warped_downbeats(song_timeline_gp["beats"],warped_beats)
+    dense_tempos=compute_dense_measure_tempos(warped_beats,fallback_bpm=float(tempo_events[0][1]))
+    explicit_beats=build_explicit_feedpak_beats(warped_beats)
+    alignment_report=analyze_alignment_quality(song_timeline_gp["beats"],warped_beats,warp_fn,sanitization)
+    fc.log(f"ALIGNMENT QUALITY: {alignment_report['severity'].upper()}",indent=1)
+    for repair in sanitization["repairs"]:
+        fc.log(f"REPAIRED measures {repair['from_measure']}..{repair['to_measure']} by bounded interpolation",indent=2)
+    for severe in sanitization["unresolved_severe"]:
+        fc.log(f"SEVERE measure {severe['measure']}: duration={severe['duration']:.4f}s",indent=2)
+    if alignment_report["severity"]=="severe" and not allow_severe_alignment:
+        raise RuntimeError("Severe alignment remains after repair; refusing to package. Review the report or pass --allow-severe-alignment.")
+    song_timeline={
+        "tempos":dense_tempos,
+        "time_signatures":[{"time":round(warp_fn(e["t_gp"]),4),"ts":e["ts"]}
+                           for e in song_timeline_gp["time_signatures"]],
     }
+    if timeline_mode in ("both","beats"):
+        song_timeline["beats"]=explicit_beats
+    if timeline_mode=="beats":
+        song_timeline.pop("tempos",None)
 
     fc.log_step(5, 5, "Applying warp to all tracks")
     arrangements_out = {}
@@ -626,6 +858,7 @@ def process(gp_path, drums_audio_path, sr=22050, count_in_offset=0.0):
         "keys": {"version": 1, "events": [{"t": e["t"], "key": e["key"]} for e in key_events]}
                  if key_events else None,
         "song_timeline": song_timeline,
+        "alignment_report": alignment_report,
     }
     fc.log(f"Done: {len(arrangements_out)} fretted arrangement(s), "
            f"{len(drum_hits)} drum hits, {len(warped_notation)} notation track(s)")
@@ -645,7 +878,13 @@ def _safe_track_id(track):
 def main():
     parser = argparse.ArgumentParser(description="Parse a .gp5 file and align it to real audio via DTW.")
     parser.add_argument("gp_file", help="Path to the .gp5 file")
-    parser.add_argument("drums_audio", help="Path to the isolated drums stem (e.g. drums.ogg)")
+    parser.add_argument("drums_audio", nargs="?", default=None, help="Optional isolated drums stem")
+    parser.add_argument("--bass-audio", default=None)
+    parser.add_argument("--piano-audio", default=None)
+    parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
+                        help="A/B test output: dense tempos only, explicit beats only, or both")
+    parser.add_argument("--allow-severe-alignment", action="store_true",
+                        help="Package even if severe structural timing errors remain after repair")
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)
     parser.add_argument("--count-in-offset", type=float, default=0.0,
@@ -654,8 +893,10 @@ def main():
                               "by build_feedpak.py; 0.0 if the audio already had none).")
     args = parser.parse_args()
 
-    result = process(args.gp_file, args.drums_audio, sr=args.sr,
-                      count_in_offset=args.count_in_offset)
+    result=process(args.gp_file,args.drums_audio,bass_audio_path=args.bass_audio,
+                   piano_audio_path=args.piano_audio,sr=args.sr,
+                   count_in_offset=args.count_in_offset,timeline_mode=args.timeline_mode,
+                   allow_severe_alignment=args.allow_severe_alignment)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

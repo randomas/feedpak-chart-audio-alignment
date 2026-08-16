@@ -1,3 +1,4 @@
+
 """
 build_feedpak.py
 
@@ -120,6 +121,47 @@ def probe_duration_seconds(audio_path):
 # Count-in padding
 # --------------------------------------------------------------------------
 
+def compress_padded_stem(wav_path, out_dir):
+    """
+    Re-encodes a padded WAV stem into a compressed format before it's
+    eligible for final packaging — WAV is only safe/necessary as the
+    transient output of pad_audio_with_silence() (see its docstring for
+    the libsndfile OGG-write crash this avoids); it must never end up in
+    the shipped .feedpak, where an uncompressed 3-4 minute stereo 44.1kHz
+    stem runs ~35-45MB apiece.
+
+    Tries ffmpeg's own Vorbis encoder first — a completely different
+    code path from libsndfile's (which is what crashed), and ffmpeg is
+    already a required install for this project (see README setup). If
+    ffmpeg isn't on PATH or fails, falls back to FLAC via soundfile:
+    still lossless, confirmed not to hit the libsndfile crash (unlike
+    Vorbis), and a large size improvement over raw WAV even though it's
+    bigger than OGG.
+
+    Deletes wav_path once the replacement is written. Returns the new
+    file's path.
+    """
+    base = os.path.splitext(os.path.basename(wav_path))[0]
+    ogg_path = os.path.join(out_dir, base + ".ogg")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path,
+             "-c:a", "libvorbis", "-qscale:a", "5", ogg_path],
+            check=True,
+        )
+        os.remove(wav_path)
+        return ogg_path
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        fc.log(f"ffmpeg OGG encode unavailable/failed ({e}); "
+               f"falling back to FLAC for this stem", indent=1)
+        flac_path = os.path.join(out_dir, base + ".flac")
+        import soundfile as sf
+        data, sr = sf.read(wav_path, dtype="float32", always_2d=True)
+        sf.write(flac_path, data, sr, format="FLAC")
+        os.remove(wav_path)
+        return flac_path
+
+
 def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
                                  min_pad_epsilon=0.005):
     """
@@ -176,14 +218,14 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
         src = os.path.join(song_folder, os.path.basename(stem["file"]))
         src_basename = os.path.basename(stem["file"])
         if pad_seconds:
-            # Padded stems are written as WAV regardless of source format
-            # — see pad_audio_with_silence()'s docstring for why. Update
-            # both the on-disk filename and this stem's manifest `file`
-            # entry to match, so the archive and the manifest agree.
-            new_basename = os.path.splitext(src_basename)[0] + ".wav"
-            dst = os.path.join(stems_out_dir, new_basename)
-            fc.pad_audio_with_silence(src, dst, pad_seconds)
-            stem["file"] = fc.to_posix_relpath("stems", new_basename)
+            # Pad to WAV first (safe, no crash risk — see
+            # pad_audio_with_silence()'s docstring), then immediately
+            # compress that WAV before it's eligible for packaging.
+            wav_basename = os.path.splitext(src_basename)[0] + ".wav"
+            wav_path = os.path.join(stems_out_dir, wav_basename)
+            fc.pad_audio_with_silence(src, wav_path, pad_seconds)
+            dst = compress_padded_stem(wav_path, stems_out_dir)
+            stem["file"] = fc.to_posix_relpath("stems", os.path.basename(dst))
         else:
             import shutil
             dst = os.path.join(stems_out_dir, src_basename)
@@ -217,84 +259,47 @@ def run_vocals_script(vocals_path, out_path, device="cuda", hf_token=None):
     fc.log("process_vocals.py finished")
 
 
-def run_gp_script(gp_path, drums_path, out_path, sr=22050, count_in_offset=0.0):
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "process_gp_alignment.py"),
-           gp_path, drums_path, "--out", out_path, "--sr", str(sr),
-           "--count-in-offset", str(count_in_offset)]
-    fc.log(f"Launching process_gp_alignment.py as a subprocess (sr={sr}, "
-           f"count_in_offset={count_in_offset:.3f}s)")
-    subprocess.run(cmd, check=True)
-    fc.log("process_gp_alignment.py finished")
+def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
+                  bass_path=None,piano_path=None,timeline_mode="both",
+                  allow_severe_alignment=False):
+    cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path]
+    if drums_path: cmd.append(drums_path)
+    cmd += ["--out",out_path,"--sr",str(sr),"--count-in-offset",str(count_in_offset),
+            "--timeline-mode",timeline_mode]
+    if bass_path: cmd += ["--bass-audio",bass_path]
+    if piano_path: cmd += ["--piano-audio",piano_path]
+    if allow_severe_alignment: cmd.append("--allow-severe-alignment")
+    fc.log("Launching guarded multi-reference GP/audio alignment")
+    subprocess.run(cmd,check=True)
 
 
 # --------------------------------------------------------------------------
 # Wire-format conversion
 # --------------------------------------------------------------------------
 
-def write_lyric_tracks(vocals_data, work_dir, vocal_stem_id):
-    """
-    NOT CALLED in v1 — build() currently uses write_single_merged_lyrics()
-    instead (see that function's docstring for why). Kept here, tested,
-    and ready for when per-speaker lyric_tracks[] becomes the v2 default.
+def write_lyric_tracks(vocals_data,work_dir,vocal_stem_id):
+    entries=[]; files=[]; language=vocals_data.get("language") or "und"
+    for i,(speaker,data) in enumerate(sorted(vocals_data.get("speakers",{}).items()),1):
+        if not data.get("words"): continue
+        sid="".join(c if c.isalnum() else "_" for c in speaker.lower()).strip("_") or f"speaker_{i:02d}"
+        fn=f"lyrics_{sid}.json"; fc.write_json(os.path.join(work_dir,fn),data["words"])
+        entries.append({"id":sid,"file":fn,"language":language,"kind":"original","stem":vocal_stem_id,"name":f"Voice {i}"}); files.append(fn)
+    return entries,files
 
-    Splits diarized speakers into one lyrics_<speaker>.json per speaker
-    (flat {t,d,w} array per lyrics.schema.json) — the schema has no
-    per-word speaker field, so this has to be a file-per-speaker split,
-    not a merged file. Returns (lyric_track_manifest_entries, files_written).
-    """
-    entries = []
-    files = []
-    speakers = vocals_data.get("speakers", {})
-    for speaker_id, data in speakers.items():
-        words = data.get("words", [])
-        if not words:
-            continue
-        flat = [{"t": w["t"], "d": w["d"], "w": w["w"]} for w in words]
-        filename = f"lyrics_{speaker_id.lower()}.json"
-        fc.write_json(os.path.join(work_dir, filename), flat)
-        files.append(filename)
-        entries.append({
-            "id": speaker_id.lower(),
-            "file": fc.to_posix_relpath(filename),
-            "language": "und",
-            "kind": "original",
-            "stem": vocal_stem_id,
-        })
-    return entries, files
-
-
-def write_merged_vocal_pitch(vocals_data, work_dir):
-    """
-    vocal_pitch.json / vocal_pitch_contour.json are single top-level
-    manifest entries — the schemas have no per-speaker field and the
-    manifest has no per-speaker list for pitch (unlike lyric_tracks), so
-    for multi-vocalist songs all speakers' discrete notes / contour
-    samples are merged into one flat, time-sorted array. This is a real
-    schema limitation, not an oversight — see architecture doc §2.3.
-    """
-    all_notes = []
-    all_samples = []
-    for data in vocals_data.get("speakers", {}).values():
-        for w in data.get("words", []):
-            if "midi" in w:
-                all_notes.append({"t": w["t"], "d": w["d"], "midi": w["midi"]})
-        for s in data.get("contour", []):
-            all_samples.append(s)
-
-    all_notes.sort(key=lambda n: n["t"])
-    all_samples.sort(key=lambda s: s["t"])
-
-    wrote_pitch = wrote_contour = False
-    if all_notes:
-        fc.write_json(os.path.join(work_dir, "vocal_pitch.json"),
-                       {"version": 1, "notes": all_notes})
-        wrote_pitch = True
-    if all_samples:
-        fc.write_json(os.path.join(work_dir, "vocal_pitch_contour.json"),
-                       {"version": 1, "samples": all_samples})
-        wrote_contour = True
-    return wrote_pitch, wrote_contour
-
+def write_merged_vocal_pitch(vocals_data,work_dir):
+    notes=[]; samples=[]
+    for data in vocals_data.get("speakers",{}).values():
+        notes.extend(data.get("pitch_notes",[])); samples.extend(data.get("contour",[]))
+    notes.sort(key=lambda n:(n["t"],n["d"],n["midi"])); samples.sort(key=lambda x:x["t"])
+    seen=set(); samples=[x for x in samples if not ((x["t"],x["hz"]) in seen or seen.add((x["t"],x["hz"])))]
+    overlaps=0; end=-1.0
+    for n in notes:
+        if n["t"]<end-0.001: overlaps+=1
+        end=max(end,n["t"]+n["d"])
+    if notes: fc.write_json(os.path.join(work_dir,"vocal_pitch.json"),{"version":1,"notes":notes})
+    if samples: fc.write_json(os.path.join(work_dir,"vocal_pitch_contour.json"),{"version":1,"samples":samples})
+    if overlaps: fc.log(f"Vocal pitch warning: {overlaps} simultaneous-voice overlap(s)",indent=1)
+    return bool(notes),bool(samples),overlaps
 
 def write_single_merged_lyrics(vocals_data, work_dir):
     """
@@ -413,7 +418,7 @@ def write_song_timeline(gp_data, work_dir):
 # Manifest construction
 # --------------------------------------------------------------------------
 
-def build_manifest(metadata, duration, arrangements, stems, lyrics_file,
+def build_manifest(metadata, duration, arrangements, stems, lyrics_file, lyric_tracks,
                     vocal_pitch_file, vocal_pitch_contour_file,
                     drum_tab_file, keys_file, song_timeline_file, cover_file):
     manifest = {
@@ -428,6 +433,8 @@ def build_manifest(metadata, duration, arrangements, stems, lyrics_file,
     }
     if lyrics_file:
         manifest["lyrics"] = lyrics_file
+    if lyric_tracks:
+        manifest["lyric_tracks"] = lyric_tracks
     if vocal_pitch_file:
         manifest["vocal_pitch"] = vocal_pitch_file
     if vocal_pitch_contour_file:
@@ -464,6 +471,8 @@ def validate_manifest_paths(manifest):
             raise ValueError(f"arrangements[{arr.get('id')}].capo must be >= 0")
     for stem in manifest.get("stems", []):
         check(stem["file"], f"stems[{stem.get('id')}].file")
+    for track in manifest.get("lyric_tracks", []):
+        check(track["file"], f"lyric_tracks[{track.get('id')}].file")
     for key in ("lyrics", "vocal_pitch", "vocal_pitch_contour", "drum_tab", "keys",
                 "song_timeline", "cover"):
         if key in manifest:
@@ -502,7 +511,11 @@ def package_feedpak(work_dir, manifest, output_path):
 # --------------------------------------------------------------------------
 
 def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name="drums",
-          device="cuda", hf_token=None, skip_vocals=False, skip_gp=False):
+          device="cuda",hf_token=None,skip_vocals=False,skip_gp=False,
+          keep_work_dir=False,vocal_layout="merged",timeline_mode="both",
+          allow_severe_alignment=False):
+    if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
+    if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps = 6
     fc.log(f"Building feedpak from: {song_folder}")
 
@@ -532,6 +545,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     drums_path = padded_paths.get(next((s["id"] for s in stems
                                          if os.path.splitext(os.path.basename(s["file"]))[0].lower()
                                          == drums_stem_name.lower()), None))
+    bass_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower()=="bass"),None))
+    piano_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower() in ("piano","keys","keyboard")),None))
 
     full_stem = next((s for s in stems if s["id"] == "full"), None)
     duration_source = padded_paths.get(full_stem["id"]) if full_stem else padded_paths.get(stems[0]["id"])
@@ -539,20 +554,17 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     fc.log(f"Duration: {duration}s (probed from padded {os.path.basename(duration_source)})", indent=1)
 
     fc.log_step(3, total_steps, "Vocal processing (Script 1)")
-    vocal_pitch_file = vocal_pitch_contour_file = lyrics_file = None
+    vocal_pitch_file=vocal_pitch_contour_file=lyrics_file=None
+    lyric_tracks=[]
     if vocals_path and not skip_vocals:
-        vocals_intermediate = os.path.join(song_folder, "intermediate_vocals.json")
-        run_vocals_script(vocals_path, vocals_intermediate, device=device, hf_token=hf_token)
-        with open(vocals_intermediate, "r", encoding="utf-8") as f:
-            vocals_data = json.load(f)
-        # Write merged (single) lyrics file, not per-speaker split
-        lyrics_file = write_single_merged_lyrics(vocals_data, work_dir)
-        wrote_pitch, wrote_contour = write_merged_vocal_pitch(vocals_data, work_dir)
-        vocal_pitch_file = "vocal_pitch.json" if wrote_pitch else None
-        vocal_pitch_contour_file = "vocal_pitch_contour.json" if wrote_contour else None
-        fc.log(f"Wrote lyrics={'yes' if lyrics_file else 'no'}, "
-               f"vocal_pitch={'yes' if wrote_pitch else 'no'}, "
-               f"vocal_pitch_contour={'yes' if wrote_contour else 'no'}", indent=1)
+        vocals_intermediate=os.path.join(song_folder,"intermediate_vocals.json")
+        run_vocals_script(vocals_path,vocals_intermediate,device=device,hf_token=hf_token)
+        with open(vocals_intermediate,"r",encoding="utf-8") as f: vocals_data=json.load(f)
+        if vocal_layout in ("merged","both"): lyrics_file=write_single_merged_lyrics(vocals_data,work_dir)
+        if vocal_layout in ("separated","both"): lyric_tracks,_=write_lyric_tracks(vocals_data,work_dir,vocals_stem_name)
+        wrote_pitch,wrote_contour,overlaps=write_merged_vocal_pitch(vocals_data,work_dir)
+        vocal_pitch_file="vocal_pitch.json" if wrote_pitch else None
+        vocal_pitch_contour_file="vocal_pitch_contour.json" if wrote_contour else None
     elif skip_vocals:
         fc.log("--skip-vocals set; skipping vocal processing.", indent=1)
     else:
@@ -560,10 +572,13 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
 
     fc.log_step(4, total_steps, "GP parsing + DTW alignment (Script 2)")
     arrangements = []
-    drum_tab_file = keys_file = song_timeline_file = None
-    if gp_path and drums_path and not skip_gp:
+    drum_tab_file=keys_file=song_timeline_file=None
+    alignment_report=None
+    if gp_path and (drums_path or bass_path or piano_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
-        run_gp_script(gp_path, drums_path, gp_intermediate, count_in_offset=count_in_offset)
+        run_gp_script(gp_path,drums_path,gp_intermediate,count_in_offset=count_in_offset,
+                      bass_path=bass_path,piano_path=piano_path,timeline_mode=timeline_mode,
+                      allow_severe_alignment=allow_severe_alignment)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         arrangements += write_arrangement_files(gp_data, work_dir)
@@ -573,7 +588,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
             arrangements.append({"id": "drums", "name": "Drums", "type": "drums",
                                   "drum_tab": fc.to_posix_relpath(drum_tab_file)})
         keys_file = write_keys(gp_data, work_dir)
-        song_timeline_file = write_song_timeline(gp_data, work_dir)
+        song_timeline_file=write_song_timeline(gp_data,work_dir)
+        alignment_report=gp_data.get("alignment_report")
         fc.log(f"Wrote {len(arrangements)} arrangement entr(y/ies), "
                f"drum_tab={'yes' if drum_tab_file else 'no'}, "
                f"keys={'yes' if keys_file else 'no'}, "
@@ -582,9 +598,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.log("--skip-gp set; skipping arrangement extraction.", indent=1)
     elif not gp_path:
         fc.log(f"No .gp5 file found in {song_folder}; skipping arrangement extraction.", indent=1)
-    elif not drums_path:
-        fc.log(f"No stem matching '{drums_stem_name}' found; cannot DTW-align .gp5 data. Skipping.",
-               indent=1)
+    elif not (drums_path or bass_path or piano_path):
+        fc.log("No drums, bass, or piano/keys alignment stem found; skipping GP alignment.",indent=1)
 
     fc.log_step(5, total_steps, "Building manifest.yaml")
     cover_file = next(
@@ -597,7 +612,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         shutil.copyfile(os.path.join(song_folder, cover_file), os.path.join(work_dir, cover_file))
 
     manifest = build_manifest(
-        metadata, duration, arrangements, stems, lyrics_file,
+        metadata,duration,arrangements,stems,lyrics_file,lyric_tracks,
         vocal_pitch_file, vocal_pitch_contour_file, drum_tab_file, keys_file,
         song_timeline_file, cover_file,
     )
@@ -608,11 +623,24 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     os.makedirs(output_folder, exist_ok=True)
     safe_name = f"{manifest['artist']} - {manifest['title']}.feedpak".replace("/", "_")
     output_path = os.path.join(output_folder, safe_name)
-    package_feedpak(work_dir, manifest, output_path)
+    package_feedpak(work_dir,manifest,output_path)
+    if alignment_report: fc.write_json(output_path+".alignment_report.json",alignment_report)
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     fc.log(f"Wrote {output_path} ({size_mb:.1f} MB)", indent=1)
 
     print(f"\nDone: {output_path}")
+
+    if not keep_work_dir:
+        import shutil
+        for leftover in (work_dir,
+                         os.path.join(song_folder, "intermediate_vocals.json"),
+                         os.path.join(song_folder, "intermediate_arrangements.json")):
+            if os.path.isdir(leftover):
+                shutil.rmtree(leftover, ignore_errors=True)
+            elif os.path.isfile(leftover):
+                os.remove(leftover)
+        fc.log("Cleaned up working files (pass --keep-work-dir to keep them for debugging)")
+
     return output_path
 
 
@@ -626,12 +654,21 @@ def main():
     parser.add_argument("--hf-token", default=None)
     parser.add_argument("--skip-vocals", action="store_true")
     parser.add_argument("--skip-gp", action="store_true")
+    parser.add_argument("--vocal-layout",choices=("merged","separated","both"),default="merged")
+    parser.add_argument("--timeline-mode",choices=("tempos","beats","both"),default="both",
+                        help="Create controlled A/B packages")
+    parser.add_argument("--allow-severe-alignment",action="store_true")
+    parser.add_argument("--keep-work-dir", action="store_true",
+                         help="Keep _feedpak_build/ and intermediate_*.json in the song "
+                              "folder after a successful build, for debugging.")
     args = parser.parse_args()
 
     build(args.song_folder, args.output_folder,
           vocals_stem_name=args.vocals_stem, drums_stem_name=args.drums_stem,
           device=args.device, hf_token=args.hf_token,
-          skip_vocals=args.skip_vocals, skip_gp=args.skip_gp)
+          skip_vocals=args.skip_vocals, skip_gp=args.skip_gp,
+          keep_work_dir=args.keep_work_dir,vocal_layout=args.vocal_layout,
+          timeline_mode=args.timeline_mode,allow_severe_alignment=args.allow_severe_alignment)
 
 
 if __name__ == "__main__":

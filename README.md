@@ -1,323 +1,1330 @@
-# **Feedpak Builder Pipeline**
+# Feedpak Audio Alignment Builder
 
-An automated toolchain to convert raw audio stems and Guitar Pro files (`.gp5`) into a fully compliant [Feedpak](https://got-feedback.github.io/feedpak-spec/) format (`.feedpak` ZIP archive).
+An automated Python pipeline for converting separated audio stems and a Guitar Pro chart into a Feedpak archive for feedBack.
 
-**Current v1 Features:**
-- ✅ Vocal extraction (WhisperX): lyrics + speaker diarization + word timestamps
-- ✅ Pitch tracking (CREPE): discrete MIDI per word + continuous Hz contour
-- ✅ Guitar Pro parsing + DTW alignment to real audio
-- ✅ Drum tab extraction (Rock Band 3 Pro Drums-style 8-piece kit: kick, snare, 3 toms, 3 cymbals — no note is ever dropped, every GM percussion note resolves to the closest of these, and the kit is explicitly declared in `drum_tab.json`)
-- ✅ Hand-position anchors
-- ✅ Key signature + real tempo/beat timeline (measure boundaries read directly from the GP file)
-- ✅ **Automatic 4-beat count-in:** if a stem starts with no real lead-in silence, the pipeline pads all stems with a silent 4-beat count-in (sized to the song's actual BPM) and shifts every chart timestamp to match — audio and chart data stay in sync automatically
+The pipeline extracts playable arrangements, analyzes vocals, aligns Guitar Pro timing to the recorded performance, creates song-level timing data, writes Feedpak side files, and packages the result as a `.feedpak` ZIP archive.
+
+## Current capabilities
+
+- Guitar Pro parsing for guitar, bass, drums, and piano/keys
+- Guarded multi-reference audio alignment using available drum, bass, and piano/keys stems
+- Probability-based candidate scoring, source selection, and agreement-gated fusion
+- Instrument-specific frequency treatment for onset detection
+- Automatic four-beat lead-in padding and matching chart offset
+- Dense post-DTW per-measure tempo reconstruction
+- Optional explicit bar and beat markers for feedBack compatibility testing
+- Structural validation and repair of corrupted DTW-derived measure boundaries
+- Severe-alignment rejection unless explicitly overridden
+- Machine-readable alignment diagnostics
+- WhisperX transcription, forced alignment, and speaker diarization
+- Syllable-level lyric timing
+- Merged, separated, or combined vocal layouts
+- One representative CREPE pitch per syllable
+- Independent fine-grained vocal pitch contour
+- Drum-tab extraction and reduced-kit mapping
+- Hand-position anchor generation
+- Key-signature extraction
+- Standard-notation output for piano/keys
 
 ---
 
-## **1. Environment & Setup**
+## 1. Project scripts
 
-### **System Requirements**
+### `build_feedpak.py`
 
-- **Windows Developer Mode:** Recommended (Settings → Privacy & Security → For developers → toggle on)
-- **CUDA / GPU:** A CUDA-capable NVIDIA GPU is strongly recommended. The scripts default to `--device cuda`.
-  - Without GPU, WhisperX and CREPE run ~10× slower on CPU.
+The top-level orchestrator. It:
 
-### **Step 1: Install FFmpeg via winget (Windows)**
+1. Finds the Guitar Pro file and audio stems.
+2. Detects or adds the required four-beat lead-in.
+3. Runs vocal analysis when requested.
+4. Runs Guitar Pro parsing and guarded multi-reference alignment.
+5. Writes arrangement and side-file JSON.
+6. Builds `manifest.yaml`.
+7. Packages the final `.feedpak`.
+8. Writes an alignment report beside the archive.
 
-FFmpeg is required for audio I/O:
+### `process_gp_alignment.py`
+
+Parses the Guitar Pro file and creates the chart-related intermediate data. It:
+
+- extracts fretted arrangements;
+- extracts drum hits;
+- extracts piano/keys notation;
+- reads key signatures and meter changes;
+- builds independent drum, bass, and piano timing candidates;
+- compares candidate quality and agreement;
+- selects or safely combines timing candidates;
+- validates and repairs warped measure boundaries;
+- creates the dense tempo matrix;
+- optionally creates an explicit beat grid;
+- applies the accepted timing map to chart content;
+- and produces the alignment report.
+
+### `process_vocals.py`
+
+Runs:
+
+- WhisperX transcription;
+- forced word alignment;
+- speaker diarization;
+- syllable division;
+- and CREPE pitch tracking.
+
+Lyrics, representative pitch notes, and the fine pitch contour are maintained as separate timing layers.
+
+### `feedpak_common.py`
+
+Contains shared helpers for:
+
+- logging;
+- Guitar Pro tick-to-time conversion;
+- tuning conversion;
+- drum mapping;
+- DTW path cleanup;
+- JSON output;
+- Feedpak-relative paths;
+- leading-silence detection;
+- and stem padding.
+
+---
+
+## 2. Environment and setup
+
+### 2.1 System requirements
+
+#### Windows
+
+Windows 10 or newer is recommended.
+
+Windows Developer Mode is also recommended:
+
+```text
+Settings > Privacy & security > For developers > Developer Mode
+```
+
+This reduces symbolic-link problems when Hugging Face downloads models.
+
+#### Python
+
+Python 3.9 or newer is recommended.
+
+Check the installed version:
+
+```powershell
+python --version
+```
+
+#### FFmpeg
+
+FFmpeg is required for audio decoding, padding, conversion, and packaging.
+
+Install it with Windows Package Manager:
 
 ```powershell
 winget install Gyan.FFmpeg
 ```
 
 Close and reopen PowerShell, then verify:
+
 ```powershell
 ffmpeg -version
 ```
 
-### **Step 2: Hugging Face Token & Gated Model Access**
+### 2.2 CUDA hardware guidance
 
-`process_vocals.py` uses WhisperX, which requires the Pyannote speaker diarization model (gated on Hugging Face).
+The chart parsing and DTW stages are primarily CPU-driven. CUDA is most important for:
 
-1. Create or log in at [huggingface.co](https://huggingface.co/).
-2. **Accept model conditions** at each of these pages (click "Access repository"):
-   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-3. Generate a **Read** access token via **User Settings → Access Tokens**.
-4. Save this token — you'll use it when running the pipeline.
+- WhisperX transcription;
+- forced alignment;
+- speaker diarization;
+- and CREPE pitch tracking.
 
-### **Step 3: Create & Activate a Virtual Environment**
+Practical GPU guidance:
+
+- **4 GB VRAM:** not recommended for the complete vocal pipeline.
+- **6 GB VRAM:** may work only with reduced Whisper settings and batch size.
+- **8 GB VRAM:** practical minimum for CUDA vocal processing.
+- **12 GB VRAM:** recommended.
+- **16 GB or more:** comfortable for long songs and larger batches.
+
+An NVIDIA RTX 3060 with 12 GB VRAM is suitable for the default CUDA workflow.
+
+Monitor GPU memory during processing:
 
 ```powershell
-# Create virtual environment
-python -m venv env
-
-# Activate it
-.\env\Scripts\Activate.ps1
-
-# If you get a script execution error, run this once:
-# Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+nvidia-smi -l 1
 ```
 
-### **Step 4: Install PyTorch (with CUDA) & Dependencies**
+If CUDA runs out of memory, reduce the Whisper batch size before changing alignment settings.
 
-Install PyTorch with explicit CUDA support first (standard `pip install torch` installs CPU-only):
+### 2.3 CPU fallback
+
+If the NVIDIA GPU or eGPU is unavailable, the safest fallback is to skip vocal analysis while continuing chart and timing development:
 
 ```powershell
-# PyTorch with CUDA 12.4
+python build_feedpak.py my_song output_folder `
+  --device cpu `
+  --skip-vocals `
+  --keep-work-dir
+```
+
+This still performs:
+
+- count-in preparation;
+- Guitar Pro parsing;
+- drum, bass, and piano candidate alignment;
+- timing validation and repair;
+- tempo and beat generation;
+- drum-tab extraction;
+- notation output;
+- and Feedpak packaging.
+
+CPU-only WhisperX and CREPE are substantially slower. The current default vocal configuration is optimized for CUDA, so CPU vocal processing may also require a smaller Whisper model, INT8 computation, and a reduced batch size in a future configuration update.
+
+### 2.4 Create and activate a virtual environment
+
+Create the environment:
+
+```powershell
+python -m venv env
+```
+
+Activate it:
+
+```powershell
+.\env\Scripts\Activate.ps1
+```
+
+If PowerShell blocks activation, run:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+```
+
+Then activate the environment again.
+
+### 2.5 Install PyTorch with CUDA
+
+Install the CUDA-enabled PyTorch build before WhisperX.
+
+Example for CUDA 12.4:
+
+```powershell
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
 
-# ML models & audio processing
-pip install whisperx torchcrepe librosa scipy soundfile pyyaml
+Use the PyTorch build compatible with the installed NVIDIA driver.
 
-# Guitar Pro parsing
+### 2.6 Install project dependencies
+
+Install the machine-learning and audio dependencies:
+
+```powershell
+pip install whisperx torchcrepe librosa scipy soundfile pyyaml pyphen numpy
+```
+
+Install Guitar Pro support:
+
+```powershell
 pip install pyguitarpro
+```
 
-# Utilities
+Install utilities:
+
+```powershell
 pip install jsonschema
 ```
 
-### **Step 5: Verify CUDA**
+Optional upgrade command:
+
+```powershell
+pip install --upgrade whisperx torchcrepe librosa scipy soundfile pyyaml pyphen pyguitarpro jsonschema numpy
+```
+
+### 2.7 Verify CUDA
 
 ```powershell
 python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
 ```
 
-Expected output: `CUDA: True` and your GPU name (e.g., "NVIDIA RTX 3060").
+Expected output resembles:
+
+```text
+CUDA: True
+GPU: NVIDIA GeForce RTX 3060
+```
 
 ---
 
-## **2. Environment Variables**
+## 3. Hugging Face access
 
-Set your Hugging Face token **before running the pipeline**:
+Speaker diarization uses gated Pyannote models through WhisperX.
 
-**PowerShell:**
+Before running vocal analysis:
+
+1. Sign in to Hugging Face.
+2. Accept the access conditions for the required Pyannote diarization and segmentation models.
+3. Create a read token.
+4. Export it before running the builder.
+
+PowerShell:
+
 ```powershell
-$env:HF_TOKEN = "hf_your_actual_token_here"
+$env:HF_TOKEN = "hf_your_token_here"
 ```
 
-**Command Prompt (cmd.exe):**
+Command Prompt:
+
 ```cmd
-set HF_TOKEN=hf_your_actual_token_here
+set HF_TOKEN=hf_your_token_here
 ```
+
+If symbolic-link creation fails, enable Windows Developer Mode or set:
+
+```powershell
+$env:HF_HUB_DISABLE_SYMLINKS = "1"
+```
+
+> Never paste a live Hugging Face token into logs, screenshots, bug reports, or public messages. Revoke and replace any token that has been exposed.
 
 ---
 
-## **3. Project Folder Structure**
+## 4. Preparing audio stems
 
-Create a folder for each song. The folder must contain:
+The alignment pipeline works best with clean, synchronized stems derived from the same source mix.
 
+Recommended workflow:
+
+1. Use a high-quality source mix.
+2. Separate vocals first with a RoFormer vocal/instrumental model in UVR.
+3. Run the vocal-reduced instrumental through a Demucs multi-stem model.
+4. Keep useful outputs such as drums, bass, and other.
+5. Optionally extract piano or keys from the instrumental or `other` stem with a suitable model.
+6. Keep every stem untrimmed and sample-aligned.
+
+Recommended intermediate formats:
+
+- WAV;
+- or lossless FLAC.
+
+Avoid MP3 intermediates because lossy encoding can smear transients used for alignment.
+
+Do not add different silence amounts to different stems. The builder handles the synchronized lead-in automatically.
+
+---
+
+## 5. Input folder layout
+
+Each song should have its own directory:
+
+```text
+my_song/
+├── song.gp5
+├── drums.ogg
+├── bass.ogg
+├── piano.ogg
+├── vocals.ogg
+├── guitar.ogg
+├── other.ogg
+├── full.ogg
+├── cover.jpg
+└── metadata.json
 ```
-my_test_song/
-├── song.gp5              (required: Guitar Pro file, .gp5/.gp4/.gp3)
-├── vocals.ogg            (optional: vocal stem, required for lyrics/pitch)
-├── drums.ogg             (optional: drum stem, required for DTW alignment)
-├── bass.ogg              (optional)
-├── guitar.ogg            (optional)
-├── full.ogg              (optional: complete mix/backing)
-├── cover.jpg             (optional: album art)
-└── metadata.json         (optional: song metadata)
+
+The actual audio extensions may be `.ogg`, `.wav`, or `.flac`.
+
+### 5.1 Recognized alignment stems
+
+The builder currently recognizes these stem IDs automatically:
+
+```text
+drums
+bass
+piano
+keys
+keyboard
 ```
 
-### **Audio Format**
+The base filename becomes the stem ID:
 
-- Supported: `.ogg`, `.wav`, `.flac`
-- Recommended: `.ogg` (good compression)
-- Sample rate: 44.1 kHz or higher, mono or stereo
+```text
+drums.ogg -> drums
+bass.flac -> bass
+keys.wav  -> keys
+```
 
-### **metadata.json (Optional)**
+Names such as these are not automatically recognized as alignment references:
 
-Create this file in your song folder to populate the manifest. If omitted, defaults to "Unknown Title" / "Unknown Artist":
+```text
+electric_bass.ogg
+grand_piano.wav
+synth.flac
+bass_stem.wav
+```
+
+Rename them to a supported ID before building.
+
+### 5.2 Supported audio formats
+
+- OGG
+- WAV
+- FLAC
+
+### 5.3 Optional `metadata.json`
 
 ```json
 {
   "title": "My Song",
   "artist": "My Band",
   "album": "Album Name",
-  "year": 2024,
+  "year": 2026,
   "genres": ["rock"]
 }
 ```
 
----
-
-## **4. Running the Pipeline**
-
-### **Full Pipeline (Recommended)**
-
-```powershell
-python build_feedpak.py my_test_song output_folder --device cuda --hf-token $env:HF_TOKEN
-```
-
-**Arguments:**
-- `my_test_song` — Song folder (contains stems + `song.gp5`)
-- `output_folder` — Where to save the `.feedpak` archive
-- `--device cuda` — Use GPU (`cpu` if no CUDA available)
-- `--hf-token <token>` — Your Hugging Face token
-- `--vocals-stem vocals` — Name of vocal stem file (default: `vocals`)
-- `--drums-stem drums` — Name of drum stem file (default: `drums`)
-- `--skip-vocals` — Skip vocal processing
-- `--skip-gp` — Skip GP parsing + alignment
-
-**Output:**
-```
-output_folder/
-└── My Band - My Song.feedpak
-```
-
-### **Step-by-Step Testing (Debugging)**
-
-If you need to debug individual stages:
-
-**Step 1: Vocal Processing**
-```powershell
-python process_vocals.py my_test_song\vocals.ogg --out my_test_song\intermediate_vocals.json --device cuda --hf-token $env:HF_TOKEN
-```
-
-Check `intermediate_vocals.json` for lyrics, pitches, contours per speaker.
-
-**Step 2: GP Alignment + DTW**
-```powershell
-python process_gp_alignment.py my_test_song\song.gp5 my_test_song\drums.ogg --out my_test_song\intermediate_arrangements.json
-```
-
-Check `intermediate_arrangements.json` for warped note times, anchors, drum hits.
-
-**Step 3: Build the Feedpak**
-```powershell
-python build_feedpak.py my_test_song output_folder --device cuda --hf-token $env:HF_TOKEN
-```
+If metadata is omitted, fallback values such as `Unknown Title` and `Unknown Artist` are used.
 
 ---
 
-## **5. Output: The `.feedpak` Archive**
+## 6. Basic usage
 
-The `.feedpak` is a ZIP containing:
+### 6.1 Standard CUDA build
 
+```powershell
+python build_feedpak.py my_song output_folder `
+  --device cuda `
+  --hf-token $env:HF_TOKEN
 ```
+
+### 6.2 Recommended archival vocal build
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --device cuda `
+  --hf-token $env:HF_TOKEN `
+  --vocal-layout both `
+  --keep-work-dir
+```
+
+### 6.3 Skip vocal analysis
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --skip-vocals
+```
+
+### 6.4 Skip Guitar Pro parsing and alignment
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --skip-gp
+```
+
+### 6.5 Keep temporary files
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --keep-work-dir
+```
+
+This preserves:
+
+```text
+_feedpak_build/
+intermediate_vocals.json
+intermediate_arrangements.json
+```
+
+Use this during initial testing and alignment debugging.
+
+---
+
+## 7. Automatic four-beat lead-in
+
+The lead-in mechanism is automatic.
+
+Before chart or vocal processing, the builder:
+
+1. Selects a reference stem, preferring the full mix, then drums, then the first available stem.
+2. Measures existing leading silence.
+3. Reads the opening BPM from the Guitar Pro file.
+4. Calculates a four-beat lead-in:
+
+```text
+count_in_seconds = 4 × 60 / initial_BPM
+```
+
+5. Adds only the missing amount:
+
+```text
+padding = max(0, count_in_seconds - existing_silence)
+```
+
+6. Applies identical padding to every stem.
+7. Applies the resulting lead-in offset to chart events before alignment.
+
+The same offset is applied to:
+
+- guitar and bass notes;
+- hand-position anchors;
+- drum hits;
+- bass alignment events;
+- piano alignment events;
+- key changes;
+- measure boundaries;
+- time signatures;
+- and notation events.
+
+This keeps all packaged stems, chart events, and alignment references on the same clock.
+
+Original source files are never modified.
+
+---
+
+## 8. Validate the chart before alignment
+
+Audio alignment assumes that the chart and recording represent the same arrangement.
+
+Before treating a repeated alignment failure as a code defect, verify:
+
+- the same measure count;
+- the same opening pickup;
+- the same time signatures;
+- the same repeat expansion;
+- the same solo and bridge lengths;
+- the same inserted or removed bars;
+- the same ending structure;
+- and a reasonably corresponding drum, bass, or piano transcription.
+
+A chart can begin and end correctly while being one or more bars wrong in the middle. This often indicates:
+
+- a repeated riff matched to the wrong occurrence;
+- an extra or missing bar;
+- an alternate transcription revision;
+- a solo of different length;
+- or a repeat-expansion difference.
+
+If the same measure range repeatedly triggers repair or disagreement warnings, inspect that section of the chart and recording before changing DTW parameters.
+
+---
+
+## 9. Multi-reference audio alignment
+
+The alignment stage can use up to three independent references.
+
+### 9.1 Drums
+
+- Chart reference: Guitar Pro drum-hit onsets
+- Audio reference: demuxed drum stem
+- Frequency treatment: broadband onset analysis
+
+Drums are normally the strongest reference because their attacks are transient-rich.
+
+### 9.2 Bass
+
+- Chart reference: Guitar Pro bass-note onsets
+- Audio reference: demuxed bass stem
+- Frequency treatment: approximately 30 to 1200 Hz
+
+The bass candidate is intentionally concentrated on low and low-mid frequencies. Attack harmonics within this range can help identify pick, finger, and slap onsets.
+
+Bass alignment is less reliable during:
+
+- long sustained notes;
+- slides;
+- legato passages;
+- weak or artifact-heavy demixing;
+- and sections where the transcription differs from the recording.
+
+### 9.3 Piano or keys
+
+- Chart reference: piano/keyboard notation-beat onsets
+- Audio reference: demuxed piano, keys, or keyboard stem
+- Frequency treatment: approximately 45 to 6000 Hz
+
+The current GP track-name detection expects `PIANO` or `KEY` in the track name.
+
+### 9.4 Symmetric source processing
+
+For each candidate, the real stem and synthetic reference are analyzed using the same source-specific Mel-frequency range.
+
+Source-specific synthetic click frequencies are used to avoid comparing mismatched spectral representations.
+
+### 9.5 Candidate construction
+
+Each valid reference independently produces:
+
+1. a list of nominal chart onsets;
+2. a synthetic transient reference;
+3. source-specific onset-strength envelopes;
+4. a constrained DTW path;
+5. a nominal-time to real-time mapping;
+6. residual, coverage, and path metrics;
+7. and an alignment quality score.
+
+Missing stems or missing matching Guitar Pro tracks are skipped automatically.
+
+---
+
+## 10. Alignment decision and candidate agreement
+
+Each candidate receives a heuristic score based on:
+
+- median onset residual;
+- 95th-percentile onset residual;
+- path coverage;
+- DTW constraint-band pressure;
+- and number of usable chart events.
+
+The scores are normalized with softmax and reported as relative probabilities.
+
+These are not statistically calibrated probabilities. A probability of `0.70` means that the candidate received 70 percent of the relative quality weight for that build, not that it has a proven 70 percent chance of being correct.
+
+### 10.1 Direct selection
+
+If the strongest candidate exceeds the selection threshold, it is selected directly.
+
+### 10.2 Candidate-agreement validation
+
+Candidates are compared at common measure-boundary sample times before fusion.
+
+The report records pairwise:
+
+- median disagreement;
+- 95th-percentile disagreement;
+- and maximum disagreement.
+
+Fusion is allowed only when candidates remain within the configured agreement limits.
+
+If candidates disagree too strongly, the strongest candidate is selected and the report records:
+
+```text
+selected_due_to_disagreement
+```
+
+This prevents incompatible timing maps from being averaged together.
+
+### 10.3 Probability-weighted fusion
+
+If no candidate dominates and all candidates agree closely enough, the warp mappings may be combined:
+
+```text
+final_warp(t) = Σ probability_i × candidate_warp_i(t)
+```
+
+A weighted combination of agreed monotonic mappings remains monotonic.
+
+### 10.4 Interpretation
+
+Excellent residuals do not prove global correctness. Repeated material can produce two locally convincing but globally different alignments.
+
+Always inspect the report when the decision is:
+
+```text
+selected_due_to_disagreement
+```
+
+or when alignment quality is `WARNING` or `SEVERE`.
+
+---
+
+## 11. Guarded timeline generation
+
+Warped measure boundaries are validated before either `tempos[]` or `beats[]` is generated.
+
+Checks include:
+
+- duplicate timestamps;
+- non-monotonic boundaries;
+- implausibly short measures;
+- excessive stretch or compression;
+- and implausible effective BPM values.
+
+### 11.1 Local repair
+
+Bounded local failures may be repaired through interpolation between nearby valid boundaries.
+
+Example console output:
+
+```text
+ALIGNMENT QUALITY: WARNING
+  REPAIRED measures 48..52 by bounded interpolation
+```
+
+The repair is also recorded in the alignment report.
+
+Repair prevents output such as:
+
+- duplicate downbeat timestamps;
+- zero-duration measures;
+- backward-moving boundaries;
+- and multi-thousand-BPM tempo entries.
+
+### 11.2 Severe alignment rejection
+
+If structural corruption remains after repair, the build refuses to package the timing map by default.
+
+For diagnostic use only, this can be overridden:
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --allow-severe-alignment
+```
+
+Do not use the override for production content unless the resulting timing has been manually inspected.
+
+---
+
+## 12. Timeline output modes
+
+The builder can create dense tempo data, explicit beat data, or both.
+
+Use:
+
+```text
+--timeline-mode tempos
+--timeline-mode beats
+--timeline-mode both
+```
+
+### 12.1 Dense tempos only
+
+```powershell
+python build_feedpak.py my_song output_tempos `
+  --skip-vocals `
+  --timeline-mode tempos `
+  --keep-work-dir
+```
+
+This writes the dense per-measure tempo curve and time signatures without an explicit `beats[]` array.
+
+### 12.2 Explicit beats only
+
+```powershell
+python build_feedpak.py my_song output_beats `
+  --skip-vocals `
+  --timeline-mode beats `
+  --keep-work-dir
+```
+
+This is primarily a controlled compatibility test.
+
+### 12.3 Both representations
+
+```powershell
+python build_feedpak.py my_song output_both `
+  --skip-vocals `
+  --timeline-mode both `
+  --keep-work-dir
+```
+
+This writes both the dense tempo curve and explicit beat markers.
+
+### 12.4 Why the modes exist
+
+Some known working Feedpak examples contain dense `tempos[]` and `time_signatures[]` without explicit `beats[]`. Other feedBack versions or workflows may benefit from explicit beat markers.
+
+Do not assume that `beats[]` is universally required. Use controlled A/B packages built from the same accepted alignment result to determine the behavior of the installed feedBack version.
+
+---
+
+## 13. Dynamic timing matrix
+
+The accepted time mapping is applied to:
+
+- playable guitar and bass notes;
+- drum events;
+- anchors;
+- key changes;
+- notation;
+- and measure boundaries.
+
+### 13.1 Dense tempo matrix
+
+For each pair of accepted warped measure boundaries, the builder calculates an effective per-measure tempo:
+
+```text
+effective_BPM = beats_per_measure × 60 / warped_measure_duration
+```
+
+This is a dense curve designed to follow local performance timing rather than only sparse authored Guitar Pro tempo events.
+
+### 13.2 Explicit highway beat grid
+
+When enabled, each accepted warped measure interval is subdivided into beat markers.
+
+Example 4/4 output:
+
+```json
+[
+  {"time": 10.0000, "measure": 12},
+  {"time": 10.5500, "measure": -1},
+  {"time": 11.1000, "measure": -1},
+  {"time": 11.6500, "measure": -1},
+  {"time": 12.2000, "measure": 13}
+]
+```
+
+Rules:
+
+- numbered entries identify downbeats;
+- `measure: -1` identifies internal beats;
+- downbeats remain based on accepted post-DTW measure boundaries;
+- and internal markers are interpolated within the same accepted measure interval.
+
+This avoids creating a second independent timing map.
+
+### 13.3 Compound meters
+
+The current implementation divides measures by the time-signature numerator:
+
+- 4/4 produces four subdivisions;
+- 3/4 produces three;
+- 6/8 produces six;
+- 12/8 produces twelve.
+
+It does not currently add compound-meter accent metadata.
+
+### 13.4 Final measure
+
+The final measure has no following downbeat from which to calculate its real duration. The current fallback uses the preceding valid measure duration for final-bar subdivisions.
+
+This may be approximate for:
+
+- partial final measures;
+- fermatas;
+- final tempo changes;
+- or shortened endings.
+
+---
+
+## 14. Alignment report
+
+The build writes a report beside the Feedpak:
+
+```text
+Artist - Song.feedpak.alignment_report.json
+```
+
+The report contains:
+
+- final severity;
+- decision mode;
+- selected source;
+- candidate probabilities;
+- event counts;
+- source frequency ranges;
+- median and 95th-percentile residuals;
+- path coverage;
+- candidate disagreement;
+- minimum and maximum measure stretch;
+- repaired measure ranges;
+- unresolved severe conditions;
+- and warnings.
+
+Example decision information:
+
+```json
+{
+  "mode": "selected_due_to_disagreement",
+  "selected_source": "drums",
+  "candidates": [
+    {
+      "source": "drums",
+      "probability": 0.644,
+      "median_residual_ms": 19.3,
+      "coverage": 1.0
+    },
+    {
+      "source": "bass",
+      "probability": 0.356,
+      "median_residual_ms": 39.2,
+      "coverage": 1.0
+    }
+  ],
+  "agreement": [
+    {
+      "sources": ["drums", "bass"],
+      "median_ms": 6579.4,
+      "p95_ms": 19560.5
+    }
+  ]
+}
+```
+
+This example demonstrates why low residuals alone are insufficient. Both candidates can match local onsets well while describing globally different song positions.
+
+---
+
+## 15. Vocal analysis
+
+Vocal processing uses three independent layers.
+
+### 15.1 Syllable-level lyrics
+
+WhisperX provides transcription, forced word timing, and speaker diarization.
+
+Words are divided into syllables with Pyphen. Each syllable receives a proportional part of the forced-aligned word interval.
+
+Pitch analysis does not change lyric timing.
+
+### 15.2 Representative pitch
+
+For every syllable containing confident CREPE frames, the builder calculates one representative MIDI pitch using the median confident pitch in that syllable interval.
+
+This produces:
+
+```text
+vocal_pitch.json
+```
+
+The compatibility pitch note uses the same start and duration as its syllable.
+
+### 15.3 Dynamic pitch contour
+
+Confident CREPE frames are independently preserved in:
+
+```text
+vocal_pitch_contour.json
+```
+
+This fine-grained contour can represent movement within a syllable more accurately than one MIDI note per syllable.
+
+### 15.4 Removed overlap source
+
+Earlier versions could generate:
+
+- a full-syllable pitch note;
+- secondary pitch notes beginning inside that interval;
+- and standalone `+` lyric entries.
+
+The current pipeline:
+
+- no longer creates standalone `+` lyric records;
+- writes at most one compatibility pitch note per pitched syllable;
+- and keeps detailed movement in the pitch contour.
+
+### 15.5 Remaining simultaneous-voice overlaps
+
+If two diarized singers overlap, their notes may still overlap in the single song-level pitch file.
+
+This is reported as a warning because Feedpak v1 provides one song-level discrete pitch track rather than one per speaker.
+
+---
+
+## 16. Vocal layout modes
+
+Use:
+
+```text
+--vocal-layout merged
+--vocal-layout separated
+--vocal-layout both
+```
+
+The default is `merged`.
+
+### 16.1 Merged
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --vocal-layout merged
+```
+
+Writes:
+
+- one merged `lyrics.json`;
+- one global `vocal_pitch.json`;
+- one global `vocal_pitch_contour.json`.
+
+Use this for current game compatibility.
+
+### 16.2 Separated
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --vocal-layout separated
+```
+
+Writes:
+
+- one lyric file per detected speaker;
+- `lyric_tracks` entries;
+- one global pitch file;
+- and one global contour file.
+
+Current game versions may not display the separated lyric tracks.
+
+### 16.3 Both
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --vocal-layout both
+```
+
+Writes:
+
+- merged `lyrics.json` for compatibility;
+- one lyric file per detected speaker;
+- `lyric_tracks` entries;
+- one global pitch file;
+- and one global contour file.
+
+This is the recommended preservation mode.
+
+---
+
+## 17. Direct alignment-script usage
+
+### 17.1 Drums only
+
+```powershell
+python process_gp_alignment.py song.gp5 drums.ogg `
+  --out intermediate_arrangements.json
+```
+
+### 17.2 Drums and bass
+
+```powershell
+python process_gp_alignment.py song.gp5 drums.ogg `
+  --bass-audio bass.ogg `
+  --out intermediate_arrangements.json
+```
+
+### 17.3 Drums, bass, and piano
+
+```powershell
+python process_gp_alignment.py song.gp5 drums.ogg `
+  --bass-audio bass.ogg `
+  --piano-audio piano.ogg `
+  --out intermediate_arrangements.json
+```
+
+### 17.4 Bass without drums
+
+```powershell
+python process_gp_alignment.py song.gp5 `
+  --bass-audio bass.ogg `
+  --out intermediate_arrangements.json
+```
+
+### 17.5 Piano without drums
+
+```powershell
+python process_gp_alignment.py song.gp5 `
+  --piano-audio piano.ogg `
+  --out intermediate_arrangements.json
+```
+
+### 17.6 Lower DTW analysis sample rate
+
+```powershell
+python process_gp_alignment.py song.gp5 drums.ogg `
+  --sr 16000 `
+  --out intermediate_arrangements.json
+```
+
+### 17.7 Explicit count-in offset
+
+```powershell
+python process_gp_alignment.py song.gp5 drums.ogg `
+  --count-in-offset 2.0 `
+  --out intermediate_arrangements.json
+```
+
+When run through `build_feedpak.py`, the count-in offset is calculated automatically.
+
+---
+
+## 18. Feedpak output
+
+A complete archive can contain:
+
+```text
 song.feedpak/
-├── manifest.yaml                      (metadata + file index)
-├── stems/
-│   ├── vocals.ogg
-│   ├── drums.ogg
-│   └── ...
+├── manifest.yaml
 ├── arrangements/
-│   ├── lead.json                      (fretted notes)
+│   ├── guitar.json
 │   ├── bass.json
-│   └── notation_piano.json            (staff notation if keyboard exists)
-├── lyrics.json                        (flat word list with timestamps)
-├── vocal_pitch.json                   (discrete MIDI per word)
-├── vocal_pitch_contour.json           (continuous Hz contour)
-├── drum_tab.json                      (drum hits + piece labels)
-├── song_timeline.json                 (dense per-measure tempo curve + beat boundaries)
-├── keys.json                          (key signature changes)
-└── cover.jpg                          (if provided)
+│   └── notation_piano.json
+├── stems/
+│   ├── full.ogg
+│   ├── drums.ogg
+│   ├── bass.ogg
+│   ├── piano.ogg
+│   └── vocals.ogg
+├── lyrics.json
+├── lyrics_speaker_00.json
+├── lyrics_speaker_01.json
+├── vocal_pitch.json
+├── vocal_pitch_contour.json
+├── drum_tab.json
+├── song_timeline.json
+├── keys.json
+└── cover.jpg
 ```
 
-All files conform to the [Feedpak v1 schema](https://got-feedback.github.io/feedpak-spec/).
+The diagnostics file is written beside the archive:
 
-### **How bar/beat data works**
-
-`song_timeline.json`'s `tempos[]` isn't a sparse list of just the tempo changes the `.gp5` file happens to declare — it's a **dense, one-entry-per-measure curve**. Each entry's BPM is back-computed from how long that measure actually took in the real, DTW-aligned audio (`bpm = beats_per_measure * 60 / real_measure_duration`), not just the authored tempo. That's what lets a renderer draw accurate bar lines even through a performance with natural tempo drift — a fixed/sparse tempo map can't do that on its own. `beats[]` also carries an explicit `{time, measure}` entry per measure for renderers that want it directly.
-
----
-
-## **6. Known Issues & v1 Limitations**
-
-### **Audio Timing (v1)**
-
-**4-beat count-in is automatic.** Before running Script 1/2, the pipeline checks one reference stem (the full mix if present, else `drums.ogg`, else whichever stem it finds first) for leading silence, and tops it up — not just gates on a threshold — to a full 4-beat count-in sized to the song's actual tempo (read from the `.gp5` file): `pad = max(0, count_in_seconds - existing_silence)`. So a stem with no lead-in gets the full count-in; a stem with a partial gap only gets topped up the rest of the way; a stem that already has more than a full count-in isn't padded, but the chart still shifts to match where the audio actually starts. Every stem is padded identically, and every nominal chart timestamp (notes, drum hits, key changes, song timeline, keyboard notation) shifts by the same amount before DTW alignment runs.
-
-Padded stems are written as WAV, not re-encoded to the original compressed format — decoding then re-encoding to OGG Vorbis would both cost a lossy generation and, on top of that, a large OGG Vorbis write has a confirmed libsndfile crash on some platforms. A stem that didn't need padding is copied byte-for-byte in its original format.
-
-You don't need to do anything for this — it's automatic. The padded stems (not the originals) are what ends up in the final `.feedpak`; your original files in the song folder are never modified.
-
-**DTW Alignment Lag:** If tab notes still appear offset from audio after this, the DTW warp itself may have drifted on a long or tempo-heavy section. Check that `drums.ogg` is a proper isolated drum stem (not the full mix). Try running with `--sr 16000` for faster DTW on long songs.
-
-### **Vocals (v1)**
-
-- **Flat lyrics only:** Currently writes a single `lyrics.json` with all speakers' words merged and time-sorted. No per-speaker attribution in the lyrics file itself (check `intermediate_vocals.json` for speaker info).
-- **Per-speaker lyric_tracks:** Will be added in v2 (manifest `lyric_tracks[]` structure exists but is not yet populated by Script 3).
-
-### **Not Yet Extracted**
-
-- Technique fields (slides, bends, hammer-on/pull-off, fingering)
-- Chord hand-shapes / diagrams
-- Harmony / chord progression estimation
-- Rig / amp-effects chains
-- Auxiliary percussion beyond the 8-piece kit (cowbell, tambourine, extra toms, etc.) folds into the nearest of kick/snare/hh_closed/tom_hi/tom_mid/tom_floor/crash_r/ride rather than getting its own piece
+```text
+output_folder/
+├── Artist - Song.feedpak
+└── Artist - Song.feedpak.alignment_report.json
+```
 
 ---
 
-## **7. Troubleshooting**
+## 19. Troubleshooting
 
-### "Module not found: whisperx / torchcrepe / librosa"
+### 19.1 Chart suddenly becomes one bar early or late
+
+This is normally a structural jump rather than gradual tempo drift.
+
+Common causes:
+
+- repeated riffs;
+- different repeat expansion;
+- a missing or extra measure;
+- an alternate chart revision;
+- a solo of different length;
+- or DTW matching the wrong occurrence of similar material.
+
+The symptom often looks like:
+
+```text
+correct
+correct
+correct
+suddenly one bar late
+```
+
+If the same measure range repeatedly triggers repairs, compare the chart and recording around that range before changing the alignment code.
+
+### 19.2 No bar or beat markers
+
+Inspect:
+
+```text
+song_timeline.json
+```
+
+Then build controlled A/B packages with:
+
+```text
+--timeline-mode tempos
+--timeline-mode beats
+--timeline-mode both
+```
+
+Some compatible Feedpaks use dense tempo and time-signature data without an explicit beat array. Do not assume that one representation is universally required.
+
+Before testing renderer behavior, confirm that the accepted measure boundaries are monotonic and imply plausible tempos.
+
+### 19.3 Alignment selects the wrong source
+
+Inspect:
+
+- decision mode;
+- source probabilities;
+- residuals;
+- coverage;
+- and candidate disagreement.
+
+If `selected_due_to_disagreement` appears, the sources describe materially different timelines. Compare the chart, stems, and suspicious song section.
+
+### 19.4 Alignment repairs the same measures repeatedly
+
+This usually indicates something specific about that song region:
+
+- repeated musical material;
+- sparse transients;
+- chart-versus-recording disagreement;
+- or an alternate arrangement.
+
+Repair prevents corrupt output, but it does not prove that the corrected region exactly matches the performance.
+
+### 19.5 Bass alignment is poor
+
+Bass alignment works best with clearly articulated attacks.
+
+Possible causes:
+
+- long sustains;
+- slides and legato;
+- kick-drum bleed;
+- noisy demixing;
+- missing chart notes;
+- and differences between the GP bass transcription and recording.
+
+### 19.6 Piano alignment is unavailable
+
+Check that:
+
+- the stem is named `piano`, `keys`, or `keyboard`;
+- and the Guitar Pro track name contains `PIANO` or `KEY`.
+
+### 19.7 Wrong vocal language detected
+
+WhisperX detects language from the audio. Distorted, layered, or sparse vocals can produce a wrong result.
+
+A future update should expose an explicit language override. Until then, inspect the detected language in the console and intermediate vocal file.
+
+### 19.8 TorchCodec warning
+
+If Pyannote reports that TorchCodec cannot load:
+
+- verify FFmpeg installation;
+- check TorchCodec compatibility with the installed PyTorch version;
+- or rely on the in-memory waveform path if the current WhisperX workflow continues successfully.
+
+A warning does not necessarily mean the build failed if audio was already decoded elsewhere.
+
+### 19.9 No vocals in separated mode
+
+Use:
+
+```text
+--vocal-layout both
+```
+
+This preserves per-speaker files while keeping the merged compatibility pointer.
+
+### 19.10 Pitch overlaps remain
+
+Secondary notes inside one syllable are no longer generated. Remaining overlaps generally represent simultaneous diarized singers sharing the global Feedpak pitch track.
+
+### 19.11 DTW takes too long
+
+Use:
+
+```powershell
+python process_gp_alignment.py song.gp5 drums.ogg `
+  --sr 16000 `
+  --out intermediate_arrangements.json
+```
+
+Also remove unusable references rather than calculating candidates from poor stems.
+
+### 19.12 Missing modules
 
 ```powershell
 pip install --upgrade whisperx torchcrepe librosa
 ```
 
-### "A required privilege is not held" (Windows, during model download)
+### 19.13 Required privilege is not held
 
-Either:
-1. Enable Developer Mode (Settings → Privacy & Security → For developers), or
-2. Disable symlinking: `$env:HF_HUB_DISABLE_SYMLINKS = "1"`
+Enable Windows Developer Mode or set:
 
-Then re-run.
-
-### "DiarizationPipeline() got unexpected keyword argument"
-
-Update WhisperX:
 ```powershell
-pip install --upgrade whisperx
+$env:HF_HUB_DISABLE_SYMLINKS = "1"
 ```
 
-### DTW Takes Very Long
+---
 
-- Use a proper isolated drum stem (not the full mix)
-- Try lower sample rate: `python process_gp_alignment.py song.gp5 drums.ogg --out inter.json --sr 16000`
-- For very long songs, consider splitting into sections
+## 20. Current limitations
 
-### No .gp5 File Found
+### Alignment
 
-- Ensure `song.gp5` is in the root of your song folder (not in a subfolder)
-- Filename must match exactly (case-sensitive on Linux/macOS)
+- Alignment probabilities are heuristic and not statistically calibrated.
+- Strongly disagreeing candidates are not fused, but disagreement still requires manual review.
+- Repeated musical material can produce locally convincing but globally incorrect DTW paths.
+- Alignment quality depends on chart-to-recording correspondence.
+- Missing bars, alternate revisions, and repeat differences may require manual verification.
+- Bass and piano candidates use onset timing rather than note-pitch agreement.
+- Automatic stem-name recognition is intentionally narrow.
+- Piano ties and sustain-pedal semantics are not fully modeled for alignment.
+- Compound meters are subdivided by numerator without accent-group metadata.
+- Final-measure duration is inferred from the preceding valid measure.
+- Timeline repair is conservative and cannot guarantee musical correctness when the underlying chart structure differs.
 
-### Vocals Detected as Wrong Language
+### Vocals
 
-- WhisperX detects based on audio content, not file name
-- Check the audio itself; detection is usually correct
-- Explicit language selection will be added in a future release
+- Syllable timing is proportionally divided inside word-level alignment windows rather than phoneme-aligned.
+- Per-speaker vocal pitch files are not supported by Feedpak v1.
+- Simultaneous speakers may overlap in the global pitch file.
+- Current game versions may ignore `lyric_tracks`.
+- Dynamic contour samples are associated with diarized word intervals, so untranscribed humming or extended notes may be incomplete.
+- CPU vocal processing is not yet exposed through a complete set of model, precision, and batch-size options.
+
+### Arrangement content
+
+The current version does not yet extract:
+
+- bends;
+- slides;
+- hammer-ons and pull-offs;
+- fingering;
+- chord diagrams and handshapes;
+- harmony estimation;
+- or amp and effects rigs.
 
 ---
 
-## **8. Performance Tips**
+## 21. Recommended workflow
 
-- **GPU is essential:** Use `--device cuda`. Without it, expect 5–10× slowdown.
-- **Sample rate:** Lower `--sr 16000` if DTW is slow.
-- **Skip unnecessary stages:** Use `--skip-vocals` or `--skip-gp` to test one part.
-- **Batch processing:** Loop over multiple song folders in a script.
+1. Start with the cleanest possible source audio.
+2. Prepare sample-aligned stems.
+3. Confirm that the GP chart and recording represent the same arrangement.
+4. Check measure count, repeats, solo length, and ending structure.
+5. Build with `--keep-work-dir`.
+6. Review console alignment quality.
+7. Review the generated alignment report.
+8. Inspect any repaired measure ranges manually.
+9. Test a known-good chart and recording before using a difficult song as the baseline.
+10. Use `--timeline-mode tempos` and `--timeline-mode both` for controlled feedBack compatibility testing.
+11. Use `--vocal-layout both` when preserving multiple voices matters.
+12. Test early, middle, solo, and ending sections in feedBack.
+13. If alignment is poor, compare a rebuild with the questionable reference stem removed.
+14. Never use `--allow-severe-alignment` for production without manual verification.
+
+Recommended development command:
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --device cuda `
+  --hf-token $env:HF_TOKEN `
+  --vocal-layout both `
+  --timeline-mode both `
+  --keep-work-dir
+```
+
+Inspect:
+
+```text
+intermediate_arrangements.json
+intermediate_vocals.json
+_feedpak_build/song_timeline.json
+_feedpak_build/vocal_pitch.json
+_feedpak_build/vocal_pitch_contour.json
+Artist - Song.feedpak.alignment_report.json
+```
 
 ---
 
-## **9. References**
+## 22. Support information
 
-- **Feedpak Specification:** https://got-feedback.github.io/feedpak-spec/
-- **WhisperX GitHub:** https://github.com/m-bain/whisperx
-- **CREPE (PyTorch):** https://github.com/marl/torchcrepe
-- **pyguitarpro:** https://github.com/nferretti/guitarpro
-- **Librosa:** https://librosa.org/
+When reporting an issue, include:
 
----
+- the complete terminal log;
+- the alignment report;
+- `metadata.json`;
+- the song folder's filenames;
+- the Guitar Pro track names;
+- the exact command;
+- which stems participated in alignment;
+- which measures visibly fail;
+- whether the failure is gradual or a sudden whole-bar jump;
+- Python version;
+- installed package versions;
+- GPU, VRAM, driver, and CUDA information;
+- and whether the chart and recording have been manually compared in the failing region.
 
-## **10. Support**
+Useful commands:
 
-If you encounter issues, provide:
-1. Full error traceback
-2. Your `metadata.json` and folder structure
-3. The exact command you ran
-4. Output of `python --version` and `pip list`
-5. GPU name/driver version (if using CUDA)
+```powershell
+python --version
+pip list
+nvidia-smi
+```
 
----
-
-**Happy transcribing!** 🎸🎤
+Do not share copyrighted audio or Guitar Pro files unless you have permission to distribute them.
