@@ -8,6 +8,8 @@ Kept free of heavy imports (guitarpro, librosa, whisperx, torchcrepe) so it
 can be imported and unit-tested without those installed.
 """
 import json
+import hashlib
+import os
 import math
 import re
 import sys
@@ -278,10 +280,23 @@ def dedupe_monotonic_path(xs, ys):
 # JSON export helpers
 # --------------------------------------------------------------------------
 
+def file_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_json(path, data, indent=2):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent)
+    path = os.fspath(path)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, indent=indent, allow_nan=False)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, path)
 
 
 def omit_if_negligible(d, key, value, threshold=0.05):

@@ -175,6 +175,108 @@ def _source_click_frequency(source):
     return {"bass": 90.0, "piano": 880.0, "drums": 180.0}.get(source, 180.0)
 
 
+
+def load_alignment_anchors(path, nominal_downbeats, padding_added=0.0):
+    """Load manual anchors. Missing time_reference defaults to original source audio."""
+    if not path:
+        return [], "source"
+    with open(path, "r", encoding="utf-8") as f:
+        payload=json.load(f)
+    reference=payload.get("time_reference", "source").lower()
+    if reference not in ("source", "padded"):
+        raise ValueError("Anchor time_reference must be 'source' or 'padded'")
+    by_measure={int(b["measure"]):b for b in nominal_downbeats}
+    anchors=[]
+    for raw in payload.get("anchors", []):
+        measure=int(raw["measure"]); beat=float(raw.get("beat",1))
+        if measure not in by_measure:
+            raise ValueError(f"Anchor references unknown measure {measure}")
+        current=by_measure[measure]; nominal=float(current["t_gp"])
+        if beat != 1:
+            nxt=by_measure.get(measure+1)
+            if not nxt: raise ValueError("Non-downbeat anchor cannot target final measure")
+            nominal += ((beat-1)/max(1,int(current.get("ts_num",4))))*(nxt["t_gp"]-current["t_gp"])
+        source_time=float(raw["audio_time"])
+        padded_time=source_time+padding_added if reference == "source" else source_time
+        anchors.append({"measure":measure,"beat":beat,"nominal_time":nominal,
+                        "source_audio_time":source_time-padding_added if reference=="padded" else source_time,
+                        "padded_audio_time":padded_time,"label":raw.get("label")})
+    anchors.sort(key=lambda a:a["nominal_time"])
+    for a,b in zip(anchors,anchors[1:]):
+        if b["nominal_time"]<=a["nominal_time"] or b["padded_audio_time"]<=a["padded_audio_time"]:
+            raise ValueError("Anchors must increase in score and audio time")
+    return anchors, reference
+
+
+def apply_hard_anchors(base_warp, anchors, nominal_downbeats, max_chunk_measures=16):
+    """Create a continuous piecewise warp through manual and heuristic boundaries."""
+    points=[]
+    for i,b in enumerate(nominal_downbeats):
+        if i==0 or i==len(nominal_downbeats)-1 or i % max(2,max_chunk_measures)==0:
+            points.append({"nominal_time":float(b["t_gp"]),"padded_audio_time":float(base_warp(b["t_gp"])),"kind":"heuristic"})
+    # Manual anchors replace heuristic points at the same score position.
+    for a in anchors:
+        points=[p for p in points if abs(p["nominal_time"]-a["nominal_time"])>1e-6]
+        points.append({**a,"kind":"manual"})
+    points.sort(key=lambda p:p["nominal_time"])
+    clean=[]
+    for point in points:
+        if clean and point["padded_audio_time"]<=clean[-1]["padded_audio_time"]:
+            if point.get("kind")=="manual":
+                while clean and clean[-1].get("kind")!="manual" and point["padded_audio_time"]<=clean[-1]["padded_audio_time"]:
+                    clean.pop()
+                if clean and point["padded_audio_time"]<=clean[-1]["padded_audio_time"]:
+                    raise ValueError("Manual anchor conflicts with an earlier manual anchor")
+            else:
+                continue
+        clean.append(point)
+    x=np.asarray([p["nominal_time"] for p in clean]); y=np.asarray([p["padded_audio_time"] for p in clean])
+    if len(x)<2: return base_warp, clean
+    fn=interp1d(x,y,kind="linear",bounds_error=False,fill_value="extrapolate")
+    return (lambda t:float(fn(float(t)))), clean
+
+
+def compute_simple_warp(event_times, audio_path, mode, sr=22050):
+    diagnostics={"mode":mode,"selected_source":None,"candidates":[],"agreement":[]}
+    if mode == "nominal":
+        fn=lambda t:float(t)
+        diagnostics.update({"method":"identity_gp_clock","offset_seconds":0.0,"scale":1.0})
+        fn.alignment_diagnostics=diagnostics
+        return fn
+    if librosa is None or not audio_path or not event_times:
+        fn=lambda t:float(t)
+        diagnostics.update({"method":"identity_fallback","reason":"missing audio, events, or librosa",
+                            "offset_seconds":0.0,"scale":1.0})
+        fn.alignment_diagnostics=diagnostics
+        return fn
+    audio,actual_sr=librosa.load(audio_path,sr=sr,mono=True)
+    envelope=librosa.onset.onset_strength(y=audio,sr=actual_sr)
+    detected=librosa.onset.onset_detect(onset_envelope=envelope,sr=actual_sr,units="time",backtrack=False)
+    if len(detected)==0:
+        fn=lambda t:float(t)
+        diagnostics.update({"method":"identity_fallback","reason":"no audio onsets detected",
+                            "offset_seconds":0.0,"scale":1.0})
+        fn.alignment_diagnostics=diagnostics
+        return fn
+    nominal_start=float(event_times[0]); audio_start=float(detected[0])
+    if mode == "offset" or len(event_times)<2 or len(detected)<2:
+        offset=audio_start-nominal_start
+        fn=lambda t,o=offset:float(t)+o
+        diagnostics.update({"method":"first_onset_offset","audio":str(audio_path),
+                            "nominal_start":nominal_start,"audio_start":audio_start,
+                            "offset_seconds":offset,"scale":1.0})
+    else:
+        nominal_end=float(event_times[-1]); audio_end=float(detected[-1])
+        span=nominal_end-nominal_start
+        scale=(audio_end-audio_start)/span if span>0 else 1.0
+        fn=lambda t,a=audio_start,n=nominal_start,k=scale:a+(float(t)-n)*k
+        diagnostics.update({"method":"first_last_onset_linear","audio":str(audio_path),
+                            "nominal_start":nominal_start,"nominal_end":nominal_end,
+                            "audio_start":audio_start,"audio_end":audio_end,
+                            "offset_seconds":audio_start-nominal_start,"scale":scale})
+    fn.alignment_diagnostics=diagnostics
+    return fn
+
 def compute_warp_candidate(event_times, audio_path, source, sr=22050, band_rad=0.25):
     """Build one instrument-specific DTW candidate without altering chart timing."""
     if librosa is None or interp1d is None or not event_times or not audio_path:
@@ -707,7 +809,8 @@ def get_initial_tempo(gp_path):
 
 def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_path=None,
             sr=22050, count_in_offset=0.0, timeline_mode="both",
-            allow_severe_alignment=False):
+            allow_severe_alignment=False, anchors_path=None, padding_added=0.0,
+            auto_chunk_measures=16, alignment_mode="linear"):
     if guitarpro is None:
         raise RuntimeError("pyguitarpro is required: pip install pyguitarpro")
 
@@ -773,18 +876,39 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         song_timeline_gp["time_signatures"], count_in_offset)
     song_timeline_gp["beats"] = shift_nominal_times(song_timeline_gp["beats"], count_in_offset)
 
+    manual_anchors, anchor_reference = load_alignment_anchors(
+        anchors_path, song_timeline_gp["beats"], padding_added=padding_added)
+    if manual_anchors:
+        fc.log(f"Loaded {len(manual_anchors)} manual anchor(s); input clock={anchor_reference}, padding conversion=+{padding_added:.3f}s", indent=1)
+
     fc.log_step(4, 5, "DTW-aligning nominal GP timing to real audio")
     specs=[("drums",_event_times(drum_hits_gp),drums_audio_path),
            ("bass",_event_times(bass_alignment_events),bass_audio_path),
            ("piano",_event_times(piano_alignment_events),piano_audio_path)]
-    candidates=[]
-    for source,event_times,audio_path in specs:
-        if event_times and audio_path:
-            fc.log(f"Building {source} alignment candidate from {len(event_times)} onsets",indent=1)
-            candidates.append(compute_warp_candidate(event_times,audio_path,source,sr=sr))
-    sample_times=[b["t_gp"] for b in song_timeline_gp["beats"]]
-    warp_fn=choose_probabilistic_warp(candidates,sample_times)
-    decision=warp_fn.alignment_diagnostics
+    if alignment_mode == "dtw":
+        candidates=[]
+        for source,event_times,audio_path in specs:
+            if event_times and audio_path:
+                fc.log(f"Building {source} alignment candidate from {len(event_times)} onsets",indent=1)
+                candidates.append(compute_warp_candidate(event_times,audio_path,source,sr=sr))
+        sample_times=[b["t_gp"] for b in song_timeline_gp["beats"]]
+        warp_fn=choose_probabilistic_warp(candidates,sample_times)
+        decision=warp_fn.alignment_diagnostics
+        warp_fn,chunk_points=apply_hard_anchors(warp_fn,manual_anchors,song_timeline_gp["beats"],
+                                                max_chunk_measures=auto_chunk_measures)
+        decision["manual_anchors"]=manual_anchors
+        decision["chunk_points"]=chunk_points
+        decision["anchor_time_reference"]=anchor_reference
+        decision["padding_added"]=padding_added
+    else:
+        reference=next(((source,times,path) for source,times,path in specs if times and path),None)
+        source,event_times,audio_path=reference if reference else ("none",[],None)
+        fc.log(f"Using simple alignment mode '{alignment_mode}' with reference '{source}'",indent=1)
+        warp_fn=compute_simple_warp(event_times,audio_path,alignment_mode,sr=sr)
+        decision=warp_fn.alignment_diagnostics
+        decision["selected_source"]=source if source != "none" else None
+        decision["manual_anchors_ignored"]=bool(manual_anchors)
+        decision["padding_added"]=padding_added
     fc.log(f"Alignment decision: {decision.get('mode')} {decision.get('selected_source') or ''}",indent=1)
     for c in decision.get("candidates",[]):
         fc.log(f"{c['source']}: p={c.get('probability',0):.3f}, median={c.get('median_residual_ms',0):.1f}ms, coverage={c.get('coverage',0):.2f}",indent=2)
@@ -881,10 +1005,14 @@ def main():
     parser.add_argument("drums_audio", nargs="?", default=None, help="Optional isolated drums stem")
     parser.add_argument("--bass-audio", default=None)
     parser.add_argument("--piano-audio", default=None)
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw"),default="linear")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
                         help="A/B test output: dense tempos only, explicit beats only, or both")
     parser.add_argument("--allow-severe-alignment", action="store_true",
                         help="Package even if severe structural timing errors remain after repair")
+    parser.add_argument("--anchors", default=None)
+    parser.add_argument("--padding-added", type=float, default=0.0)
+    parser.add_argument("--auto-chunk-measures", type=int, default=16)
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)
     parser.add_argument("--count-in-offset", type=float, default=0.0,
@@ -896,7 +1024,9 @@ def main():
     result=process(args.gp_file,args.drums_audio,bass_audio_path=args.bass_audio,
                    piano_audio_path=args.piano_audio,sr=args.sr,
                    count_in_offset=args.count_in_offset,timeline_mode=args.timeline_mode,
-                   allow_severe_alignment=args.allow_severe_alignment)
+                   allow_severe_alignment=args.allow_severe_alignment,
+                   anchors_path=args.anchors, padding_added=args.padding_added,
+                   auto_chunk_measures=args.auto_chunk_measures,alignment_mode=args.alignment_mode)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

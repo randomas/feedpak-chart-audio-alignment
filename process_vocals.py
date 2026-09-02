@@ -304,10 +304,13 @@ def run_crepe(audio_path, device="cuda", hop_seconds=CREPE_HOP_SECONDS):
 # Main
 # --------------------------------------------------------------------------
 
-def process(vocals_path, device="cuda", hf_token=None):
+def process(vocals_path, device="cuda", hf_token=None, batch_size=16, compute_type=None, language=None):
     fc.log(f"Processing vocal stem: {vocals_path}")
     fc.log_step(1, 3, "WhisperX (transcribe + align + diarize)")
-    words, language = run_whisperx(vocals_path, device=device, hf_token=hf_token)
+    compute_type = compute_type or ("float16" if device == "cuda" else "int8")
+    words, detected_language = run_whisperx(vocals_path, device=device, batch_size=batch_size,
+                                             compute_type=compute_type, hf_token=hf_token)
+    language = language or detected_language
 
     fc.log_step(2, 3, "CREPE pitch tracking")
     times, hz, confidence = run_crepe(vocals_path, device=device)
@@ -324,10 +327,16 @@ def main():
     parser.add_argument("vocals_audio", help="Path to the isolated vocal stem (e.g. vocals.ogg)")
     parser.add_argument("--out", default="intermediate_vocals.json")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--compute-type", default=None)
+    parser.add_argument("--language", default=None)
     parser.add_argument("--hf-token", default=None, help="HuggingFace token for pyannote diarization models")
     args = parser.parse_args()
 
-    result = process(args.vocals_audio, device=args.device, hf_token=args.hf_token)
+    result = process(args.vocals_audio, device=args.device, hf_token=args.hf_token,
+                     batch_size=args.batch_size, compute_type=args.compute_type,
+                     language=args.language)
+    result["cache"] = {"audio_sha256": fc.file_sha256(args.vocals_audio)}
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

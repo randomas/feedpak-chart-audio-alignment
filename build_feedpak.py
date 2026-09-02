@@ -33,6 +33,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -90,7 +91,7 @@ def discover_stems(song_folder, vocals_stem_name, drums_stem_name):
     for f in audio_files:
         base = os.path.splitext(f)[0]
         is_full_mix = base.lower() in FULL_MIX_STEM_NAMES
-        stem_id = "full" if is_full_mix else base
+        stem_id = "full" if is_full_mix else base.lower()
         default_state = not (is_full_mix and other_stem_count > 0)
         stems.append({
             "id": stem_id,
@@ -240,18 +241,20 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     # needed, but the chart still has to shift to match wherever the
     # real content actually starts, not stay at zero).
     count_in_offset = max(leading_silence, count_in_seconds)
-    return count_in_offset, stems_out_dir, padded_paths
+    return count_in_offset, pad_seconds, stems_out_dir, padded_paths
 
 
 # --------------------------------------------------------------------------
 # Subprocess orchestration
 # --------------------------------------------------------------------------
 
-def run_vocals_script(vocals_path, out_path, device="cuda", hf_token=None):
+def run_vocals_script(vocals_path, out_path, device="cuda", hf_token=None, batch_size=16, compute_type=None, language=None):
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "process_vocals.py"),
            vocals_path, "--out", out_path, "--device", device]
-    if hf_token:
-        cmd += ["--hf-token", hf_token]
+    cmd += ["--batch-size",str(batch_size)]
+    if compute_type: cmd += ["--compute-type",compute_type]
+    if language: cmd += ["--language",language]
+    if hf_token: cmd += ["--hf-token",hf_token]
     fc.log(f"Launching process_vocals.py as a subprocess (device={device})")
     # No capture_output: let the child's own [*] progress logs stream
     # straight through to this terminal in real time.
@@ -259,9 +262,19 @@ def run_vocals_script(vocals_path, out_path, device="cuda", hf_token=None):
     fc.log("process_vocals.py finished")
 
 
+
+def load_reusable_vocals(path, vocals_path):
+    if not path or not os.path.isfile(path): return None
+    with open(path,"r",encoding="utf-8") as f: data=json.load(f)
+    if (data.get("cache") or {}).get("audio_sha256") == fc.file_sha256(vocals_path):
+        fc.log(f"Reusing cached vocal analysis: {path}",indent=1); return data
+    fc.log("Vocal cache does not match the padded vocal audio; rerunning models",indent=1)
+    return None
+
 def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   bass_path=None,piano_path=None,timeline_mode="both",
-                  allow_severe_alignment=False):
+                  allow_severe_alignment=False,anchors_path=None,padding_added=0.0,
+                  auto_chunk_measures=16,alignment_mode="linear"):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path]
     if drums_path: cmd.append(drums_path)
     cmd += ["--out",out_path,"--sr",str(sr),"--count-in-offset",str(count_in_offset),
@@ -269,6 +282,9 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
     if bass_path: cmd += ["--bass-audio",bass_path]
     if piano_path: cmd += ["--piano-audio",piano_path]
     if allow_severe_alignment: cmd.append("--allow-severe-alignment")
+    if anchors_path: cmd += ["--anchors",anchors_path]
+    cmd += ["--padding-added",str(padding_added),"--auto-chunk-measures",str(auto_chunk_measures),
+            "--alignment-mode",alignment_mode]
     fc.log("Launching guarded multi-reference GP/audio alignment")
     subprocess.run(cmd,check=True)
 
@@ -276,6 +292,31 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
 # --------------------------------------------------------------------------
 # Wire-format conversion
 # --------------------------------------------------------------------------
+
+def shift_vocal_analysis(vocals_data, offset):
+    """Map source-audio vocal timestamps to physically padded packaged audio."""
+    if not offset: return vocals_data
+    out=dict(vocals_data); speakers={}
+    for speaker,data in (vocals_data.get("speakers") or {}).items():
+        item=dict(data)
+        item["words"]=[{**x,"t":round(float(x["t"])+offset,4)} for x in data.get("words",[])]
+        item["pitch_notes"]=[{**x,"t":round(float(x["t"])+offset,4)} for x in data.get("pitch_notes",[])]
+        item["contour"]=[{**x,"t":round(float(x["t"])+offset,4)} for x in data.get("contour",[])]
+        speakers[speaker]=item
+    out["speakers"]=speakers
+    return out
+
+
+def embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,entries):
+    """Mirror beats/sections for highway readers using the historical hoist path."""
+    timeline=gp_data.get("song_timeline") or {}
+    if not entries or not timeline.get("beats"): return
+    path=os.path.join(work_dir,*entries[0]["file"].split("/"))
+    with open(path,"r",encoding="utf-8") as f: data=json.load(f)
+    data["beats"]=timeline["beats"]
+    if timeline.get("sections"): data["sections"]=timeline["sections"]
+    fc.write_json(path,data)
+
 
 def write_lyric_tracks(vocals_data,work_dir,vocal_stem_id):
     entries=[]; files=[]; language=vocals_data.get("language") or "und"
@@ -422,6 +463,7 @@ def build_manifest(metadata, duration, arrangements, stems, lyrics_file, lyric_t
                     vocal_pitch_file, vocal_pitch_contour_file,
                     drum_tab_file, keys_file, song_timeline_file, cover_file):
     manifest = {
+        "feedpak_version": "1.19.0",
         "title": metadata.get("title", "Unknown Title"),
         "artist": metadata.get("artist", "Unknown Artist"),
         "album": metadata.get("album"),
@@ -506,6 +548,68 @@ def package_feedpak(work_dir, manifest, output_path):
                 zf.write(full, rel)
 
 
+
+PROJECT_BASE_NAME = "feedpak-project.yaml"
+PROJECT_VERSION_RE = re.compile(r"^feedpak-project\.v(\d{3})\.yaml$")
+
+
+def find_latest_project_file(song_folder, explicit=None):
+    if explicit:
+        return explicit if os.path.isabs(explicit) else os.path.join(song_folder, explicit)
+    found=[]
+    base=os.path.join(song_folder,PROJECT_BASE_NAME)
+    if os.path.isfile(base): found.append((1,base))
+    for name in os.listdir(song_folder):
+        match=PROJECT_VERSION_RE.match(name)
+        if match: found.append((int(match.group(1)),os.path.join(song_folder,name)))
+    return max(found,key=lambda x:x[0])[1] if found else None
+
+
+def load_project_defaults(path):
+    if not path or not os.path.isfile(path): return {}
+    with open(path,"r",encoding="utf-8") as f: data=yaml.safe_load(f) or {}
+    vocals=data.get("vocals",{}); alignment=data.get("alignment",{}); timeline=data.get("timeline",{}); build=data.get("build",{}); stems=data.get("stems",{})
+    return {"vocals_stem":stems.get("vocals"),"drums_stem":stems.get("drums"),
+            "device":vocals.get("device"),"vocal_layout":vocals.get("layout"),
+            "reuse_vocals":vocals.get("reuse"),"vocals_cache":vocals.get("cache"),
+            "vocal_batch_size":vocals.get("batch_size"),"vocal_compute_type":vocals.get("compute_type"),
+            "vocal_language":vocals.get("language"),"anchors":alignment.get("anchors"),
+            "auto_chunk_measures":alignment.get("max_chunk_measures"),
+            "alignment_mode":alignment.get("mode"),
+            "allow_severe_alignment":alignment.get("allow_severe"),
+            "timeline_mode":timeline.get("mode"),"keep_work_dir":build.get("keep_work_dir")}
+
+
+def project_document(args):
+    return {"version":1,"stems":{"vocals":args.vocals_stem,"drums":args.drums_stem},
+            "vocals":{"device":args.device,"layout":args.vocal_layout,"reuse":args.reuse_vocals,
+                       "cache":args.vocals_cache,"batch_size":args.vocal_batch_size,
+                       "compute_type":args.vocal_compute_type,"language":args.vocal_language},
+            "alignment":{"mode":args.alignment_mode,"anchors":args.anchors,
+                         "max_chunk_measures":args.auto_chunk_measures,"allow_severe":args.allow_severe_alignment},
+            "timeline":{"mode":args.timeline_mode},
+            "build":{"keep_work_dir":args.keep_work_dir}}
+
+
+def write_project_version(song_folder, document, current_path=None):
+    current=None
+    if current_path and os.path.isfile(current_path):
+        with open(current_path,"r",encoding="utf-8") as f: current=yaml.safe_load(f) or {}
+    if current == document:
+        return current_path
+    versions=[1]
+    for name in os.listdir(song_folder):
+        match=PROJECT_VERSION_RE.match(name)
+        if match: versions.append(int(match.group(1)))
+    if not current_path:
+        path=os.path.join(song_folder,PROJECT_BASE_NAME)
+    else:
+        path=os.path.join(song_folder,f"feedpak-project.v{max(versions)+1:03d}.yaml")
+    with open(path,"w",encoding="utf-8",newline="\n") as f:
+        yaml.safe_dump(document,f,sort_keys=False,allow_unicode=True)
+    fc.log(f"Project configuration saved: {path}",indent=1)
+    return path
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -513,7 +617,9 @@ def package_feedpak(work_dir, manifest, output_path):
 def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name="drums",
           device="cuda",hf_token=None,skip_vocals=False,skip_gp=False,
           keep_work_dir=False,vocal_layout="merged",timeline_mode="both",
-          allow_severe_alignment=False):
+          allow_severe_alignment=False,reuse_vocals=False,vocals_cache=None,
+          vocal_batch_size=16,vocal_compute_type=None,vocal_language=None,
+          anchors_path=None,auto_chunk_measures=16,alignment_mode="linear"):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps = 6
@@ -522,6 +628,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     fc.log_step(1, total_steps, "Discovering stems and metadata")
     metadata = load_metadata(song_folder)
     stems, vocals_path, drums_path = discover_stems(song_folder, vocals_stem_name, drums_stem_name)
+    original_vocals_path = vocals_path
     if not stems:
         raise RuntimeError(f"No audio stems found in {song_folder}")
     fc.log(f"Found {len(stems)} stem(s): {[s['id'] for s in stems]}", indent=1)
@@ -534,7 +641,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     gp_path = find_gp_file(song_folder)
 
     fc.log_step(2, total_steps, "Count-in check (padding stems if needed)")
-    count_in_offset, stems_dir, padded_paths = prepare_stems_with_count_in(
+    count_in_offset, padding_added, stems_dir, padded_paths = prepare_stems_with_count_in(
         song_folder, stems, gp_path, work_dir)
     # From here on, use the padded copies for everything — DTW reference,
     # vocal processing input, and duration probing all need to see the
@@ -557,9 +664,15 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     vocal_pitch_file=vocal_pitch_contour_file=lyrics_file=None
     lyric_tracks=[]
     if vocals_path and not skip_vocals:
-        vocals_intermediate=os.path.join(song_folder,"intermediate_vocals.json")
-        run_vocals_script(vocals_path,vocals_intermediate,device=device,hf_token=hf_token)
-        with open(vocals_intermediate,"r",encoding="utf-8") as f: vocals_data=json.load(f)
+        vocals_intermediate=vocals_cache or os.path.join(song_folder,"intermediate_vocals.json")
+        vocals_analysis_path=original_vocals_path or vocals_path
+        vocals_data=load_reusable_vocals(vocals_intermediate,vocals_analysis_path) if reuse_vocals else None
+        if vocals_data is None:
+            run_vocals_script(vocals_analysis_path,vocals_intermediate,device=device,hf_token=hf_token,
+                              batch_size=vocal_batch_size,compute_type=vocal_compute_type,
+                              language=vocal_language)
+            with open(vocals_intermediate,"r",encoding="utf-8") as f: vocals_data=json.load(f)
+        vocals_data=shift_vocal_analysis(vocals_data,padding_added)
         if vocal_layout in ("merged","both"): lyrics_file=write_single_merged_lyrics(vocals_data,work_dir)
         if vocal_layout in ("separated","both"): lyric_tracks,_=write_lyric_tracks(vocals_data,work_dir,vocals_stem_name)
         wrote_pitch,wrote_contour,overlaps=write_merged_vocal_pitch(vocals_data,work_dir)
@@ -578,7 +691,9 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
         run_gp_script(gp_path,drums_path,gp_intermediate,count_in_offset=count_in_offset,
                       bass_path=bass_path,piano_path=piano_path,timeline_mode=timeline_mode,
-                      allow_severe_alignment=allow_severe_alignment)
+                      allow_severe_alignment=allow_severe_alignment,
+                      anchors_path=anchors_path,padding_added=padding_added,
+                      auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         arrangements += write_arrangement_files(gp_data, work_dir)
@@ -589,6 +704,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                                   "drum_tab": fc.to_posix_relpath(drum_tab_file)})
         keys_file = write_keys(gp_data, work_dir)
         song_timeline_file=write_song_timeline(gp_data,work_dir)
+        embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,arrangements)
         alignment_report=gp_data.get("alignment_report")
         fc.log(f"Wrote {len(arrangements)} arrangement entr(y/ies), "
                f"drum_tab={'yes' if drum_tab_file else 'no'}, "
@@ -645,30 +761,51 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build a .feedpak from a song folder.")
-    parser.add_argument("song_folder")
-    parser.add_argument("output_folder")
-    parser.add_argument("--vocals-stem", default="vocals")
-    parser.add_argument("--drums-stem", default="drums")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--hf-token", default=None)
-    parser.add_argument("--skip-vocals", action="store_true")
-    parser.add_argument("--skip-gp", action="store_true")
-    parser.add_argument("--vocal-layout",choices=("merged","separated","both"),default="merged")
-    parser.add_argument("--timeline-mode",choices=("tempos","beats","both"),default="both",
-                        help="Create controlled A/B packages")
-    parser.add_argument("--allow-severe-alignment",action="store_true")
-    parser.add_argument("--keep-work-dir", action="store_true",
-                         help="Keep _feedpak_build/ and intermediate_*.json in the song "
-                              "folder after a successful build, for debugging.")
-    args = parser.parse_args()
+    # First pass finds song folder and optional explicit project file.
+    pre=argparse.ArgumentParser(add_help=False)
+    pre.add_argument("song_folder"); pre.add_argument("output_folder")
+    pre.add_argument("--config",default=None)
+    known,_=pre.parse_known_args()
+    project_path=find_latest_project_file(known.song_folder,known.config)
+    defaults=load_project_defaults(project_path)
 
-    build(args.song_folder, args.output_folder,
-          vocals_stem_name=args.vocals_stem, drums_stem_name=args.drums_stem,
-          device=args.device, hf_token=args.hf_token,
-          skip_vocals=args.skip_vocals, skip_gp=args.skip_gp,
-          keep_work_dir=args.keep_work_dir,vocal_layout=args.vocal_layout,
-          timeline_mode=args.timeline_mode,allow_severe_alignment=args.allow_severe_alignment)
+    parser=argparse.ArgumentParser(description="Build a .feedpak from a song folder.")
+    parser.add_argument("song_folder"); parser.add_argument("output_folder"); parser.add_argument("--config",default=known.config)
+    parser.add_argument("--vocals-stem",default=defaults.get("vocals_stem") or "vocals")
+    parser.add_argument("--drums-stem",default=defaults.get("drums_stem") or "drums")
+    parser.add_argument("--device",default=defaults.get("device") or "cuda")
+    parser.add_argument("--hf-token",default=None)
+    parser.add_argument("--skip-vocals",action="store_true"); parser.add_argument("--skip-gp",action="store_true")
+    parser.add_argument("--vocal-layout",choices=("merged","separated","both"),default=defaults.get("vocal_layout") or "merged")
+    parser.add_argument("--timeline-mode",choices=("tempos","beats","both"),default=defaults.get("timeline_mode") or "both")
+    parser.add_argument("--allow-severe-alignment",action="store_true",default=bool(defaults.get("allow_severe_alignment",False)))
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw"),
+                        default=defaults.get("alignment_mode") or "linear")
+    parser.add_argument("--anchors",default=defaults.get("anchors"))
+    parser.add_argument("--auto-chunk-measures",type=int,default=defaults.get("auto_chunk_measures") or 16)
+    parser.add_argument("--reuse-vocals",action="store_true",default=bool(defaults.get("reuse_vocals",False)))
+    parser.add_argument("--vocals-cache",default=defaults.get("vocals_cache"))
+    parser.add_argument("--vocal-batch-size",type=int,default=defaults.get("vocal_batch_size") or 16)
+    parser.add_argument("--vocal-compute-type",default=defaults.get("vocal_compute_type"))
+    parser.add_argument("--vocal-language",default=defaults.get("vocal_language"))
+    parser.add_argument("--keep-work-dir",action="store_true",default=bool(defaults.get("keep_work_dir",False)))
+    args=parser.parse_args()
+
+    # Explicit CLI values have already overridden project-derived parser defaults.
+    project_path=write_project_version(args.song_folder,project_document(args),project_path)
+    anchors=args.anchors
+    if anchors and not os.path.isabs(anchors): anchors=os.path.join(args.song_folder,anchors)
+    cache=args.vocals_cache
+    if cache and not os.path.isabs(cache): cache=os.path.join(args.song_folder,cache)
+    build(args.song_folder,args.output_folder,vocals_stem_name=args.vocals_stem,
+          drums_stem_name=args.drums_stem,device=args.device,hf_token=args.hf_token,
+          skip_vocals=args.skip_vocals,skip_gp=args.skip_gp,keep_work_dir=args.keep_work_dir,
+          vocal_layout=args.vocal_layout,timeline_mode=args.timeline_mode,
+          allow_severe_alignment=args.allow_severe_alignment,reuse_vocals=args.reuse_vocals,
+          vocals_cache=cache,vocal_batch_size=args.vocal_batch_size,
+          vocal_compute_type=args.vocal_compute_type,vocal_language=args.vocal_language,
+          anchors_path=anchors,auto_chunk_measures=args.auto_chunk_measures,
+          alignment_mode=args.alignment_mode)
 
 
 if __name__ == "__main__":

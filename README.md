@@ -1328,3 +1328,53 @@ nvidia-smi
 ```
 
 Do not share copyrighted audio or Guitar Pro files unless you have permission to distribute them.
+
+
+## Project configuration and versioning
+
+The builder automatically creates `feedpak-project.yaml` in the song folder on the first run. On later runs it loads the newest project configuration automatically. Explicit CLI arguments always override project values.
+
+When effective project settings change, the previous file is preserved and a new sequential snapshot is written:
+
+```text
+feedpak-project.yaml
+feedpak-project.v002.yaml
+feedpak-project.v003.yaml
+```
+
+If settings have not changed, no new file is created. Use `--config path.yaml` to load a specific configuration instead of the newest automatic snapshot.
+
+The project file stores stem names, vocal device/cache settings, anchor file, chunk size, timeline mode, and build behavior. Tokens and one-shot skip switches are deliberately not stored.
+
+## Manual anchor time reference
+
+Anchor files default to the original unpadded source-audio clock:
+
+```json
+{
+  "version": 1,
+  "time_reference": "source",
+  "anchors": [
+    {"measure": 48, "beat": 1, "audio_time": 118.647, "label": "solo start"}
+  ]
+}
+```
+
+`time_reference` may be `source` or `padded`. If omitted, `source` is assumed. Source times are converted internally by adding only the silence introduced by the current build, not the total detected count-in. The alignment report records source time, converted padded time, and padding added.
+
+
+### Alignment test modes
+
+Use `--alignment-mode nominal|offset|linear|dtw`. `nominal` keeps the shifted GP clock, `offset` matches the first symbolic and audio onsets without changing tempo, `linear` matches first and last onsets with one constant scale, and `dtw` uses guarded multi-reference alignment. The selected value is stored as `alignment.mode` in the project YAML.
+
+
+## Verified renderer and vocal timing corrections
+
+- Linear alignment remains the default.
+- `song_timeline.json` keeps the accepted aligned times unchanged.
+- The same beats and sections are mirrored into the first playable arrangement for historical highway rendering.
+- No synthetic measure is inserted at zero.
+- Vocal analysis runs on the original vocals stem. At packaging, only physically added padding is added to lyric, per-syllable pitch, and contour timestamps. Existing source silence is never added twice.
+- `vocal_pitch.json` remains per-syllable and mirrors `lyrics.json` timing, as required by the karaoke renderer. Detailed samples remain in `vocal_pitch_contour.json`.
+- Vocal caches carry the SHA-256 of the exact original stem analyzed. Old hashless caches must be regenerated once.
+- The generated manifest declares Feedpak 1.19.0 and uses lowercase stem IDs.
