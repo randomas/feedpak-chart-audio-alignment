@@ -1,4 +1,3 @@
-
 """
 build_feedpak.py
 
@@ -193,26 +192,47 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     stems_out_dir = os.path.join(work_dir, "stems")
     os.makedirs(stems_out_dir, exist_ok=True)
 
-    reference = next((s for s in stems if s["id"] == "full"), None) \
-        or next((s for s in stems if s["id"] == "drums"), None) \
-        or stems[0]
-    reference_path = os.path.join(song_folder, os.path.basename(reference["file"]))
-    leading_silence = fc.detect_leading_silence_seconds(reference_path)
+    if gp_path:
+        bpm = pga.get_initial_tempo(gp_path)
+    else:
+        bpm = 120.0
+        fc.log("No .gp5 file to read tempo from; assuming 120 BPM for count-in sizing", indent=1)
 
+    # Initial count-in top-up rule, independent of internal silence checkpoints.
+    # Measure only the full mix when available, then add only the missing
+    # difference needed to reach exactly four beats of total leading space.
     if gp_path:
         bpm = pga.get_initial_tempo(gp_path)
     else:
         bpm = 120.0
         fc.log("No .gp5 file to read tempo from; assuming 120 BPM for count-in sizing", indent=1)
     count_in_seconds = COUNT_IN_BEATS * (60.0 / bpm)
-
-    pad_seconds = max(0.0, count_in_seconds - leading_silence)
+    full_stem = next((stem for stem in stems if str(stem["id"]).lower() == "full"), None)
+    if full_stem is not None:
+        full_source = os.path.join(song_folder, os.path.basename(full_stem["file"]))
+        leading_silence = fc.detect_leading_silence_seconds(full_source)
+        reference = "full"
+    else:
+        # A full-mix-only project is covered above. If no full mix exists,
+        # use the earliest non-vocal stem as a conservative recording-start
+        # fallback, never a consensus of later instrument entrances.
+        observations = []
+        for stem in stems:
+            stem_id = str(stem["id"]).lower()
+            if stem_id == "vocals":
+                continue
+            source = os.path.join(song_folder, os.path.basename(stem["file"]))
+            observations.append((stem_id, fc.detect_leading_silence_seconds(source)))
+        if observations:
+            reference, leading_silence = min(observations, key=lambda item: item[1])
+        else:
+            reference, leading_silence = "none", 0.0
+    pad_seconds = max(0.0, count_in_seconds - float(leading_silence))
     if pad_seconds < min_pad_epsilon:
         pad_seconds = 0.0
-
-    fc.log(f"Reference stem '{reference['id']}' has {leading_silence:.3f}s of leading "
-           f"silence; needs {count_in_seconds:.3f}s for a full {COUNT_IN_BEATS}-beat "
-           f"count-in at {bpm:.0f} BPM -> padding {pad_seconds:.3f}s", indent=1)
+    fc.log(f"Initial count-in reference: {reference}; existing space {leading_silence:.3f}s", indent=1)
+    fc.log(f"Four beats at {bpm:.0f} BPM require {count_in_seconds:.3f}s -> "
+           f"adding only missing difference {pad_seconds:.3f}s", indent=1)
 
     padded_paths = {}
     for stem in stems:
@@ -267,24 +287,33 @@ def load_reusable_vocals(path, vocals_path):
     if not path or not os.path.isfile(path): return None
     with open(path,"r",encoding="utf-8") as f: data=json.load(f)
     if (data.get("cache") or {}).get("audio_sha256") == fc.file_sha256(vocals_path):
+        if int(data.get("analysis_version", 1)) < 3:
+            fc.log("Vocal cache predates contiguous multi-note syllables; rerunning models",indent=1)
+            return None
         fc.log(f"Reusing cached vocal analysis: {path}",indent=1); return data
     fc.log("Vocal cache does not match the padded vocal audio; rerunning models",indent=1)
     return None
 
 def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
-                  bass_path=None,piano_path=None,timeline_mode="both",
+                  bass_path=None,piano_path=None,guitar_path=None,full_path=None,
+                  timeline_mode="both",
                   allow_severe_alignment=False,anchors_path=None,padding_added=0.0,
-                  auto_chunk_measures=16,alignment_mode="linear"):
+                  auto_chunk_measures=16,alignment_mode="dtw",
+                  checkpoint_measures=4,checkpoint_search_radius=1.0):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path]
     if drums_path: cmd.append(drums_path)
     cmd += ["--out",out_path,"--sr",str(sr),"--count-in-offset",str(count_in_offset),
             "--timeline-mode",timeline_mode]
     if bass_path: cmd += ["--bass-audio",bass_path]
     if piano_path: cmd += ["--piano-audio",piano_path]
+    if guitar_path: cmd += ["--guitar-audio",guitar_path]
+    if full_path: cmd += ["--full-audio",full_path]
     if allow_severe_alignment: cmd.append("--allow-severe-alignment")
     if anchors_path: cmd += ["--anchors",anchors_path]
     cmd += ["--padding-added",str(padding_added),"--auto-chunk-measures",str(auto_chunk_measures),
-            "--alignment-mode",alignment_mode]
+            "--alignment-mode",alignment_mode,
+            "--checkpoint-measures",str(checkpoint_measures),
+            "--checkpoint-search-radius",str(checkpoint_search_radius)]
     fc.log("Launching guarded multi-reference GP/audio alignment")
     subprocess.run(cmd,check=True)
 
@@ -293,8 +322,8 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
 # Wire-format conversion
 # --------------------------------------------------------------------------
 
-def shift_vocal_analysis(vocals_data, offset):
-    """Map source-audio vocal timestamps to physically padded packaged audio."""
+def shift_vocal_analysis(vocals_data,offset):
+    """Map source-audio vocal timestamps onto the packaged padded clock."""
     if not offset: return vocals_data
     out=dict(vocals_data); speakers={}
     for speaker,data in (vocals_data.get("speakers") or {}).items():
@@ -308,10 +337,11 @@ def shift_vocal_analysis(vocals_data, offset):
 
 
 def embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,entries):
-    """Mirror beats/sections for highway readers using the historical hoist path."""
+    """Mirror beats/sections for highway readers using the legacy hoist path."""
     timeline=gp_data.get("song_timeline") or {}
-    if not entries or not timeline.get("beats"): return
-    path=os.path.join(work_dir,*entries[0]["file"].split("/"))
+    first=next((e for e in entries if e.get("file")),None)
+    if not first or not timeline.get("beats"): return
+    path=os.path.join(work_dir,*first["file"].split("/"))
     with open(path,"r",encoding="utf-8") as f: data=json.load(f)
     data["beats"]=timeline["beats"]
     if timeline.get("sections"): data["sections"]=timeline["sections"]
@@ -327,20 +357,43 @@ def write_lyric_tracks(vocals_data,work_dir,vocal_stem_id):
         entries.append({"id":sid,"file":fn,"language":language,"kind":"original","stem":vocal_stem_id,"name":f"Voice {i}"}); files.append(fn)
     return entries,files
 
+def _resolve_global_vocal_monophony(notes, minimum_seconds=0.04):
+    out=[]; resolved=0
+    for raw in sorted(notes,key=lambda n:(float(n["t"]),-float(n.get("confidence",0)))):
+        n=dict(raw); n["t"]=float(n["t"]); n["d"]=float(n["d"])
+        if n["d"]<=0: continue
+        if not out: out.append(n); continue
+        p=out[-1]; pe=p["t"]+p["d"]; ne=n["t"]+n["d"]
+        if n["t"]>=pe-0.001:
+            if n["t"]<pe: n["t"]=pe; n["d"]=ne-pe
+            if n["d"]>=minimum_seconds: out.append(n)
+            continue
+        resolved+=1
+        if int(n["midi"])==int(p["midi"]):
+            p["d"]=max(pe,ne)-p["t"]
+            p["confidence"]=max(float(p.get("confidence",0)),float(n.get("confidence",0)))
+        elif float(n.get("confidence",0))>float(p.get("confidence",0)):
+            p["d"]=max(0,n["t"]-p["t"])
+            if p["d"]<minimum_seconds: out.pop()
+            out.append(n)
+        else:
+            n["t"]=pe; n["d"]=max(0,ne-pe)
+            if n["d"]>=minimum_seconds: out.append(n)
+    return out,resolved
+
+
 def write_merged_vocal_pitch(vocals_data,work_dir):
     notes=[]; samples=[]
     for data in vocals_data.get("speakers",{}).values():
         notes.extend(data.get("pitch_notes",[])); samples.extend(data.get("contour",[]))
-    notes.sort(key=lambda n:(n["t"],n["d"],n["midi"])); samples.sort(key=lambda x:x["t"])
+    samples.sort(key=lambda x:x["t"])
     seen=set(); samples=[x for x in samples if not ((x["t"],x["hz"]) in seen or seen.add((x["t"],x["hz"])))]
-    overlaps=0; end=-1.0
-    for n in notes:
-        if n["t"]<end-0.001: overlaps+=1
-        end=max(end,n["t"]+n["d"])
-    if notes: fc.write_json(os.path.join(work_dir,"vocal_pitch.json"),{"version":1,"notes":notes})
+    raw=len(notes); notes,resolved=_resolve_global_vocal_monophony(notes)
+    wire=[{"t":round(float(n["t"]),4),"d":round(float(n["d"]),4),"midi":int(n["midi"])} for n in notes]
+    if wire: fc.write_json(os.path.join(work_dir,"vocal_pitch.json"),{"version":1,"notes":wire})
     if samples: fc.write_json(os.path.join(work_dir,"vocal_pitch_contour.json"),{"version":1,"samples":samples})
-    if overlaps: fc.log(f"Vocal pitch warning: {overlaps} simultaneous-voice overlap(s)",indent=1)
-    return bool(notes),bool(samples),overlaps
+    fc.log(f"Vocal pitch coverage: {raw} speaker note(s) -> {len(wire)} monophonic output note(s); {resolved} overlap(s) resolved",indent=1)
+    return bool(wire),bool(samples),resolved
 
 def write_single_merged_lyrics(vocals_data, work_dir):
     """
@@ -556,6 +609,8 @@ PROJECT_VERSION_RE = re.compile(r"^feedpak-project\.v(\d{3})\.yaml$")
 def find_latest_project_file(song_folder, explicit=None):
     if explicit:
         return explicit if os.path.isabs(explicit) else os.path.join(song_folder, explicit)
+    if not os.path.isdir(song_folder):
+        return None
     found=[]
     base=os.path.join(song_folder,PROJECT_BASE_NAME)
     if os.path.isfile(base): found.append((1,base))
@@ -576,6 +631,8 @@ def load_project_defaults(path):
             "vocal_language":vocals.get("language"),"anchors":alignment.get("anchors"),
             "auto_chunk_measures":alignment.get("max_chunk_measures"),
             "alignment_mode":alignment.get("mode"),
+            "checkpoint_measures":alignment.get("checkpoint_measures"),
+            "checkpoint_search_radius":alignment.get("checkpoint_search_radius"),
             "allow_severe_alignment":alignment.get("allow_severe"),
             "timeline_mode":timeline.get("mode"),"keep_work_dir":build.get("keep_work_dir")}
 
@@ -586,7 +643,10 @@ def project_document(args):
                        "cache":args.vocals_cache,"batch_size":args.vocal_batch_size,
                        "compute_type":args.vocal_compute_type,"language":args.vocal_language},
             "alignment":{"mode":args.alignment_mode,"anchors":args.anchors,
-                         "max_chunk_measures":args.auto_chunk_measures,"allow_severe":args.allow_severe_alignment},
+                         "max_chunk_measures":args.auto_chunk_measures,
+                         "checkpoint_measures":args.checkpoint_measures,
+                         "checkpoint_search_radius":args.checkpoint_search_radius,
+                         "allow_severe":args.allow_severe_alignment},
             "timeline":{"mode":args.timeline_mode},
             "build":{"keep_work_dir":args.keep_work_dir}}
 
@@ -619,7 +679,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           keep_work_dir=False,vocal_layout="merged",timeline_mode="both",
           allow_severe_alignment=False,reuse_vocals=False,vocals_cache=None,
           vocal_batch_size=16,vocal_compute_type=None,vocal_language=None,
-          anchors_path=None,auto_chunk_measures=16,alignment_mode="linear"):
+          anchors_path=None,auto_chunk_measures=16,alignment_mode="dtw",
+          checkpoint_measures=4,checkpoint_search_radius=1.0):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps = 6
@@ -628,7 +689,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     fc.log_step(1, total_steps, "Discovering stems and metadata")
     metadata = load_metadata(song_folder)
     stems, vocals_path, drums_path = discover_stems(song_folder, vocals_stem_name, drums_stem_name)
-    original_vocals_path = vocals_path
+    original_vocals_path=vocals_path
     if not stems:
         raise RuntimeError(f"No audio stems found in {song_folder}")
     fc.log(f"Found {len(stems)} stem(s): {[s['id'] for s in stems]}", indent=1)
@@ -654,9 +715,11 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                                          == drums_stem_name.lower()), None))
     bass_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower()=="bass"),None))
     piano_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower() in ("piano","keys","keyboard")),None))
+    guitar_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower() in ("guitar","rhythm_guitar","lead_guitar")),None))
 
     full_stem = next((s for s in stems if s["id"] == "full"), None)
-    duration_source = padded_paths.get(full_stem["id"]) if full_stem else padded_paths.get(stems[0]["id"])
+    full_path = padded_paths.get(full_stem["id"]) if full_stem else None
+    duration_source = full_path if full_path else padded_paths.get(stems[0]["id"])
     duration = probe_duration_seconds(duration_source)
     fc.log(f"Duration: {duration}s (probed from padded {os.path.basename(duration_source)})", indent=1)
 
@@ -664,8 +727,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     vocal_pitch_file=vocal_pitch_contour_file=lyrics_file=None
     lyric_tracks=[]
     if vocals_path and not skip_vocals:
-        vocals_intermediate=vocals_cache or os.path.join(song_folder,"intermediate_vocals.json")
         vocals_analysis_path=original_vocals_path or vocals_path
+        vocals_intermediate=vocals_cache or os.path.join(song_folder,"intermediate_vocals.json")
         vocals_data=load_reusable_vocals(vocals_intermediate,vocals_analysis_path) if reuse_vocals else None
         if vocals_data is None:
             run_vocals_script(vocals_analysis_path,vocals_intermediate,device=device,hf_token=hf_token,
@@ -690,10 +753,13 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     if gp_path and (drums_path or bass_path or piano_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
         run_gp_script(gp_path,drums_path,gp_intermediate,count_in_offset=count_in_offset,
-                      bass_path=bass_path,piano_path=piano_path,timeline_mode=timeline_mode,
+                      bass_path=bass_path,piano_path=piano_path,guitar_path=guitar_path,
+                      full_path=full_path,timeline_mode=timeline_mode,
                       allow_severe_alignment=allow_severe_alignment,
                       anchors_path=anchors_path,padding_added=padding_added,
-                      auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode)
+                      auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode,
+                      checkpoint_measures=checkpoint_measures,
+                      checkpoint_search_radius=checkpoint_search_radius)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         arrangements += write_arrangement_files(gp_data, work_dir)
@@ -740,7 +806,13 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     safe_name = f"{manifest['artist']} - {manifest['title']}.feedpak".replace("/", "_")
     output_path = os.path.join(output_folder, safe_name)
     package_feedpak(work_dir,manifest,output_path)
-    if alignment_report: fc.write_json(output_path+".alignment_report.json",alignment_report)
+    if alignment_report:
+        report_path=output_path+".alignment_report.json"
+        fc.write_json(report_path,alignment_report)
+        if not os.path.isfile(report_path): raise RuntimeError(f"Alignment report write failed: {report_path}")
+        fc.log(f"Wrote alignment report: {report_path}",indent=1)
+    else:
+        fc.log("No alignment report returned by process_gp_alignment.py",indent=1)
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     fc.log(f"Wrote {output_path} ({size_mb:.1f} MB)", indent=1)
 
@@ -779,10 +851,12 @@ def main():
     parser.add_argument("--vocal-layout",choices=("merged","separated","both"),default=defaults.get("vocal_layout") or "merged")
     parser.add_argument("--timeline-mode",choices=("tempos","beats","both"),default=defaults.get("timeline_mode") or "both")
     parser.add_argument("--allow-severe-alignment",action="store_true",default=bool(defaults.get("allow_severe_alignment",False)))
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw"),
-                        default=defaults.get("alignment_mode") or "linear")
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint"),
+                        default=defaults.get("alignment_mode") or "dtw")
     parser.add_argument("--anchors",default=defaults.get("anchors"))
     parser.add_argument("--auto-chunk-measures",type=int,default=defaults.get("auto_chunk_measures") or 16)
+    parser.add_argument("--checkpoint-measures",type=int,default=defaults.get("checkpoint_measures") or 4)
+    parser.add_argument("--checkpoint-search-radius",type=float,default=defaults.get("checkpoint_search_radius") or 1.0)
     parser.add_argument("--reuse-vocals",action="store_true",default=bool(defaults.get("reuse_vocals",False)))
     parser.add_argument("--vocals-cache",default=defaults.get("vocals_cache"))
     parser.add_argument("--vocal-batch-size",type=int,default=defaults.get("vocal_batch_size") or 16)
@@ -805,8 +879,22 @@ def main():
           vocals_cache=cache,vocal_batch_size=args.vocal_batch_size,
           vocal_compute_type=args.vocal_compute_type,vocal_language=args.vocal_language,
           anchors_path=anchors,auto_chunk_measures=args.auto_chunk_measures,
-          alignment_mode=args.alignment_mode)
+          alignment_mode=args.alignment_mode,
+          checkpoint_measures=args.checkpoint_measures,
+          checkpoint_search_radius=args.checkpoint_search_radius)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+

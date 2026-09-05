@@ -1,4 +1,3 @@
-
 """
 process_vocals.py
 
@@ -38,6 +37,11 @@ except ImportError:
 
 CREPE_CONFIDENCE_THRESHOLD = 0.5
 CREPE_HOP_SECONDS = 0.010  # 10ms hop, per architecture doc
+VOCAL_ANALYSIS_VERSION = 3
+MIN_VOCAL_NOTE_SECONDS = 0.150
+MIN_PITCH_CHANGE_SEMITONES = 1.0
+MAX_VOICED_GAP_SECONDS = 0.060
+MIN_EMITTED_NOTE_SECONDS = 0.040
 
 # WhisperX language codes -> pyphen dictionary names. Falls back to
 # en_US for anything not listed (pyphen's dictionary set is smaller than
@@ -132,46 +136,111 @@ def distribute_word_time_across_syllables(start, end, syllables):
     return spans
 
 
-def segment_contour_into_notes(times, hz, confidence, conf_threshold=CREPE_CONFIDENCE_THRESHOLD,
-                                min_note_seconds=0.12, semitone_tolerance=0.75):
-    """
-    Groups contiguous confident CREPE frames into monophonic note
-    segments (runs of stable pitch). Used within a single syllable's
-    time window to detect melisma: if a syllable's window contains more
-    than one of these, the syllable is being sung across more than one
-    pitch, and every segment past the first becomes a "+" continuation
-    entry — the standard vocal-chart notation for a sustained note
-    changing pitch without new lyric text.
-    """
-    segments = []
-    current = None
-    for t, h, c in zip(times, hz, confidence):
-        if c < conf_threshold or h <= 0:
-            if current:
-                segments.append(current)
-                current = None
-            continue
-        midi = fc.hz_to_midi(h)
-        if current is None:
-            current = {"start": t, "end": t, "midis": [midi]}
-        elif abs(midi - (sum(current["midis"]) / len(current["midis"]))) <= semitone_tolerance:
-            current["end"] = t
-            current["midis"].append(midi)
-        else:
-            segments.append(current)
-            current = {"start": t, "end": t, "midis": [midi]}
-    if current:
-        segments.append(current)
+def segment_contour_into_notes(times, hz, confidence,
+                               conf_threshold=CREPE_CONFIDENCE_THRESHOLD,
+                               min_note_seconds=MIN_VOCAL_NOTE_SECONDS,
+                               min_pitch_change_semitones=MIN_PITCH_CHANGE_SEMITONES,
+                               max_gap_seconds=MAX_VOICED_GAP_SECONDS):
+    """Find stable, sequential pitch regions in one syllable.
 
-    out = []
-    for seg in segments:
-        if seg["end"] - seg["start"] < min_note_seconds:
-            continue
-        sorted_midis = sorted(seg["midis"])
-        median_midi = sorted_midis[len(sorted_midis) // 2]
-        out.append({"start": seg["start"], "end": seg["end"], "midi": round(median_midi)})
+    A pitch change must be at least one semitone and persist for at least
+    ``min_note_seconds``. Brief excursions are treated as vibrato/noise.
+    The returned regions are evidence only; ``partition_syllable_pitch``
+    expands their boundaries to cover the complete pitched syllable.
+    """
+    frames=[]
+    for t,h,c in zip(times,hz,confidence):
+        if c >= conf_threshold and h > 0:
+            midi=fc.hz_to_midi(h)
+            if midi is not None:
+                frames.append((float(t),float(midi),float(c)))
+    if not frames:
+        return []
+
+    runs=[]; current=[]
+    for frame in frames:
+        if not current:
+            current=[frame]; continue
+        ref=sorted(x[1] for x in current)[len(current)//2]
+        pitch_changed=abs(round(frame[1])-round(ref)) >= min_pitch_change_semitones
+        gap=frame[0]-current[-1][0]
+        if gap <= max_gap_seconds and not pitch_changed:
+            current.append(frame)
+        else:
+            runs.append(current); current=[frame]
+    if current: runs.append(current)
+
+    def duration(run): return run[-1][0]-run[0][0]+CREPE_HOP_SECONDS
+    def pitch(run):
+        vals=sorted(x[1] for x in run); return int(round(vals[len(vals)//2]))
+
+    # Remove short excursions. An A-short-B pattern joins the short run to
+    # the closest neighbour, then adjacent equal-pitch runs are coalesced.
+    changed=True
+    while changed and len(runs)>1:
+        changed=False
+        for i,run in enumerate(runs):
+            if duration(run) >= min_note_seconds: continue
+            neighbours=[]
+            if i>0: neighbours.append((abs(pitch(run)-pitch(runs[i-1])),i-1))
+            if i+1<len(runs): neighbours.append((abs(pitch(run)-pitch(runs[i+1])),i+1))
+            if not neighbours: continue
+            _,j=min(neighbours,key=lambda x:(x[0],x[1]))
+            runs[j]=sorted(runs[j]+run,key=lambda x:x[0]); runs.pop(i)
+            runs.sort(key=lambda r:r[0][0]); changed=True; break
+
+    stable=[]
+    for run in runs:
+        if duration(run) < min_note_seconds: continue
+        stable.append({"start":run[0][0],"end":run[-1][0]+CREPE_HOP_SECONDS,
+                       "midi":pitch(run),
+                       "confidence":sum(x[2] for x in run)/len(run)})
+    # Coalesce adjacent equal-pitch regions after short-run suppression.
+    out=[]
+    for seg in stable:
+        if out and seg["midi"]==out[-1]["midi"] and seg["start"]<=out[-1]["end"]+max_gap_seconds:
+            out[-1]["end"]=max(out[-1]["end"],seg["end"])
+            out[-1]["confidence"]=max(out[-1]["confidence"],seg["confidence"])
+        else: out.append(seg)
     return out
 
+
+def partition_syllable_pitch(syllable, segments, fallback_midi, fallback_confidence):
+    """Make a complete, gap-free, monophonic pitch partition for a syllable."""
+    start=float(syllable["t"]); end=start+float(syllable["d"])
+    if end <= start or fallback_midi is None: return []
+    if not segments:
+        return [{"t":round(start,4),"d":round(end-start,4),"midi":int(fallback_midi),
+                 "confidence":round(float(fallback_confidence),4)}]
+    segments=sorted(segments,key=lambda x:x["start"])
+    # Boundaries are midpoints between adjacent evidence regions. The first
+    # and last notes extend to the syllable edges, restoring renderer coverage.
+    boundaries=[start]
+    for a,b in zip(segments,segments[1:]):
+        boundaries.append(max(start,min(end,(float(a["end"])+float(b["start"]))/2.0)))
+    boundaries.append(end)
+    notes=[]
+    for i,seg in enumerate(segments):
+        a=max(start,boundaries[i]); b=min(end,boundaries[i+1])
+        if b-a < MIN_EMITTED_NOTE_SECONDS:
+            continue
+        notes.append({"t":round(a,4),"d":round(b-a,4),"midi":int(seg["midi"]),
+                      "confidence":round(float(seg.get("confidence",fallback_confidence)),4)})
+    if not notes:
+        return [{"t":round(start,4),"d":round(end-start,4),"midi":int(fallback_midi),
+                 "confidence":round(float(fallback_confidence),4)}]
+    # Guarantee exact syllable coverage after any very-short partition removal.
+    notes[0]["t"]=round(start,4)
+    cursor=start
+    for i,n in enumerate(notes):
+        n["t"]=round(cursor,4)
+        next_start=(float(notes[i+1]["t"]) if i+1<len(notes) else end)
+        if i+1<len(notes):
+            next_start=max(cursor+MIN_EMITTED_NOTE_SECONDS,float(notes[i+1]["t"]))
+        n["d"]=round(max(MIN_EMITTED_NOTE_SECONDS,next_start-cursor),4)
+        cursor=n["t"]+n["d"]
+    notes[-1]["d"]=round(max(MIN_EMITTED_NOTE_SECONDS,end-notes[-1]["t"]),4)
+    return notes
 
 def expand_word(word_entry, syllable_dic):
     syllables=syllabify_word(word_entry["word"],syllable_dic)
@@ -186,6 +255,33 @@ def representative_pitch(syllable,times,hz,confidence,threshold=CREPE_CONFIDENCE
     return int(round(vals[len(vals)//2])) if vals else None
 
 
+def _resolve_monophonic_notes(notes, minimum_seconds=MIN_EMITTED_NOTE_SECONDS):
+    """Merge same-pitch overlaps and trim different-pitch overlaps by confidence."""
+    out=[]; suppressed=0
+    for raw in sorted(notes,key=lambda n:(float(n["t"]),-float(n.get("confidence",0)))):
+        n=dict(raw); n["t"]=float(n["t"]); n["d"]=float(n["d"])
+        if n["d"]<=0: continue
+        if not out: out.append(n); continue
+        p=out[-1]; pe=p["t"]+p["d"]; ne=n["t"]+n["d"]
+        if n["t"]>=pe-0.001:
+            if n["t"]<pe: n["t"]=pe; n["d"]=ne-pe
+            if n["d"]>=minimum_seconds: out.append(n)
+            continue
+        suppressed+=1
+        if int(n["midi"])==int(p["midi"]):
+            p["d"]=max(pe,ne)-p["t"]
+            p["confidence"]=max(float(p.get("confidence",0)),float(n.get("confidence",0)))
+        elif float(n.get("confidence",0))>float(p.get("confidence",0)):
+            p["d"]=max(0,n["t"]-p["t"])
+            if p["d"]<minimum_seconds: out.pop()
+            out.append(n)
+        else:
+            n["t"]=pe; n["d"]=max(0,ne-pe)
+            if n["d"]>=minimum_seconds: out.append(n)
+    for n in out: n["t"]=round(n["t"],4); n["d"]=round(n["d"],4)
+    return out,suppressed
+
+
 def build_speaker_structure(diarized_words,contour_times,contour_hz,contour_confidence,
                              confidence_threshold=CREPE_CONFIDENCE_THRESHOLD,
                              whisper_language_code="en"):
@@ -195,16 +291,37 @@ def build_speaker_structure(diarized_words,contour_times,contour_hz,contour_conf
         speakers[sp]["words"].extend(expand_word(word,dic))
         for i,t in enumerate(contour_times):
             if word["start"]<=t<word["end"]: speakers[sp]["indices"].add(i)
-    result={"language":whisper_language_code,"speakers":{}}
+    result={"analysis_version":VOCAL_ANALYSIS_VERSION,"language":whisper_language_code,
+            "pitch_settings":{"minimum_change_semitones":MIN_PITCH_CHANGE_SEMITONES,
+                              "minimum_stable_seconds":MIN_VOCAL_NOTE_SECONDS,
+                              "maximum_gap_seconds":MAX_VOICED_GAP_SECONDS},
+            "speakers":{},"pitch_diagnostics":{}}
     for sp,data in speakers.items():
-        words=sorted(data["words"],key=lambda x:x["t"]); notes=[]
+        words=sorted(data["words"],key=lambda x:x["t"]); candidates=[]
+        pitched_syllables=multi_note_syllables=0
         for syl in words:
-            midi=representative_pitch(syl,contour_times,contour_hz,contour_confidence,confidence_threshold)
-            if midi is not None: notes.append({"t":syl["t"],"d":syl["d"],"midi":midi})
+            start=float(syl["t"]); end=start+float(syl["d"])
+            indices=[i for i,t in enumerate(contour_times) if start<=t<end]
+            evidence=[(contour_times[i],contour_hz[i],contour_confidence[i]) for i in indices
+                      if contour_confidence[i]>=confidence_threshold and contour_hz[i]>0]
+            if not evidence: continue
+            pitched_syllables+=1
+            midis=sorted(fc.hz_to_midi(h) for _,h,_ in evidence)
+            fallback=int(round(midis[len(midis)//2]))
+            fallback_conf=sum(c for _,_,c in evidence)/len(evidence)
+            segments=segment_contour_into_notes([x[0] for x in evidence],[x[1] for x in evidence],
+                                                [x[2] for x in evidence],confidence_threshold)
+            partition=partition_syllable_pitch(syl,segments,fallback,fallback_conf)
+            if len(partition)>1: multi_note_syllables+=1
+            candidates.extend(partition)
+        notes,suppressed=_resolve_monophonic_notes(candidates)
         contour=[{"t":round(contour_times[i],4),"hz":round(contour_hz[i],3)}
                  for i in sorted(data["indices"])
                  if contour_confidence[i]>=confidence_threshold and contour_hz[i]>0]
         result["speakers"][sp]={"words":words,"pitch_notes":notes,"contour":contour}
+        result["pitch_diagnostics"][sp]={"pitched_syllables":pitched_syllables,
+             "multi_note_syllables":multi_note_syllables,"candidate_notes":len(candidates),
+             "final_notes":len(notes),"overlaps_resolved":suppressed}
     return result
 
 
@@ -343,3 +460,18 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

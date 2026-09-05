@@ -386,3 +386,15 @@ def pad_audio_with_silence(src_path, dst_path, pad_seconds):
     silence = np.zeros((pad_samples, data.shape[1]), dtype="float32")
     padded = np.concatenate([silence, data], axis=0)
     sf.write(dst_path, padded, sr, format="WAV")
+
+
+
+
+
+
+
+
+
+
+
+

@@ -782,6 +782,321 @@ def compute_warp_function(gp_drum_hits, drums_audio_path, sr=22050, band_rad=0.2
     return warp_fn
 
 
+
+
+def _cluster_event_times(times,tolerance=0.025):
+    out=[]
+    for value in sorted(float(t) for t in times):
+        if not out or value-out[-1]>tolerance:
+            out.append(value)
+    return out
+
+
+def _score_gaps(times,start_time,end_time):
+    points=[float(start_time)]+_cluster_event_times(times)+[float(end_time)]
+    return [(a,b) for a,b in zip(points,points[1:]) if b>a]
+
+
+_SILENCE_FEATURE_CACHE={}
+
+
+def _audio_inactivity(audio_path,start,end,sr=22050,hop=512):
+    if not audio_path or end<=start: return None
+    key=(str(audio_path),int(sr),int(hop))
+    cached=_SILENCE_FEATURE_CACHE.get(key)
+    if cached is None:
+        y,actual_sr=librosa.load(audio_path,sr=sr,mono=True)
+        rms=librosa.feature.rms(y=y,hop_length=hop)[0]
+        times=librosa.frames_to_time(np.arange(len(rms)),sr=actual_sr,hop_length=hop)
+        onset=librosa.onset.onset_strength(y=y,sr=actual_sr,hop_length=hop)
+        onset_times=librosa.frames_to_time(np.arange(len(onset)),sr=actual_sr,hop_length=hop)
+        cached=(rms,times,onset,onset_times)
+        _SILENCE_FEATURE_CACHE[key]=cached
+    rms,times,onset,onset_times=cached
+    mask=(times>=start)&(times<end)
+    if not np.any(mask): return None
+    low=float(np.percentile(rms,30)); high=float(np.percentile(rms,75)); mean=float(np.mean(rms[mask]))
+    normalized=float(np.clip(1.0-(mean-low)/max(high-low,1e-9),0.0,1.0))
+    omask=(onset_times>=start)&(onset_times<end)
+    onset_density=float(np.mean(onset[omask])) if np.any(omask) else 0.0
+    onset_ref=float(np.percentile(onset,60)) if len(onset) else 1.0
+    onset_quiet=float(np.clip(1.0-onset_density/max(onset_ref,1e-9),0.0,1.0))
+    confidence=0.65*normalized+0.35*onset_quiet
+    return {"confidence":round(confidence,4),"mean_rms":round(mean,7),
+            "rms_quiet":round(normalized,4),"onset_quiet":round(onset_quiet,4),
+            "confirmed":bool(confidence>=0.60)}
+
+
+def diagnose_silence_checkpoints(score_events,audio_paths,base_warp,measure_downbeats,
+                                  tempo_bpm,search_radius=1.0,sr=22050):
+    """Find internal silence landmarks without modifying timing.
+
+    Drum-only gaps must exceed one second. Gaps shared by at least two
+    non-vocal instrument stems must last at least one local beat. The full
+    mix confirms audibility but never counts as an independent stem.
+    """
+    beat_seconds=60.0/max(float(tempo_bpm),1e-6)
+    start=float(measure_downbeats[0]["t_gp"]); end=float(measure_downbeats[-1]["t_gp"])
+    gaps={name:_score_gaps(times,start,end) for name,times in score_events.items() if times}
+    raw=[]
+    # Drum-only long gaps.
+    for a,b in gaps.get("drums",[]):
+        if b-a>1.0:
+            raw.append({"score_start":a,"score_end":b,"supporting_stems":["drums"],
+                        "rule":"drum_only_over_1_second"})
+    # Intersections shared by at least two independent instrument stems.
+    names=sorted(gaps)
+    for i,name_a in enumerate(names):
+        for name_b in names[i+1:]:
+            for a0,a1 in gaps[name_a]:
+                for b0,b1 in gaps[name_b]:
+                    lo=max(a0,b0); hi=min(a1,b1)
+                    if hi-lo>beat_seconds:
+                        raw.append({"score_start":lo,"score_end":hi,
+                                    "supporting_stems":[name_a,name_b],
+                                    "rule":"two_plus_stems_one_beat"})
+    # Merge the same musical boundary within 500ms, unioning support.
+    merged=[]
+    for cand in sorted(raw,key=lambda x:x["score_end"]):
+        if merged and abs(cand["score_end"]-merged[-1]["score_end"])<=0.5:
+            old=merged[-1]
+            old["score_start"]=max(old["score_start"],cand["score_start"])
+            old["supporting_stems"]=sorted(set(old["supporting_stems"]+cand["supporting_stems"]))
+            if len(old["supporting_stems"])>=2: old["rule"]="two_plus_stems_one_beat"
+        else: merged.append(dict(cand))
+    output=[]
+    for cand in merged:
+        boundary=cand["score_end"]; support=cand["supporting_stems"]
+        duration=boundary-cand["score_start"]
+        # Recognizable post-silence boundary: three clusters in 750ms, or
+        # entries from at least two supporting sources within 120ms.
+        per_source={name:[t for t in score_events.get(name,[]) if boundary<=t<=boundary+.75]
+                    for name in support}
+        post_clusters=_cluster_event_times([t for values in per_source.values() for t in values])
+        entering=[name for name,values in per_source.items() if values and values[0]-boundary<=.12]
+        boundary_ok=len(post_clusters)>=3 or len(entering)>=2
+        audio_start=float(base_warp(cand["score_start"])); audio_end=float(base_warp(boundary))
+        confirmations={}
+        for name in support:
+            evidence=_audio_inactivity(audio_paths.get(name),audio_start,audio_end,sr=sr)
+            if evidence is not None: confirmations[name]=evidence
+        confirmed=[name for name,e in confirmations.items() if e["confirmed"]]
+        required_audio=1 if support==["drums"] else 2
+        full_evidence=_audio_inactivity(audio_paths.get("full"),audio_start,audio_end,sr=sr)
+        accepted=(duration>1.0 and len(confirmed)>=1 if support==["drums"] else
+                  duration>beat_seconds and len(confirmed)>=2)
+        accepted=bool(accepted and boundary_ok)
+        nearest=min(measure_downbeats,key=lambda b:abs(float(b["t_gp"])-boundary))
+        output.append({"measure":int(nearest["measure"]),"pattern_type":"silence_transition",
+            "score_start":round(cand["score_start"],4),"score_end":round(boundary,4),
+            "predicted_audio_start":round(audio_start,4),"predicted_audio_end":round(audio_end,4),
+            "duration_seconds":round(duration,4),"duration_beats":round(duration/beat_seconds,4),
+            "rule":cand["rule"],"supporting_stems":support,"supporting_stem_count":len(support),
+            "audio_confirmed_stems":confirmed,"audio_confirmation":confirmations,
+            "full_mix_confirmation":full_evidence,"post_silence_clusters_750ms":len(post_clusters),
+            "boundary_entering_stems_120ms":entering,"boundary_recognizable":bool(boundary_ok),
+            "accepted":accepted,
+            "warnings":([] if accepted else
+                (["rejected_boundary_not_recognizable"] if not boundary_ok else [])+
+                (["rejected_insufficient_audio_stem_confirmation"] if len(confirmed)<required_audio else []))})
+    strong=sum(1 for x in output if x["accepted"])
+    return {"version":1,"status":"diagnostic_only","vocals_ignored":True,
+            "drum_only_minimum_seconds":1.0,"multi_stem_minimum_beats":1.0,
+            "beat_seconds":round(beat_seconds,6),"generated":len(output),"strong":strong,
+            "rejected":len(output)-strong,"checkpoints":output}
+
+_CHROMA_FEATURE_CACHE={}
+
+
+def _load_audio_chroma(audio_path,sr=22050,hop=512):
+    if not audio_path: return None
+    key=(str(audio_path),int(sr),int(hop))
+    if key in _CHROMA_FEATURE_CACHE: return _CHROMA_FEATURE_CACHE[key]
+    y,actual_sr=librosa.load(audio_path,sr=sr,mono=True)
+    harmonic=librosa.effects.harmonic(y,margin=3.0)
+    chroma=librosa.feature.chroma_cqt(y=harmonic,sr=actual_sr,hop_length=hop)
+    times=librosa.frames_to_time(np.arange(chroma.shape[1]),sr=actual_sr,hop_length=hop)
+    norms=np.linalg.norm(chroma,axis=0,keepdims=True)
+    chroma=chroma/np.maximum(norms,1e-9)
+    result=(chroma,times,float(actual_sr),int(hop))
+    _CHROMA_FEATURE_CACHE[key]=result
+    return result
+
+
+def _score_chroma_template(pitch_events,start,end,frame_times):
+    template=np.zeros((12,len(frame_times)),dtype=float)
+    if not pitch_events or end<=start: return template
+    for event in pitch_events:
+        t=float(event["t_gp"])
+        if start<=t<=end:
+            j=int(np.argmin(np.abs(frame_times-t)))
+            template[int(event["midi"])%12,j]=1.0
+            if j+1<len(frame_times): template[int(event["midi"])%12,j+1]=max(template[int(event["midi"])%12,j+1],0.5)
+    # Mild temporal smoothing, preserving absolute pitch class.
+    if template.shape[1]>=3:
+        template=(np.roll(template,1,axis=1)+2*template+np.roll(template,-1,axis=1))/4.0
+        template[:,0]*=4/3; template[:,-1]*=4/3
+    norms=np.linalg.norm(template,axis=0,keepdims=True)
+    return template/np.maximum(norms,1e-9)
+
+
+def _chroma_candidate_for_source(pitch_events,audio_path,nominal_start,nominal_end,
+                                 linear_prediction,base_warp,search_radius,sr=22050,hop=512):
+    loaded=_load_audio_chroma(audio_path,sr,hop)
+    if loaded is None: return {"available":False,"reason":"missing_audio"}
+    audio_chroma,audio_times,actual_sr,hop=loaded
+    frame_seconds=hop/actual_sr
+    n=max(16,int(round((float(base_warp(nominal_end))-float(base_warp(nominal_start)))/frame_seconds)))
+    score_times=np.linspace(nominal_start,nominal_end,n,endpoint=False)
+    template=_score_chroma_template(pitch_events,nominal_start,nominal_end,score_times)
+    active=np.where(np.sum(template,axis=1)>0)[0]
+    usable=int(np.sum(np.linalg.norm(template,axis=0)>0))
+    if len(active)<3 or usable<16:
+        return {"available":False,"reason":"insufficient_pitched_content",
+                "active_pitch_classes":int(len(active)),"usable_chroma_frames":usable}
+    center=float(linear_prediction)
+    offsets=np.arange(-search_radius,search_radius+frame_seconds/2,frame_seconds)
+    scored=[]
+    template_active=np.linalg.norm(template,axis=0)>0
+    for residual in offsets:
+        candidate_start=float(base_warp(nominal_start))+float(residual)
+        query=candidate_start+np.arange(n)*frame_seconds
+        indices=np.searchsorted(audio_times,query)
+        indices=np.clip(indices,0,audio_chroma.shape[1]-1)
+        observed=audio_chroma[:,indices]
+        sims=np.sum(template[:,template_active]*observed[:,template_active],axis=0)
+        score=float(np.mean(sims)) if len(sims) else 0.0
+        scored.append((score,float(residual),candidate_start))
+    scored.sort(reverse=True,key=lambda x:x[0])
+    # Non-maximum suppression makes second-best a genuinely distinct location.
+    best=scored[0]; distinct=[x for x in scored[1:] if abs(x[1]-best[1])>=0.10]
+    second=distinct[0] if distinct else scored[-1]
+    null=min(scored,key=lambda x:abs(x[1]))
+    margin=best[0]-second[0]; gain=best[0]-null[0]
+    # Pattern uniqueness combines local ambiguity with chroma diversity.
+    entropy=[]
+    for j in range(template.shape[1]):
+        col=template[:,j]
+        if np.sum(col)>0:
+            q=col/np.sum(col); entropy.append(-float(np.sum(q[q>0]*np.log(q[q>0])))/math.log(12))
+    diversity=float(np.mean(entropy)) if entropy else 0.0
+    uniqueness=float(np.clip(0.7*margin/0.10+0.3*diversity,0,1))
+    accepted=bool(best[0]>=0.55 and margin>=0.10 and gain>=0.025 and abs(best[1])<=0.250)
+    warnings=[]
+    if best[0]<0.55: warnings.append("rejected_low_chroma_similarity")
+    if margin<0.10: warnings.append("rejected_insufficient_best_second_margin")
+    if gain<0.025: warnings.append("rejected_insufficient_gain_over_linear")
+    if abs(best[1])>0.250: warnings.append("rejected_excessive_residual")
+    return {"available":True,"active_pitch_classes":int(len(active)),
+            "usable_chroma_frames":usable,"pattern_uniqueness":round(uniqueness,4),
+            "best_time":round(center+best[1],6),"residual_ms":round(best[1]*1000,3),
+            "best_score":round(best[0],4),"second_score":round(second[0],4),
+            "margin":round(margin,4),"linear_null_score":round(null[0],4),
+            "gain_over_linear":round(gain,4),"accepted":accepted,"warnings":warnings}
+
+
+def diagnose_chroma_checkpoints(pitched_events,audio_paths,base_warp,measure_downbeats,
+                                onset_report,every_measures=4,search_radius=1.0,sr=22050):
+    config={"checkpoint_measures":int(every_measures),"search_radius_seconds":float(search_radius),
+            "context_measures_before":1,"context_measures_after":1,
+            "minimum_active_pitch_classes":3,"minimum_chroma_frames":16,
+            "minimum_similarity":0.55,"minimum_best_second_margin":0.10,
+            "minimum_gain_over_linear":0.025,"maximum_cross_stem_disagreement_ms":50.0,
+            "maximum_chroma_onset_disagreement_ms":50.0,"maximum_residual_ms":250.0}
+    periodic={int(x["measure"]):x for x in (onset_report or {}).get("checkpoints",[])}
+    checkpoints=[]; source_counts={"bass":0,"guitar":0,"piano":0,"full":0}
+    step=max(1,int(every_measures)); bounds=measure_downbeats
+    for i,b in enumerate(bounds):
+        if i%step: continue
+        lo=max(0,i-1); hi=min(len(bounds)-1,i+1)
+        nominal_start=float(bounds[lo]["t_gp"]); nominal_end=float(bounds[hi]["t_gp"])
+        nominal=float(b["t_gp"]); linear=float(base_warp(nominal))
+        sources={}
+        for name in ("bass","guitar","piano"):
+            result=_chroma_candidate_for_source(pitched_events.get(name,[]),audio_paths.get(name),
+                nominal_start,nominal_end,linear,base_warp,search_radius,sr)
+            sources[name]=result
+            if result.get("available"): source_counts[name]+=1
+        # Full mix corroborates the combined pitched score, never independently accepts.
+        combined=[]
+        for name in ("bass","guitar","piano"): combined.extend(pitched_events.get(name,[]))
+        full=_chroma_candidate_for_source(combined,audio_paths.get("full"),nominal_start,nominal_end,
+                                          linear,base_warp,search_radius,sr)
+        if full.get("available"): source_counts["full"]+=1
+        full["corroborating_only"]=True; sources["full"]=full
+        strong=[(name,x) for name,x in sources.items() if name!="full" and x.get("accepted")]
+        residuals=[x["residual_ms"] for _,x in strong]
+        disagreement=(max(residuals)-min(residuals)) if len(residuals)>=2 else None
+        onset=periodic.get(int(b["measure"])); onset_ms=None
+        if onset and onset.get("accepted") and onset.get("median_correction_seconds") is not None:
+            onset_ms=1000*float(onset["median_correction_seconds"])
+        combined_ms=float(np.median(residuals)) if residuals else None
+        chroma_onset=abs(combined_ms-onset_ms) if combined_ms is not None and onset_ms is not None else None
+        warnings=[]
+        if not strong: warnings.append("rejected_no_strong_isolated_chroma_source")
+        if disagreement is not None and disagreement>50: warnings.append("rejected_cross_stem_disagreement")
+        if chroma_onset is not None and chroma_onset>50: warnings.append("rejected_chroma_onset_disagreement")
+        accepted=bool(strong and not warnings)
+        checkpoints.append({"measure":int(b["measure"]),"nominal_time":round(nominal,4),
+            "linear_prediction":round(linear,4),"window_nominal_start":round(nominal_start,4),
+            "window_nominal_end":round(nominal_end,4),"sources":sources,
+            "strong_isolated_sources":[name for name,_ in strong],
+            "cross_stem_disagreement_ms":None if disagreement is None else round(disagreement,3),
+            "onset_residual_ms":None if onset_ms is None else round(onset_ms,3),
+            "chroma_onset_disagreement_ms":None if chroma_onset is None else round(chroma_onset,3),
+            "combined_candidate_time":None if combined_ms is None else round(linear+combined_ms/1000,6),
+            "combined_residual_ms":None if combined_ms is None else round(combined_ms,3),
+            "accepted":accepted,"warnings":warnings})
+    strong=sum(1 for x in checkpoints if x["accepted"])
+    return {"version":1,"status":"diagnostic_only","config":config,
+            "summary":{"generated":len(checkpoints),"strong":strong,
+                       "rejected":len(checkpoints)-strong,"by_source":source_counts,
+                       "timing_changes_applied":False},"checkpoints":checkpoints}
+
+
+def diagnose_checkpoints(event_times,audio_path,base_warp,measure_downbeats,
+                         every_measures=4,search_radius=1.0,sr=22050):
+    """Measure local onset agreement without changing the linear warp."""
+    if librosa is None or not audio_path or not event_times:
+        return {"version":1,"status":"unavailable","checkpoints":[],
+                "reason":"missing librosa, audio, or symbolic events"}
+    y,actual_sr=librosa.load(audio_path,sr=sr,mono=True)
+    env=librosa.onset.onset_strength(y=y,sr=actual_sr)
+    detected=np.asarray(librosa.onset.onset_detect(onset_envelope=env,sr=actual_sr,
+                                                  units="time",backtrack=False),dtype=float)
+    checkpoints=[]; strong=0; rejected=0
+    step=max(1,int(every_measures))
+    events=np.asarray(sorted(float(t) for t in event_times),dtype=float)
+    for index,b in enumerate(measure_downbeats):
+        if index % step: continue
+        nominal=float(b["t_gp"]); predicted=float(base_warp(nominal))
+        # Pick symbolic events close to this score boundary, then compare each
+        # predicted event with the nearest detected onset inside the radius.
+        half_window=max(0.35,min(1.5,float(search_radius)))
+        local=events[np.abs(events-nominal)<=half_window]
+        residuals=[]
+        for event in local:
+            target=float(base_warp(event))
+            lo=np.searchsorted(detected,target-search_radius)
+            hi=np.searchsorted(detected,target+search_radius,side="right")
+            if hi>lo:
+                nearest=detected[lo:hi][np.argmin(np.abs(detected[lo:hi]-target))]
+                residuals.append(float(nearest-target))
+        if len(residuals)>=3:
+            correction=float(np.median(residuals)); spread=float(np.median(np.abs(np.asarray(residuals)-correction)))
+            accepted=abs(correction)<=search_radius and spread<=0.12
+        else:
+            correction=None; spread=None; accepted=False
+        strong+=int(accepted); rejected+=int(not accepted)
+        checkpoints.append({"measure":int(b["measure"]),"nominal_time":round(nominal,4),
+                            "predicted_time":round(predicted,4),"matched_events":len(residuals),
+                            "median_correction_seconds":round(correction,4) if correction is not None else None,
+                            "mad_seconds":round(spread,4) if spread is not None else None,
+                            "accepted":accepted})
+    return {"version":1,"status":"diagnostic_only","checkpoint_measures":step,
+            "search_radius_seconds":float(search_radius),"strong":strong,
+            "rejected":rejected,"checkpoints":checkpoints}
+
 def apply_warp(entries, warp_fn, time_key="t_gp", out_key="t"):
     out = []
     for e in entries:
@@ -808,9 +1123,11 @@ def get_initial_tempo(gp_path):
 
 
 def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_path=None,
+            guitar_audio_path=None, full_audio_path=None,
             sr=22050, count_in_offset=0.0, timeline_mode="both",
             allow_severe_alignment=False, anchors_path=None, padding_added=0.0,
-            auto_chunk_measures=16, alignment_mode="linear"):
+            auto_chunk_measures=16, alignment_mode="dtw",
+            checkpoint_measures=4, checkpoint_search_radius=1.0):
     if guitarpro is None:
         raise RuntimeError("pyguitarpro is required: pip install pyguitarpro")
 
@@ -832,6 +1149,10 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     drum_hits_gp = []
     bass_alignment_events = []
     piano_alignment_events = []
+    guitar_alignment_events = []
+    bass_pitch_events = []
+    guitar_pitch_events = []
+    piano_pitch_events = []
     notation_tracks = {}
 
     for track in song.tracks:
@@ -846,12 +1167,22 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             notation = parse_keyboard_track(track, tempo_events, first_tick)
             notation_tracks[_safe_track_id(track)] = notation
             piano_alignment_events.extend({"t_gp": t} for t in _keyboard_onsets(notation))
+            for measure in notation.get("measures",[]):
+                for stave in measure.get("staves",{}).values():
+                    for voice in stave.get("voices",[]):
+                        for beat in voice.get("beats",[]):
+                            for note in beat.get("notes",[]):
+                                piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
         else:
             fc.log(f"'{track.name}' -> fretted track", indent=1)
             data = parse_fretted_track(track, tempo_events, first_tick)
             fretted_tracks[_safe_track_id(track)] = data
             if "bass" in (track.name or "").lower() or "bass" in data["name"].lower():
                 bass_alignment_events.extend({"t_gp": n["t_gp"]} for n in data["notes"])
+                bass_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
+            else:
+                guitar_alignment_events.extend({"t_gp": n["t_gp"]} for n in data["notes"])
+                guitar_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
             fc.log(f"{len(data['notes'])} notes, {len(data['anchors'])} anchors", indent=2)
 
     fc.log_step(3, 5, "Reading key signatures + building song timeline")
@@ -871,6 +1202,10 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     drum_hits_gp = shift_nominal_times(drum_hits_gp, count_in_offset)
     bass_alignment_events = shift_nominal_times(bass_alignment_events, count_in_offset)
     piano_alignment_events = shift_nominal_times(piano_alignment_events, count_in_offset)
+    guitar_alignment_events = shift_nominal_times(guitar_alignment_events, count_in_offset)
+    bass_pitch_events = shift_nominal_times(bass_pitch_events, count_in_offset)
+    guitar_pitch_events = shift_nominal_times(guitar_pitch_events, count_in_offset)
+    piano_pitch_events = shift_nominal_times(piano_pitch_events, count_in_offset)
     key_events_gp = shift_nominal_times(key_events_gp, count_in_offset)
     song_timeline_gp["time_signatures"] = shift_nominal_times(
         song_timeline_gp["time_signatures"], count_in_offset)
@@ -903,12 +1238,39 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     else:
         reference=next(((source,times,path) for source,times,path in specs if times and path),None)
         source,event_times,audio_path=reference if reference else ("none",[],None)
-        fc.log(f"Using simple alignment mode '{alignment_mode}' with reference '{source}'",indent=1)
-        warp_fn=compute_simple_warp(event_times,audio_path,alignment_mode,sr=sr)
+        simple_mode="linear" if alignment_mode=="dtw-checkpoint" else alignment_mode
+        fc.log(f"Using simple alignment mode '{simple_mode}' with reference '{source}'",indent=1)
+        warp_fn=compute_simple_warp(event_times,audio_path,simple_mode,sr=sr)
         decision=warp_fn.alignment_diagnostics
         decision["selected_source"]=source if source != "none" else None
         decision["manual_anchors_ignored"]=bool(manual_anchors)
         decision["padding_added"]=padding_added
+        if alignment_mode=="dtw-checkpoint":
+            fc.log(f"Detecting diagnostic {source} checkpoints every {checkpoint_measures} measures",indent=1)
+            checkpoint_report=diagnose_checkpoints(event_times,audio_path,warp_fn,
+                song_timeline_gp["beats"],checkpoint_measures,checkpoint_search_radius,sr)
+            decision["mode"]="dtw-checkpoint-diagnostic-v3"
+            decision["checkpoint_diagnostics"]=checkpoint_report
+            score_events={"drums":_event_times(drum_hits_gp),"bass":_event_times(bass_alignment_events),
+                          "guitar":_event_times(guitar_alignment_events),"piano":_event_times(piano_alignment_events)}
+            audio_paths={"drums":drums_audio_path,"bass":bass_audio_path,"guitar":guitar_audio_path,
+                         "piano":piano_audio_path,"full":full_audio_path}
+            silence_report=diagnose_silence_checkpoints(score_events,audio_paths,warp_fn,
+                song_timeline_gp["beats"],float(tempo_events[0][1]),checkpoint_search_radius,sr)
+            decision["silence_checkpoint_diagnostics"]=silence_report
+            pitched_events={"bass":bass_pitch_events,"guitar":guitar_pitch_events,"piano":piano_pitch_events}
+            chroma_report=diagnose_chroma_checkpoints(pitched_events,audio_paths,warp_fn,
+                song_timeline_gp["beats"],checkpoint_report,checkpoint_measures,
+                checkpoint_search_radius,sr)
+            decision["chroma_checkpoint_diagnostics"]=chroma_report
+            decision["mode"]="dtw-checkpoint-diagnostic-v4"
+            fc.log(f"Chroma checkpoints: {chroma_report['summary']['strong']} strong, "
+                   f"{chroma_report['summary']['rejected']} rejected from "
+                   f"{chroma_report['summary']['generated']} periodic candidate(s)",indent=2)
+            fc.log(f"Silence checkpoints: {silence_report.get('strong',0)} strong, "
+                   f"{silence_report.get('rejected',0)} rejected from {silence_report.get('generated',0)} consolidated candidate(s)",indent=2)
+            fc.log(f"Checkpoints: {checkpoint_report.get('strong',0)} strong, "
+                   f"{checkpoint_report.get('rejected',0)} rejected; timing unchanged",indent=2)
     fc.log(f"Alignment decision: {decision.get('mode')} {decision.get('selected_source') or ''}",indent=1)
     for c in decision.get("candidates",[]):
         fc.log(f"{c['source']}: p={c.get('probability',0):.3f}, median={c.get('median_residual_ms',0):.1f}ms, coverage={c.get('coverage',0):.2f}",indent=2)
@@ -1005,7 +1367,9 @@ def main():
     parser.add_argument("drums_audio", nargs="?", default=None, help="Optional isolated drums stem")
     parser.add_argument("--bass-audio", default=None)
     parser.add_argument("--piano-audio", default=None)
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw"),default="linear")
+    parser.add_argument("--guitar-audio", default=None)
+    parser.add_argument("--full-audio", default=None)
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint"),default="dtw")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
                         help="A/B test output: dense tempos only, explicit beats only, or both")
     parser.add_argument("--allow-severe-alignment", action="store_true",
@@ -1013,6 +1377,8 @@ def main():
     parser.add_argument("--anchors", default=None)
     parser.add_argument("--padding-added", type=float, default=0.0)
     parser.add_argument("--auto-chunk-measures", type=int, default=16)
+    parser.add_argument("--checkpoint-measures",type=int,default=4)
+    parser.add_argument("--checkpoint-search-radius",type=float,default=1.0)
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)
     parser.add_argument("--count-in-offset", type=float, default=0.0,
@@ -1022,14 +1388,26 @@ def main():
     args = parser.parse_args()
 
     result=process(args.gp_file,args.drums_audio,bass_audio_path=args.bass_audio,
-                   piano_audio_path=args.piano_audio,sr=args.sr,
+                   piano_audio_path=args.piano_audio,guitar_audio_path=args.guitar_audio,
+                   full_audio_path=args.full_audio,sr=args.sr,
                    count_in_offset=args.count_in_offset,timeline_mode=args.timeline_mode,
                    allow_severe_alignment=args.allow_severe_alignment,
                    anchors_path=args.anchors, padding_added=args.padding_added,
-                   auto_chunk_measures=args.auto_chunk_measures,alignment_mode=args.alignment_mode)
+                   auto_chunk_measures=args.auto_chunk_measures,alignment_mode=args.alignment_mode,
+                   checkpoint_measures=args.checkpoint_measures,
+                   checkpoint_search_radius=args.checkpoint_search_radius)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+

@@ -1368,13 +1368,43 @@ Anchor files default to the original unpadded source-audio clock:
 Use `--alignment-mode nominal|offset|linear|dtw`. `nominal` keeps the shifted GP clock, `offset` matches the first symbolic and audio onsets without changing tempo, `linear` matches first and last onsets with one constant scale, and `dtw` uses guarded multi-reference alignment. The selected value is stored as `alignment.mode` in the project YAML.
 
 
-## Verified renderer and vocal timing corrections
+## Checkpoint 3: count-in consensus and report visibility
 
-- Linear alignment remains the default.
-- `song_timeline.json` keeps the accepted aligned times unchanged.
-- The same beats and sections are mirrored into the first playable arrangement for historical highway rendering.
-- No synthetic measure is inserted at zero.
-- Vocal analysis runs on the original vocals stem. At packaging, only physically added padding is added to lyric, per-syllable pitch, and contour timestamps. Existing source silence is never added twice.
-- `vocal_pitch.json` remains per-syllable and mirrors `lyrics.json` timing, as required by the karaoke renderer. Detailed samples remain in `vocal_pitch_contour.json`.
-- Vocal caches carry the SHA-256 of the exact original stem analyzed. Old hashless caches must be regenerated once.
-- The generated manifest declares Feedpak 1.19.0 and uses lowercase stem IDs.
+Existing leading silence reduces count-in padding only when at least two synchronized stems independently contain at least one whole beat of silence, with an absolute floor of 0.7 seconds. Short codec or source gaps are ignored. At 94 BPM, the one-beat duration is about 0.638 seconds, so the 0.7-second floor applies. The builder logs every stem observation, the accepted consensus, and the final padding.
+
+The alignment report is written beside the Feedpak as `<song>.feedpak.alignment_report.json`. The builder now logs the complete path and verifies that the file exists after writing.
+
+
+
+
+
+## Synchronized checkpoint build
+
+This project set must be deployed together. `build_feedpak.py` and `process_gp_alignment.py` both accept `dtw-checkpoint`, `--checkpoint-measures`, and `--checkpoint-search-radius`. Checkpoint mode preserves the linear alignment and records local onset checks in the alignment report; it does not alter timing.
+
+Count-in silence policy excludes vocals. If drums are the only usable non-vocal stem, existing silence is accepted only at 1.0 second or longer. With two or more non-vocal stems, at least two must independently show at least one whole beat of silence. Short encoder gaps are ignored.
+
+Vocal analysis uses the original source stem. Only newly prepended physical padding is added once to lyric, per-syllable pitch, and contour timestamps. The report is written beside the Feedpak and its complete path is logged.
+
+
+
+
+
+## Checkpoint v3 silence diagnostics
+
+Checkpoint mode remains timing-neutral. It now reports regular drum-onset checkpoints and separately evaluates internal silence landmarks. Vocals are ignored. A drum-only silence must exceed 1.0 second. A silence shared by at least two independent non-vocal instrument stems must last at least one local beat. The full mix may confirm audible inactivity but does not count as an independent instrument stem. A silence anchor also requires a recognizable post-silence boundary, defined initially as at least three onset clusters within 750 ms or entries from two supporting stems within 120 ms. Nearby boundaries within 500 ms are consolidated.
+
+
+## Final separation of initial padding and silence checkpoints
+
+Initial padding is a full-mix top-up. The builder measures existing leading space on the full mix and adds only the missing difference required to reach four beats. If the full mix already contains four beats or more, no padding is added. With no full mix, the earliest non-vocal stem is used conservatively. All packaged audio stems receive the same physical padding difference; GP-derived chart times use the resulting four-beat count-in clock, while source-clock vocal words, pitch, and contour receive only the physical padding actually added.
+
+Internal silence checkpoint search is independent and diagnostic-only. Vocals are excluded. A drums-only gap must be strictly greater than 1.0 second. A gap supported by at least two independent non-vocal instrument stems must be strictly greater than one local beat and receive audio confirmation from at least two stems. The full mix may provide confirmation but is not counted as an independent instrument stem.
+
+
+
+
+
+## Checkpoint 4: chroma-dependent diagnostics
+
+Checkpoint v4 remains diagnostic-only. At each periodic checkpoint it builds absolute-pitch-class templates from Guitar Pro bass, guitar, and keys notes, compares them with harmonic CQT chroma from the corresponding isolated stems, and uses the full mix only as corroboration. Acceptance requires at least three active pitch classes, sixteen usable chroma frames, similarity of 0.55, a best-versus-second margin of 0.10, gain over the exact linear null of 0.025, residual within 250 ms, cross-stem agreement within 50 ms when multiple isolated sources pass, and agreement with a strong onset checkpoint within 50 ms. Failed gates and all source metrics are retained under `decision.chroma_checkpoint_diagnostics`; timing is never changed by this mode.
