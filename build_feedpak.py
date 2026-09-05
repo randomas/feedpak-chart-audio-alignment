@@ -851,7 +851,7 @@ def main():
     parser.add_argument("--vocal-layout",choices=("merged","separated","both"),default=defaults.get("vocal_layout") or "merged")
     parser.add_argument("--timeline-mode",choices=("tempos","beats","both"),default=defaults.get("timeline_mode") or "both")
     parser.add_argument("--allow-severe-alignment",action="store_true",default=bool(defaults.get("allow_severe_alignment",False)))
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint"),
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"),
                         default=defaults.get("alignment_mode") or "dtw")
     parser.add_argument("--anchors",default=defaults.get("anchors"))
     parser.add_argument("--auto-chunk-measures",type=int,default=defaults.get("auto_chunk_measures") or 16)
@@ -886,15 +886,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-

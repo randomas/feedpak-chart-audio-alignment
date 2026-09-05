@@ -22,6 +22,7 @@ import math
 import numpy as np
 
 import feedpak_common as fc
+import checkpoint_dtw as cdtw
 
 try:
     import guitarpro
@@ -1097,6 +1098,185 @@ def diagnose_checkpoints(event_times,audio_path,base_warp,measure_downbeats,
             "search_radius_seconds":float(search_radius),"strong":strong,
             "rejected":rejected,"checkpoints":checkpoints}
 
+
+_CHECKPOINT_ONSET_CACHE = {}
+
+def _detected_onset_times(audio_path, sr=22050):
+    """Return cached onset times for checkpoint boundary refinement."""
+    if not audio_path or librosa is None:
+        return np.asarray([], dtype=float)
+    key=(str(audio_path),int(sr))
+    if key not in _CHECKPOINT_ONSET_CACHE:
+        y,actual_sr=librosa.load(audio_path,sr=sr,mono=True)
+        envelope=librosa.onset.onset_strength(y=y,sr=actual_sr)
+        _CHECKPOINT_ONSET_CACHE[key]=np.asarray(
+            librosa.onset.onset_detect(onset_envelope=envelope,sr=actual_sr,
+                                       units="time",backtrack=False),dtype=float)
+    return _CHECKPOINT_ONSET_CACHE[key]
+
+def measure_silence_boundary_residuals(silence_report,audio_paths,search_radius=1.0,sr=22050):
+    """Measure accepted silence ends using post-silence attacks in supporting stems.
+
+    The silence detector establishes that a boundary is structurally useful. This
+    pass gives the boundary its own residual rather than borrowing a periodic
+    checkpoint. Drum-only landmarks require one measured source; multi-stem
+    landmarks require two. Cross-source spread above 50 ms is rejected.
+    """
+    measured=[]
+    for cp in (silence_report or {}).get("checkpoints",[]):
+        item=dict(cp)
+        item["boundary_measurement"]={"available":False}
+        if not cp.get("accepted"):
+            measured.append(item); continue
+        predicted=float(cp["predicted_audio_end"])
+        observations=[]
+        for source in cp.get("audio_confirmed_stems",[]):
+            onsets=_detected_onset_times(audio_paths.get(source),sr=sr)
+            lo=np.searchsorted(onsets,predicted-search_radius)
+            hi=np.searchsorted(onsets,predicted+search_radius,side="right")
+            if hi<=lo: continue
+            local=onsets[lo:hi]
+            hit=float(local[np.argmin(np.abs(local-predicted))])
+            observations.append({"source":source,"time":round(hit,6),
+                                 "residual_ms":round((hit-predicted)*1000.0,3)})
+        required=1 if cp.get("rule")=="drum_only_over_1_second" else 2
+        residuals=[x["residual_ms"] for x in observations]
+        spread=(max(residuals)-min(residuals)) if len(residuals)>=2 else 0.0
+        accepted=bool(len(observations)>=required and spread<=50.0)
+        median=float(np.median(residuals)) if observations else None
+        item["boundary_measurement"]={
+            "available":bool(observations),"required_sources":required,
+            "observations":observations,"cross_source_spread_ms":round(spread,3),
+            "measured_residual_ms":None if median is None else round(median,3),
+            "accepted":accepted,
+            "warnings":([] if accepted else
+                (["rejected_insufficient_boundary_sources"] if len(observations)<required else [])+
+                (["rejected_boundary_source_disagreement"] if spread>50.0 else []))}
+        measured.append(item)
+    out=dict(silence_report or {})
+    out["checkpoints"]=measured
+    out["measured_boundaries"]=sum(1 for x in measured if x.get("boundary_measurement",{}).get("accepted"))
+    return out
+
+def _checkpoint_region_candidates(onset_report,silence_report,chroma_report):
+    candidates=[]
+    for cp in (onset_report or {}).get("checkpoints",[]):
+        if not cp.get("accepted") or cp.get("median_correction_seconds") is None: continue
+        if int(cp.get("matched_events",0))<5 or float(cp.get("mad_seconds") or 9)>0.020: continue
+        candidates.append({"measure":int(cp["measure"]),"nominal_time":float(cp["nominal_time"]),
+            "kind":"onset","residual_ms":1000.0*float(cp["median_correction_seconds"]),
+            "quality":min(1.0,0.55+0.025*int(cp.get("matched_events",0)))*
+                      max(0.25,1.0-float(cp.get("mad_seconds") or 0)/0.020),
+            "detail":{"matched_events":int(cp.get("matched_events",0)),
+                      "mad_ms":round(1000.0*float(cp.get("mad_seconds") or 0),3)}})
+    for cp in (chroma_report or {}).get("checkpoints",[]):
+        if not cp.get("accepted") or cp.get("combined_residual_ms") is None: continue
+        candidates.append({"measure":int(cp["measure"]),"nominal_time":float(cp["nominal_time"]),
+            "kind":"chroma","residual_ms":float(cp["combined_residual_ms"]),
+            "quality":0.90,"detail":{"sources":cp.get("strong_isolated_sources",[]),
+                "onset_disagreement_ms":cp.get("chroma_onset_disagreement_ms")}})
+    for cp in (silence_report or {}).get("checkpoints",[]):
+        bm=cp.get("boundary_measurement") or {}
+        if not cp.get("accepted") or not bm.get("accepted") or bm.get("measured_residual_ms") is None: continue
+        candidates.append({"measure":int(cp["measure"]),"nominal_time":float(cp["score_end"]),
+            "kind":"silence","residual_ms":float(bm["measured_residual_ms"]),
+            "quality":0.95 if len(bm.get("observations",[]))>=2 else 0.82,
+            "detail":{"supporting_stems":cp.get("supporting_stems",[]),
+                "measured_sources":[x["source"] for x in bm.get("observations",[])],
+                "spread_ms":bm.get("cross_source_spread_ms")}})
+    return candidates
+
+def build_checkpoint_linear_warp(base_warp,onset_report,silence_report,chroma_report,
+                                 measure_downbeats,minimum_actionable_ms=10.0,
+                                 shrinkage=0.50,maximum_applied_ms=50.0,
+                                 minimum_interior_anchors=3):
+    """Build a conservative residual curve over the validated linear map."""
+    candidates=_checkpoint_region_candidates(onset_report,silence_report,chroma_report)
+    # Consolidate observations within 500 ms in nominal score time.
+    groups=[]
+    for c in sorted(candidates,key=lambda x:x["nominal_time"]):
+        if groups and c["nominal_time"]-groups[-1][-1]["nominal_time"]<=0.5:
+            groups[-1].append(c)
+        else: groups.append([c])
+    selected=[]; rejected=[]
+    first=float(measure_downbeats[0]["t_gp"]); last=float(measure_downbeats[-1]["t_gp"])
+    for group in groups:
+        kinds=sorted({x["kind"] for x in group})
+        residuals=[x["residual_ms"] for x in group]
+        spread=max(residuals)-min(residuals) if len(residuals)>1 else 0.0
+        weighted=sum(x["residual_ms"]*x["quality"] for x in group)/sum(x["quality"] for x in group)
+        onset=next((x for x in group if x["kind"]=="onset"),None)
+        strong_onset=bool(onset and onset["detail"]["matched_events"]>=10 and onset["detail"]["mad_ms"]<=10.0)
+        tier="A" if len(kinds)>=2 and spread<=50.0 else "B" if ("silence" in kinds or strong_onset) else "C"
+        reasons=[]
+        if spread>50.0: reasons.append("rejected_evidence_disagreement")
+        if abs(weighted)<minimum_actionable_ms: reasons.append("rejected_negligible_residual")
+        nominal=float(np.median([x["nominal_time"] for x in group]))
+        if nominal<=first+1e-6 or nominal>=last-1e-6: reasons.append("rejected_exterior_candidate")
+        if tier=="C": reasons.append("rejected_diagnostic_only_tier")
+        record={"measure":int(round(np.median([x["measure"] for x in group]))),
+            "nominal_time":round(nominal,6),"evidence":kinds,"tier":tier,
+            "observations":group,"evidence_spread_ms":round(spread,3),
+            "measured_residual_ms":round(weighted,3)}
+        if reasons:
+            record.update({"accepted":False,"warnings":reasons}); rejected.append(record); continue
+        applied=float(np.clip(weighted*shrinkage,-maximum_applied_ms,maximum_applied_ms))
+        record.update({"accepted":True,"applied_residual_ms":round(applied,3),"warnings":[]})
+        selected.append(record)
+    status="applied"
+    if len(selected)<minimum_interior_anchors:
+        status="linear_fallback_insufficient_anchors"
+        selected=[]
+    # Validate residual stretch, dropping the lower-confidence anchor in a bad interval.
+    dropped=[]
+    def points():
+        return [{"nominal_time":first,"applied_residual_ms":0.0,"tier":"fixed"}]+selected+[
+               {"nominal_time":last,"applied_residual_ms":0.0,"tier":"fixed"}]
+    changed=True
+    while status=="applied" and changed:
+        changed=False; pts=points()
+        for a,b in zip(pts,pts[1:]):
+            base_delta=float(base_warp(b["nominal_time"]))-float(base_warp(a["nominal_time"]))
+            corrected_delta=base_delta+(b["applied_residual_ms"]-a["applied_residual_ms"])/1000.0
+            stretch=corrected_delta/base_delta if base_delta>0 else 0.0
+            if not (0.98<=stretch<=1.02):
+                options=[x for x in (a,b) if x.get("tier")!="fixed"]
+                if not options:
+                    status="linear_fallback_stretch_validation"; selected=[]; changed=False; break
+                victim=min(options,key=lambda x:(0 if x["tier"]=="B" else 1,abs(x["applied_residual_ms"])))
+                selected.remove(victim); dropped.append({**victim,"reason":"dropped_stretch_violation"})
+                changed=True; break
+        if len(selected)<minimum_interior_anchors and status=="applied":
+            status="linear_fallback_insufficient_anchors_after_validation"; selected=[]; changed=False
+    if status=="applied":
+        pts=points(); xs=np.asarray([x["nominal_time"] for x in pts],dtype=float)
+        residual=np.asarray([x["applied_residual_ms"]/1000.0 for x in pts],dtype=float)
+        def warp(t): return float(base_warp(float(t))+np.interp(float(t),xs,residual))
+    else:
+        pts=points()
+        def warp(t): return float(base_warp(float(t)))
+    # Final validation metrics sampled at every measure boundary.
+    samples=np.asarray([float(x["t_gp"]) for x in measure_downbeats],dtype=float)
+    diffs=np.asarray([(warp(t)-float(base_warp(t)))*1000.0 for t in samples])
+    stretches=[]
+    for a,b in zip(samples,samples[1:]):
+        bd=float(base_warp(b))-float(base_warp(a)); cd=warp(b)-warp(a)
+        if bd>0: stretches.append(cd/bd)
+    report={"version":1,"status":status,
+        "config":{"minimum_actionable_residual_ms":minimum_actionable_ms,"shrinkage":shrinkage,
+            "maximum_applied_correction_ms":maximum_applied_ms,"minimum_residual_stretch":0.98,
+            "maximum_residual_stretch":1.02,"minimum_interior_anchors":minimum_interior_anchors},
+        "selection":{"raw_candidates":len(candidates),"consolidated_regions":len(groups),
+            "actionable_anchors":len(selected),"rejected_regions":len(rejected),"dropped_anchors":len(dropped)},
+        "anchors":selected,"rejected":rejected,"dropped":dropped,
+        "validation":{"monotonic":bool(all(warp(b)>warp(a) for a,b in zip(samples,samples[1:]))),
+            "minimum_observed_residual_stretch":round(min(stretches or [1.0]),6),
+            "maximum_observed_residual_stretch":round(max(stretches or [1.0]),6),
+            "maximum_timing_difference_ms":round(float(np.max(np.abs(diffs))) if len(diffs) else 0.0,3),
+            "median_timing_difference_ms":round(float(np.median(np.abs(diffs))) if len(diffs) else 0.0,3),
+            "timing_changes_applied":bool(status=="applied")}}
+    return warp,report
+
 def apply_warp(entries, warp_fn, time_key="t_gp", out_key="t"):
     out = []
     for e in entries:
@@ -1238,14 +1418,14 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     else:
         reference=next(((source,times,path) for source,times,path in specs if times and path),None)
         source,event_times,audio_path=reference if reference else ("none",[],None)
-        simple_mode="linear" if alignment_mode=="dtw-checkpoint" else alignment_mode
+        simple_mode="linear" if alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective") else alignment_mode
         fc.log(f"Using simple alignment mode '{simple_mode}' with reference '{source}'",indent=1)
         warp_fn=compute_simple_warp(event_times,audio_path,simple_mode,sr=sr)
         decision=warp_fn.alignment_diagnostics
         decision["selected_source"]=source if source != "none" else None
         decision["manual_anchors_ignored"]=bool(manual_anchors)
         decision["padding_added"]=padding_added
-        if alignment_mode=="dtw-checkpoint":
+        if alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"):
             fc.log(f"Detecting diagnostic {source} checkpoints every {checkpoint_measures} measures",indent=1)
             checkpoint_report=diagnose_checkpoints(event_times,audio_path,warp_fn,
                 song_timeline_gp["beats"],checkpoint_measures,checkpoint_search_radius,sr)
@@ -1264,13 +1444,53 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 checkpoint_search_radius,sr)
             decision["chroma_checkpoint_diagnostics"]=chroma_report
             decision["mode"]="dtw-checkpoint-diagnostic-v4"
+            if alignment_mode in ("checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"):
+                silence_report=measure_silence_boundary_residuals(
+                    silence_report,audio_paths,checkpoint_search_radius,sr)
+                decision["silence_checkpoint_diagnostics"]=silence_report
+                corrected_warp,correction_report=build_checkpoint_linear_warp(
+                    warp_fn,checkpoint_report,silence_report,chroma_report,
+                    song_timeline_gp["beats"])
+                corrected_warp.alignment_diagnostics=decision
+                warp_fn=corrected_warp
+                decision["mode"]="checkpoint-linear-v1"
+                decision["checkpoint_linear"]=correction_report
+                if alignment_mode in ("checkpoint-dtw-diagnostic","checkpoint-dtw-selective"):
+                    local_report=cdtw.diagnose_local_dtw(
+                        warp_fn,checkpoint_report,silence_report,chroma_report,
+                        correction_report,song_timeline_gp["beats"],score_events,audio_paths,sr=sr)
+                    decision["local_dtw"]=local_report
+                    if alignment_mode=="checkpoint-dtw-selective":
+                        production_warp,production_report=cdtw.build_selective_warp(
+                            warp_fn,local_report,song_timeline_gp["beats"])
+                        production_warp.alignment_diagnostics=decision
+                        warp_fn=production_warp
+                        decision["mode"]="checkpoint-dtw-selective-v1"
+                        decision["timing_output"]=("checkpoint-dtw-selective-v1" if production_report["timing_changes_applied"] else "checkpoint-linear-v1")
+                        decision["local_dtw_production"]=production_report
+                    else:
+                        decision["mode"]="checkpoint-dtw-diagnostic-v1.2.1"
+                        decision["timing_output"]="checkpoint-linear-v1"
+                    q=local_report["summary"]
+                    fc.log(f"Local DTW diagnostic: {q['generated_segments']} generated, {q['evaluated_segments']} evaluated",indent=2)
+                    fc.log(f"Local DTW diagnostic: {q['boundary_assignments']} boundary assignments, {q['boundary_activated_evaluated']} evaluated, {q['boundary_activated_skipped']} skipped",indent=2)
+                    fc.log(f"Local DTW diagnostic: {q['would_apply']} would apply, {q['rejected']} rejected",indent=2)
+                    fc.log(f"Local DTW diagnostic: {q['skipped_baseline_accurate']} baseline-accurate, "
+                           f"{q['skipped_insufficient_features']} insufficient features",indent=2)
+                    if alignment_mode=="checkpoint-dtw-selective":
+                        pr=decision["local_dtw_production"]
+                        fc.log(f"Selective local DTW: {pr['applied_segment_count']} segment(s) applied; status={pr['status']}",indent=2)
+                        fc.log(f"Timing output: {decision['timing_output']}",indent=2)
+                    else:
+                        fc.log("Timing output: checkpoint-linear; local DTW not applied",indent=2)
             fc.log(f"Chroma checkpoints: {chroma_report['summary']['strong']} strong, "
                    f"{chroma_report['summary']['rejected']} rejected from "
                    f"{chroma_report['summary']['generated']} periodic candidate(s)",indent=2)
             fc.log(f"Silence checkpoints: {silence_report.get('strong',0)} strong, "
                    f"{silence_report.get('rejected',0)} rejected from {silence_report.get('generated',0)} consolidated candidate(s)",indent=2)
             fc.log(f"Checkpoints: {checkpoint_report.get('strong',0)} strong, "
-                   f"{checkpoint_report.get('rejected',0)} rejected; timing unchanged",indent=2)
+                   f"{checkpoint_report.get('rejected',0)} rejected; "
+                   f"timing {'selective local DTW production' if alignment_mode=='checkpoint-dtw-selective' else ('diagnostic local DTW; packaged checkpoint-linear' if alignment_mode=='checkpoint-dtw-diagnostic' else ('guardedly corrected' if alignment_mode=='checkpoint-linear' else 'unchanged'))}",indent=2)
     fc.log(f"Alignment decision: {decision.get('mode')} {decision.get('selected_source') or ''}",indent=1)
     for c in decision.get("candidates",[]):
         fc.log(f"{c['source']}: p={c.get('probability',0):.3f}, median={c.get('median_residual_ms',0):.1f}ms, coverage={c.get('coverage',0):.2f}",indent=2)
@@ -1369,7 +1589,7 @@ def main():
     parser.add_argument("--piano-audio", default=None)
     parser.add_argument("--guitar-audio", default=None)
     parser.add_argument("--full-audio", default=None)
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint"),default="dtw")
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"),default="dtw")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
                         help="A/B test output: dense tempos only, explicit beats only, or both")
     parser.add_argument("--allow-severe-alignment", action="store_true",
@@ -1402,12 +1622,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
