@@ -41,6 +41,7 @@ import yaml
 
 import feedpak_common as fc
 import process_gp_alignment as pga
+import project_config as pc
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_EXTENSIONS = (".ogg", ".wav", ".flac")
@@ -299,7 +300,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   timeline_mode="both",
                   allow_severe_alignment=False,anchors_path=None,padding_added=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
-                  checkpoint_measures=4,checkpoint_search_radius=1.0):
+                  checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path]
     if drums_path: cmd.append(drums_path)
     cmd += ["--out",out_path,"--sr",str(sr),"--count-in-offset",str(count_in_offset),
@@ -314,6 +315,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
             "--alignment-mode",alignment_mode,
             "--checkpoint-measures",str(checkpoint_measures),
             "--checkpoint-search-radius",str(checkpoint_search_radius)]
+    if project_config_path: cmd += ["--project-config",project_config_path]
     fc.log("Launching guarded multi-reference GP/audio alignment")
     subprocess.run(cmd,check=True)
 
@@ -680,14 +682,25 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           allow_severe_alignment=False,reuse_vocals=False,vocals_cache=None,
           vocal_batch_size=16,vocal_compute_type=None,vocal_language=None,
           anchors_path=None,auto_chunk_measures=16,alignment_mode="dtw",
-          checkpoint_measures=4,checkpoint_search_radius=1.0):
+          checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
-    total_steps = 6
+    total_steps=7
     fc.log(f"Building feedpak from: {song_folder}")
-
-    fc.log_step(1, total_steps, "Discovering stems and metadata")
-    metadata = load_metadata(song_folder)
+    gp_path=find_gp_file(song_folder); metadata_path=song_json_path or os.path.join(song_folder,"metadata.json")
+    fc.log_step(0,total_steps,"Inspecting GP5 and validating song configuration")
+    if gp_path and not skip_gp:
+        song=pga.guitarpro.parse(gp_path); inventory=pc.inventory_song(song); metadata,created=pc.ensure_song_json(metadata_path,os.path.basename(gp_path),inventory); validation=pc.validate_song_config(metadata,inventory)
+        inspection_path=os.path.join(song_folder,"gp5_inspection.json"); fc.write_json(inspection_path,pc.inspect_song(song,gp_path,metadata,inventory,validation))
+        if created: fc.log(f"Created song configuration: {metadata_path}",indent=1)
+        fc.log(f"Wrote GP5 inspection: {inspection_path}",indent=1)
+        if not validation["valid"]:
+            for error in validation["errors"]: fc.log("CONFIG ERROR: "+json.dumps(error,ensure_ascii=False),indent=1)
+            raise RuntimeError("Song configuration does not match GP5 tracks; no audio processing was started")
+        roles=pc.resolved_roles(metadata,inventory)
+        for item in inventory: fc.log(f"Track {item['index']}: '{item['name']}' -> {roles[item['name']]}",indent=1)
+    else: metadata=load_metadata(song_folder)
+    fc.log_step(1,total_steps,"Discovering stems and metadata")
     stems, vocals_path, drums_path = discover_stems(song_folder, vocals_stem_name, drums_stem_name)
     original_vocals_path=vocals_path
     if not stems:
@@ -698,8 +711,6 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
 
     work_dir = os.path.join(song_folder, "_feedpak_build")
     os.makedirs(os.path.join(work_dir, "arrangements"), exist_ok=True)
-
-    gp_path = find_gp_file(song_folder)
 
     fc.log_step(2, total_steps, "Count-in check (padding stems if needed)")
     count_in_offset, padding_added, stems_dir, padded_paths = prepare_stems_with_count_in(
@@ -759,7 +770,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       anchors_path=anchors_path,padding_added=padding_added,
                       auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode,
                       checkpoint_measures=checkpoint_measures,
-                      checkpoint_search_radius=checkpoint_search_radius)
+                      checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         arrangements += write_arrangement_files(gp_data, work_dir)
@@ -843,6 +854,7 @@ def main():
 
     parser=argparse.ArgumentParser(description="Build a .feedpak from a song folder.")
     parser.add_argument("song_folder"); parser.add_argument("output_folder"); parser.add_argument("--config",default=known.config)
+    parser.add_argument("--song-json",default=None)
     parser.add_argument("--vocals-stem",default=defaults.get("vocals_stem") or "vocals")
     parser.add_argument("--drums-stem",default=defaults.get("drums_stem") or "drums")
     parser.add_argument("--device",default=defaults.get("device") or "cuda")
@@ -881,8 +893,11 @@ def main():
           anchors_path=anchors,auto_chunk_measures=args.auto_chunk_measures,
           alignment_mode=args.alignment_mode,
           checkpoint_measures=args.checkpoint_measures,
-          checkpoint_search_radius=args.checkpoint_search_radius)
+          checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)))
 
 
 if __name__ == "__main__":
     main()
+
+
+

@@ -23,6 +23,7 @@ import numpy as np
 
 import feedpak_common as fc
 import checkpoint_dtw as cdtw
+import project_config as pc
 
 try:
     import guitarpro
@@ -1307,7 +1308,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             sr=22050, count_in_offset=0.0, timeline_mode="both",
             allow_severe_alignment=False, anchors_path=None, padding_added=0.0,
             auto_chunk_measures=16, alignment_mode="dtw",
-            checkpoint_measures=4, checkpoint_search_radius=1.0):
+            checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None):
     if guitarpro is None:
         raise RuntimeError("pyguitarpro is required: pip install pyguitarpro")
 
@@ -1334,36 +1335,35 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     guitar_pitch_events = []
     piano_pitch_events = []
     notation_tracks = {}
+    inventory=pc.inventory_song(song)
+    if project_config_path:
+        with open(project_config_path,"r",encoding="utf-8") as f: project_data=json.load(f)
+        validation=pc.validate_song_config(project_data,inventory)
+        if not validation["valid"]: raise ValueError("Invalid project track configuration: "+json.dumps(validation["errors"],ensure_ascii=False))
+        role_by_name=pc.resolved_roles(project_data,inventory)
+    else: role_by_name={x["name"]:x["automatic_role"] for x in inventory}
 
     for track in song.tracks:
-        if not track.measures:
-            continue
-        if track.isPercussionTrack:
-            fc.log(f"'{track.name}' -> drum track", indent=1)
-            drum_hits_gp = parse_drum_track(track, tempo_events, first_tick)
-            fc.log(f"{len(drum_hits_gp)} drum hits parsed", indent=2)
-        elif _looks_like_keyboard(track):
-            fc.log(f"'{track.name}' -> keyboard/notation track", indent=1)
-            notation = parse_keyboard_track(track, tempo_events, first_tick)
-            notation_tracks[_safe_track_id(track)] = notation
-            piano_alignment_events.extend({"t_gp": t} for t in _keyboard_onsets(notation))
+        if not track.measures: continue
+        role=role_by_name.get(track.name,"unsupported")
+        if role == "drums":
+            fc.log(f"'{track.name}' -> main drums", indent=1); drum_hits_gp=parse_drum_track(track,tempo_events,first_tick); fc.log(f"{len(drum_hits_gp)} drum hits parsed",indent=2)
+        elif role in ("piano_left","piano_right","piano_combined"):
+            fc.log(f"'{track.name}' -> {role}",indent=1); notation=parse_keyboard_track(track,tempo_events,first_tick); notation_tracks[_safe_track_id(track)]=notation
+            piano_alignment_events.extend({"t_gp":t} for t in _keyboard_onsets(notation))
             for measure in notation.get("measures",[]):
                 for stave in measure.get("staves",{}).values():
                     for voice in stave.get("voices",[]):
                         for beat in voice.get("beats",[]):
-                            for note in beat.get("notes",[]):
-                                piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
-        else:
-            fc.log(f"'{track.name}' -> fretted track", indent=1)
-            data = parse_fretted_track(track, tempo_events, first_tick)
-            fretted_tracks[_safe_track_id(track)] = data
-            if "bass" in (track.name or "").lower() or "bass" in data["name"].lower():
-                bass_alignment_events.extend({"t_gp": n["t_gp"]} for n in data["notes"])
-                bass_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
+                            for note in beat.get("notes",[]): piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
+        elif role in ("guitar","bass"):
+            fc.log(f"'{track.name}' -> {role} fretted track",indent=1); data=parse_fretted_track(track,tempo_events,first_tick); fretted_tracks[_safe_track_id(track)]=data
+            if role=="bass":
+                bass_alignment_events.extend({"t_gp":n["t_gp"]} for n in data["notes"]); bass_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
             else:
-                guitar_alignment_events.extend({"t_gp": n["t_gp"]} for n in data["notes"])
-                guitar_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
-            fc.log(f"{len(data['notes'])} notes, {len(data['anchors'])} anchors", indent=2)
+                guitar_alignment_events.extend({"t_gp":n["t_gp"]} for n in data["notes"]); guitar_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
+            fc.log(f"{len(data['notes'])} notes, {len(data['anchors'])} anchors",indent=2)
+        else: fc.log(f"'{track.name}' -> {role}; skipped",indent=1)
 
     fc.log_step(3, 5, "Reading key signatures + building song timeline")
     key_events_gp = build_key_signature_events(song, tempo_events, first_tick)
@@ -1599,6 +1599,7 @@ def main():
     parser.add_argument("--auto-chunk-measures", type=int, default=16)
     parser.add_argument("--checkpoint-measures",type=int,default=4)
     parser.add_argument("--checkpoint-search-radius",type=float,default=1.0)
+    parser.add_argument("--project-config",default=None)
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)
     parser.add_argument("--count-in-offset", type=float, default=0.0,
@@ -1615,10 +1616,13 @@ def main():
                    anchors_path=args.anchors, padding_added=args.padding_added,
                    auto_chunk_measures=args.auto_chunk_measures,alignment_mode=args.alignment_mode,
                    checkpoint_measures=args.checkpoint_measures,
-                   checkpoint_search_radius=args.checkpoint_search_radius)
+                   checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
