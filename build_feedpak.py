@@ -106,6 +106,23 @@ def discover_stems(song_folder, vocals_stem_name, drums_stem_name):
     return stems, vocals_path, drums_path
 
 
+def select_stem_path(padded_paths, stem_id, aliases=()):
+    """Resolve an alignment source by manifest stem id.
+
+    ``none``/``off`` disables the source without removing it from packaging.
+    When no explicit id is supplied, aliases retain the historical automatic
+    discovery behavior.
+    """
+    if stem_id is not None:
+        requested=str(stem_id).strip().lower()
+        if requested in ("", "none", "off", "disabled"):
+            return None
+        return padded_paths.get(requested)
+    for alias in aliases:
+        if alias in padded_paths:
+            return padded_paths[alias]
+    return None
+
 def probe_duration_seconds(audio_path):
     if audio_path is None or not os.path.exists(audio_path):
         return None
@@ -261,8 +278,9 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     # and lead-in that's already MORE than a full count-in (no padding
     # needed, but the chart still has to shift to match wherever the
     # real content actually starts, not stay at zero).
-    count_in_offset = max(leading_silence, count_in_seconds)
-    return count_in_offset, pad_seconds, stems_out_dir, padded_paths
+    audio_content_start = float(leading_silence) + float(pad_seconds)
+    fc.log(f"Post-padding audio content start: {audio_content_start:.3f}s; chart offset will be derived from the first configured instrumental score onset", indent=1)
+    return audio_content_start, pad_seconds, stems_out_dir, padded_paths
 
 
 # --------------------------------------------------------------------------
@@ -350,12 +368,46 @@ def embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,entries):
     fc.write_json(path,data)
 
 
+
+def expand_lyrics_with_pitch_continuations(words, pitch_notes, tolerance=0.002):
+    """Emit one lyric record per discrete pitch note inside each syllable.
+
+    The first pitch block carries the syllable text and later blocks carry
+    ``+``. Unpitched syllables are preserved at their WhisperX timing.
+    Pitch blocks are never duplicated between adjacent syllables.
+    """
+    ordered_words=sorted((dict(w) for w in words),key=lambda x:float(x["t"]))
+    ordered_notes=sorted((dict(n) for n in pitch_notes),key=lambda x:float(x["t"]))
+    out=[]; used=set()
+    for word in ordered_words:
+        start=float(word["t"]); end=start+float(word["d"])
+        matches=[]
+        for i,note in enumerate(ordered_notes):
+            if i in used: continue
+            ns=float(note["t"]); ne=ns+float(note["d"])
+            midpoint=(ns+ne)/2.0
+            # Assign each pitch block to exactly one syllable. Midpoint
+            # ownership avoids duplicating a block that starts exactly on
+            # the boundary between two adjacent syllables.
+            if start-tolerance<=midpoint<end-tolerance:
+                matches.append((i,note))
+        if not matches:
+            out.append({"t":round(start,4),"d":round(float(word["d"]),4),"w":word["w"]})
+            continue
+        for j,(i,note) in enumerate(matches):
+            used.add(i)
+            out.append({"t":round(float(note["t"]),4),"d":round(float(note["d"]),4),
+                        "w":word["w"] if j==0 else "+"})
+    out.sort(key=lambda x:(float(x["t"]),0 if x["w"]!="+" else 1))
+    return out
+
 def write_lyric_tracks(vocals_data,work_dir,vocal_stem_id):
     entries=[]; files=[]; language=vocals_data.get("language") or "und"
     for i,(speaker,data) in enumerate(sorted(vocals_data.get("speakers",{}).items()),1):
         if not data.get("words"): continue
         sid="".join(c if c.isalnum() else "_" for c in speaker.lower()).strip("_") or f"speaker_{i:02d}"
-        fn=f"lyrics_{sid}.json"; fc.write_json(os.path.join(work_dir,fn),data["words"])
+        expanded=expand_lyrics_with_pitch_continuations(data["words"],data.get("pitch_notes",[]))
+        fn=f"lyrics_{sid}.json"; fc.write_json(os.path.join(work_dir,fn),expanded)
         entries.append({"id":sid,"file":fn,"language":language,"kind":"original","stem":vocal_stem_id,"name":f"Voice {i}"}); files.append(fn)
     return entries,files
 
@@ -406,8 +458,8 @@ def write_single_merged_lyrics(vocals_data, work_dir):
     """
     all_words = []
     for data in vocals_data.get("speakers", {}).values():
-        for w in data.get("words", []):
-            all_words.append({"t": w["t"], "d": w["d"], "w": w["w"]})
+        expanded=expand_lyrics_with_pitch_continuations(data.get("words", []),data.get("pitch_notes", []))
+        all_words.extend(expanded)
 
     all_words.sort(key=lambda n: n["t"])
 
@@ -416,6 +468,33 @@ def write_single_merged_lyrics(vocals_data, work_dir):
         return "lyrics.json"
     return None
 
+
+def validate_vocal_coverage(vocals_data,duration,warning_tail_seconds=45.0):
+    words=[]; pitch=[]
+    for speaker in (vocals_data.get("speakers") or {}).values():
+        words.extend(speaker.get("words") or []); pitch.extend(speaker.get("pitch_notes") or [])
+    end=lambda xs:max((float(x.get("t",0))+float(x.get("d",0)) for x in xs),default=None)
+    we,pe=end(words),end(pitch); last=max([x for x in (we,pe) if x is not None],default=None)
+    tail=None if last is None or duration is None else max(0.0,float(duration)-last)
+    threshold=max(float(warning_tail_seconds),.25*float(duration or 0)); warnings=[]
+    if not words:warnings.append("no_timed_words")
+    if not pitch:warnings.append("no_pitch_notes")
+    if tail is not None and tail>threshold:warnings.append("large_unexplained_song_tail_without_vocals")
+    if we is not None and pe is not None and abs(we-pe)>30:warnings.append("lyrics_and_pitch_end_times_diverge")
+    out={"status":"warning" if warnings else "ok","word_count":len(words),"pitch_note_count":len(pitch),"last_word_end":we,"last_pitch_end":pe,"song_duration":duration,"tail_seconds":tail,"tail_warning_threshold_seconds":threshold,"warnings":warnings}
+    fc.log(f"Vocal coverage: words={len(words)}, pitch={len(pitch)}, last={last}, status={out['status']}",indent=1)
+    return out
+
+def write_gp_vocals(gp_data,work_dir):
+    data=gp_data.get("gp_vocals") or {}
+    lyrics=[{"t":x["t"],"d":x["d"],"w":x["w"]} for x in data.get("lyrics",[]) if x.get("d",0)>0]
+    pitch=[{"t":x["t"],"d":x["d"],"midi":int(x["midi"])} for x in data.get("pitch_notes",[]) if x.get("d",0)>0]
+    if lyrics: fc.write_json(os.path.join(work_dir,"lyrics.json"),lyrics)
+    if pitch: fc.write_json(os.path.join(work_dir,"vocal_pitch.json"),{"version":1,"notes":pitch})
+    if data:
+        fc.write_json(os.path.join(work_dir,"gp_vocal_diagnostics.json"),data.get("diagnostics",{}))
+        d=data.get("diagnostics",{}); fc.log(f"GP vocal output: {d.get('bars_written',0)} bar(s) written, {d.get('bars_skipped',0)} skipped",indent=1)
+    return ("lyrics.json" if lyrics else None,"vocal_pitch.json" if pitch else None)
 
 def write_arrangement_files(gp_data, work_dir):
     """
@@ -445,6 +524,8 @@ def write_arrangement_files(gp_data, work_dir):
             "tuning": arr["tuning"],
             "capo": arr["capo"],
         }
+        if arr.get("type"):
+            entry["type"] = arr["type"]
         if arr.get("tuning_nonstandard_string_count"):
             print(f"Note: {track_id} has a nonstandard string count; "
                   f"tuning offsets are best-effort.", file=sys.stderr)
@@ -452,22 +533,28 @@ def write_arrangement_files(gp_data, work_dir):
     return entries
 
 
-def write_notation_files(gp_data, work_dir):
+def write_notation_files(gp_data, work_dir, arrangement_entries=None):
+    """Write notation and attach it to the matching playable arrangement.
+
+    Piano LH/RH remain independent manifest entries. This avoids the old
+    duplicate notation-only entries and guarantees that every piano lane has
+    both ``file`` and ``notation``.
     """
-    Keyboard tracks get notation.json ONLY (measures/staves), never a
-    synthetic flat tab-style file — see architecture doc §2.4.
-    """
-    entries = []
+    entries = arrangement_entries if arrangement_entries is not None else []
+    by_id = {entry.get("id"): entry for entry in entries}
     for track_id, notation in (gp_data.get("notation") or {}).items():
         filename = f"notation_{track_id}.json"
         fc.write_json(os.path.join(work_dir, "arrangements", filename), notation)
-        entries.append({
-            "id": track_id,
-            "name": track_id.replace("_", " ").title(),
-            "notation": fc.to_posix_relpath("arrangements", filename),
-        })
+        notation_path = fc.to_posix_relpath("arrangements", filename)
+        if track_id in by_id:
+            by_id[track_id]["notation"] = notation_path
+            by_id[track_id]["type"] = "piano"
+        else:
+            entry = {"id": track_id, "name": track_id.replace("_", " ").title(),
+                     "type": "piano", "notation": notation_path}
+            entries.append(entry)
+            by_id[track_id] = entry
     return entries
-
 
 def write_drum_tab(gp_data, work_dir):
     """
@@ -627,6 +714,8 @@ def load_project_defaults(path):
     with open(path,"r",encoding="utf-8") as f: data=yaml.safe_load(f) or {}
     vocals=data.get("vocals",{}); alignment=data.get("alignment",{}); timeline=data.get("timeline",{}); build=data.get("build",{}); stems=data.get("stems",{})
     return {"vocals_stem":stems.get("vocals"),"drums_stem":stems.get("drums"),
+            "bass_alignment_stem":stems.get("bass_alignment"),"piano_alignment_stem":stems.get("piano_alignment"),
+            "guitar_alignment_stem":stems.get("guitar_alignment"),
             "device":vocals.get("device"),"vocal_layout":vocals.get("layout"),
             "reuse_vocals":vocals.get("reuse"),"vocals_cache":vocals.get("cache"),
             "vocal_batch_size":vocals.get("batch_size"),"vocal_compute_type":vocals.get("compute_type"),
@@ -640,7 +729,9 @@ def load_project_defaults(path):
 
 
 def project_document(args):
-    return {"version":1,"stems":{"vocals":args.vocals_stem,"drums":args.drums_stem},
+    return {"version":1,"stems":{"vocals":args.vocals_stem,"drums":args.drums_stem,
+                    "bass_alignment":args.bass_alignment_stem,"piano_alignment":args.piano_alignment_stem,
+                    "guitar_alignment":args.guitar_alignment_stem},
             "vocals":{"device":args.device,"layout":args.vocal_layout,"reuse":args.reuse_vocals,
                        "cache":args.vocals_cache,"batch_size":args.vocal_batch_size,
                        "compute_type":args.vocal_compute_type,"language":args.vocal_language},
@@ -682,13 +773,15 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           allow_severe_alignment=False,reuse_vocals=False,vocals_cache=None,
           vocal_batch_size=16,vocal_compute_type=None,vocal_language=None,
           anchors_path=None,auto_chunk_measures=16,alignment_mode="dtw",
-          checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None):
+          checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
+          bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps=7
     fc.log(f"Building feedpak from: {song_folder}")
     gp_path=find_gp_file(song_folder); metadata_path=song_json_path or os.path.join(song_folder,"metadata.json")
     fc.log_step(0,total_steps,"Inspecting GP5 and validating song configuration")
+    gp_vocal_capability={"classification":"no_vocal_material","direct_gp_lyrics_supported":False,"reason":"GP unavailable"}
     if gp_path and not skip_gp:
         song=pga.guitarpro.parse(gp_path); inventory=pc.inventory_song(song); metadata,created=pc.ensure_song_json(metadata_path,os.path.basename(gp_path),inventory); validation=pc.validate_song_config(metadata,inventory)
         inspection_path=os.path.join(song_folder,"gp5_inspection.json"); fc.write_json(inspection_path,pc.inspect_song(song,gp_path,metadata,inventory,validation))
@@ -698,8 +791,13 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
             for error in validation["errors"]: fc.log("CONFIG ERROR: "+json.dumps(error,ensure_ascii=False),indent=1)
             raise RuntimeError("Song configuration does not match GP5 tracks; no audio processing was started")
         roles=pc.resolved_roles(metadata,inventory)
+        gp_vocal_capability=pc.classify_vocal_capability(song,inventory,roles)
+        inspection=pc.inspect_song(song,gp_path,metadata,inventory,validation); inspection["vocal_capability"]=gp_vocal_capability; fc.write_json(inspection_path,inspection)
         for item in inventory: fc.log(f"Track {item['index']}: '{item['name']}' -> {roles[item['name']]}",indent=1)
+        fc.log(f"GP vocal capability: {gp_vocal_capability['classification']} ({gp_vocal_capability['reason']})",indent=1)
     else: metadata=load_metadata(song_folder)
+    gp_vocal_configured=bool(((metadata.get("feedpak_project") or {}).get("tracks") or {}).get("lead_vocal"))
+    gp_vocal_production=bool(gp_vocal_configured and gp_vocal_capability.get("direct_gp_lyrics_supported"))
     fc.log_step(1,total_steps,"Discovering stems and metadata")
     stems, vocals_path, drums_path = discover_stems(song_folder, vocals_stem_name, drums_stem_name)
     original_vocals_path=vocals_path
@@ -724,9 +822,13 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     drums_path = padded_paths.get(next((s["id"] for s in stems
                                          if os.path.splitext(os.path.basename(s["file"]))[0].lower()
                                          == drums_stem_name.lower()), None))
-    bass_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower()=="bass"),None))
-    piano_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower() in ("piano","keys","keyboard")),None))
-    guitar_path=padded_paths.get(next((s["id"] for s in stems if s["id"].lower() in ("guitar","rhythm_guitar","lead_guitar")),None))
+    bass_path=select_stem_path(padded_paths,bass_alignment_stem,("bass",))
+    piano_path=select_stem_path(padded_paths,piano_alignment_stem,("piano","keys","keyboard"))
+    guitar_path=select_stem_path(padded_paths,guitar_alignment_stem,("guitar","rhythm_guitar","lead_guitar"))
+    fc.log(f"Alignment stem routing: drums={os.path.basename(drums_path) if drums_path else 'off'}, "
+           f"bass={os.path.basename(bass_path) if bass_path else 'off'}, "
+           f"piano={os.path.basename(piano_path) if piano_path else 'off'}, "
+           f"guitar={os.path.basename(guitar_path) if guitar_path else 'off'}",indent=1)
 
     full_stem = next((s for s in stems if s["id"] == "full"), None)
     full_path = padded_paths.get(full_stem["id"]) if full_stem else None
@@ -737,25 +839,30 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     fc.log_step(3, total_steps, "Vocal processing (Script 1)")
     vocal_pitch_file=vocal_pitch_contour_file=lyrics_file=None
     lyric_tracks=[]
-    if vocals_path and not skip_vocals:
+    if gp_vocal_production:
+        fc.log("Configured GP lead vocal has synchronized lyric timing; deferring to GP interpreter",indent=1)
+    elif gp_vocal_configured:
+        fc.log("WARNING: Configured GP lead vocal cannot provide synchronized lyrics",indent=1); fc.log(f"GP classification: {gp_vocal_capability['classification']}; {gp_vocal_capability['reason']}",indent=2); fc.log("Falling back to WhisperX/CREPE",indent=2)
+    if not gp_vocal_production and vocals_path and not skip_vocals:
         vocals_analysis_path=original_vocals_path or vocals_path
         vocals_intermediate=vocals_cache or os.path.join(song_folder,"intermediate_vocals.json")
-        vocals_data=load_reusable_vocals(vocals_intermediate,vocals_analysis_path) if reuse_vocals else None
+        vocals_data=load_reusable_vocals(vocals_intermediate,vocals_analysis_path) if (reuse_vocals or os.path.isfile(vocals_intermediate)) else None
         if vocals_data is None:
             run_vocals_script(vocals_analysis_path,vocals_intermediate,device=device,hf_token=hf_token,
                               batch_size=vocal_batch_size,compute_type=vocal_compute_type,
                               language=vocal_language)
             with open(vocals_intermediate,"r",encoding="utf-8") as f: vocals_data=json.load(f)
         vocals_data=shift_vocal_analysis(vocals_data,padding_added)
+        fc.write_json(os.path.join(work_dir,"vocal_coverage_report.json"),validate_vocal_coverage(vocals_data,duration))
         if vocal_layout in ("merged","both"): lyrics_file=write_single_merged_lyrics(vocals_data,work_dir)
         if vocal_layout in ("separated","both"): lyric_tracks,_=write_lyric_tracks(vocals_data,work_dir,vocals_stem_name)
         wrote_pitch,wrote_contour,overlaps=write_merged_vocal_pitch(vocals_data,work_dir)
         vocal_pitch_file="vocal_pitch.json" if wrote_pitch else None
         vocal_pitch_contour_file="vocal_pitch_contour.json" if wrote_contour else None
-    elif skip_vocals:
-        fc.log("--skip-vocals set; skipping vocal processing.", indent=1)
-    else:
-        fc.log(f"No stem matching '{vocals_stem_name}' found; skipping vocal processing.", indent=1)
+    elif not gp_vocal_production and skip_vocals:
+        fc.log("--skip-vocals set; skipping audio vocal fallback.", indent=1)
+    elif not gp_vocal_production and not vocals_path:
+        fc.log(f"WARNING: No stem matching '{vocals_stem_name}' found; reliable vocals omitted.", indent=1)
 
     fc.log_step(4, total_steps, "GP parsing + DTW alignment (Script 2)")
     arrangements = []
@@ -773,8 +880,12 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
+        if gp_vocal_production:
+            lyrics_file,vocal_pitch_file=write_gp_vocals(gp_data,work_dir)
+            vocal_pitch_contour_file=None
+            lyric_tracks=[]
         arrangements += write_arrangement_files(gp_data, work_dir)
-        arrangements += write_notation_files(gp_data, work_dir)
+        arrangements = write_notation_files(gp_data, work_dir, arrangements)
         drum_tab_file = write_drum_tab(gp_data, work_dir)
         if drum_tab_file:
             arrangements.append({"id": "drums", "name": "Drums", "type": "drums",
@@ -857,6 +968,9 @@ def main():
     parser.add_argument("--song-json",default=None)
     parser.add_argument("--vocals-stem",default=defaults.get("vocals_stem") or "vocals")
     parser.add_argument("--drums-stem",default=defaults.get("drums_stem") or "drums")
+    parser.add_argument("--bass-alignment-stem",default=defaults.get("bass_alignment_stem"),help="Stem id used as bass alignment evidence; use 'none' to disable")
+    parser.add_argument("--piano-alignment-stem",default=defaults.get("piano_alignment_stem"),help="Stem id used as piano alignment evidence; e.g. guitar if that file is piano-dominant")
+    parser.add_argument("--guitar-alignment-stem",default=defaults.get("guitar_alignment_stem"),help="Stem id used as guitar alignment evidence; use 'none' to disable")
     parser.add_argument("--device",default=defaults.get("device") or "cuda")
     parser.add_argument("--hf-token",default=None)
     parser.add_argument("--skip-vocals",action="store_true"); parser.add_argument("--skip-gp",action="store_true")
@@ -893,11 +1007,25 @@ def main():
           anchors_path=anchors,auto_chunk_measures=args.auto_chunk_measures,
           alignment_mode=args.alignment_mode,
           checkpoint_measures=args.checkpoint_measures,
-          checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)))
+          checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)),
+          bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
+          guitar_alignment_stem=args.guitar_alignment_stem)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

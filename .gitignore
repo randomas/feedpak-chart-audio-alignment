@@ -1,15 +1,44 @@
-# 1. Ignore EVERYTHING in this directory by default
+# 1. Ignore everything in the repository root by default
 *
 
-# 2. Track essential source files
+# 2. Track essential root source files
 !*.py
 !README.md
 !.gitignore
 
-# 3. Explicit safety net: Never track secrets or virtual environments
+# 3. Re-include the tests directory and Python tests inside it
+!tests/
+!tests/**/*.py
+
+# 4. Explicit safety exclusions
 Tokens And APIs.txt
 env/
 __pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Temporary patch, checkpoint, and backup scripts
+apply_checkpoint_*.py
+*_before_checkpoints.py
+*_checkpoint_v*.py
+*.before_*
+fix_checkpoint_*.py
+
+# One-off local diagnostic scripts
+check_midi.py
+
+# 5. Local song data and generated output
 my_test_song/
+my_test_song_2/
+output/
 output_folder/
 Gemini_mess/
+_feedpak_build/
+**/_feedpak_build/
+*.feedpak
+*.feedpak.alignment_report.json
+intermediate_arrangements.json
+intermediate_vocals.json
+gp5_inspection.json
+feedpak-project.v*.yaml

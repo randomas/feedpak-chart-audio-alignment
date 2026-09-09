@@ -11,3 +11,18 @@ class T(unittest.TestCase):
   x={'feedpak_project':{'tracks':p.default_allocation(self.i)}};x['feedpak_project']['tracks']['lead_vocal']='Lead Vocal';self.assertFalse(p.validate_song_config(x,self.i)['valid'])
  def test_unknown(self):self.assertEqual(p.classify_name('Roger Walters'),'unsupported')
 if __name__=='__main__':unittest.main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

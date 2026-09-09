@@ -1511,3 +1511,107 @@ python -m py_compile build_feedpak.py process_gp_alignment.py process_vocals.py 
   feedpak_common.py checkpoint_dtw.py project_config.py
 python -m unittest discover -s tests -v
 ```
+
+
+
+
+## GP-only piano and coarse vocal interpreters
+
+When `metadata.json` assigns separate `piano.left` and `piano.right` tracks,
+each GP track is exported as an independent notation file. Explicit hands are
+never re-split at middle C, nonempty GP voices remain separate, and note
+sustains are calculated by warping both note endpoints. A `piano.combined`
+track retains the legacy middle-C split.
+
+When `lead_vocal` is configured, the builder uses Guitar Pro as the only vocal
+source for that build and skips WhisperX and CREPE. Vocal allocation deliberately
+restarts at every measure. Beat text is preferred; otherwise GP lyric-line text
+is consumed as a coarse token stream. Extra notes become `+` melisma entries.
+If one measure is polyphonic or cannot allocate its tokens, only that measure is
+omitted. Neighbouring measures continue normally. Diagnostics are written to
+`gp_vocal_diagnostics.json`.
+
+If `lead_vocal` is null, the existing audio-derived vocal path remains available
+for songs such as Spellbound.
+
+---
+
+## Checkpoint 7.1 RB3-compatible piano wire fix
+
+This checkpoint keeps independent Guitar Pro left-hand and right-hand piano arrangements and changes only the playable keys encoding:
+
+- piano pitches use the proven RB3 converter mapping `s = midi // 24`, `f = midi % 24`;
+- playable pitches are restricted to the standard MIDI piano range 21 through 108;
+- piano arrangements use the fixed keys anchor `{time: 0.0, fret: 1, width: 4}`;
+- the guitar hand-position anchor heuristic is no longer applied to piano;
+- Guitar Pro-derived sustain values are retained unchanged for this controlled test;
+- each piano arrangement still carries both its playable `file` and staff `notation` entry;
+- checkpoint modes retain the count-in-shifted native GP tempo-map baseline and do not scale globally from the full-mix endpoint.
+
+---
+
+## Checkpoint 7.1 timing-origin correction
+
+- Rebased Guitar Pro tempo events to the same `first_tick` clock as notes.
+- Separated padded audio content start from chart offset.
+- Derived chart offset from the first configured instrumental score onset, avoiding a doubled scored intro measure.
+- Added whole-song adaptive checkpoint diagnostics at 1x, 2x, and 4x radius when no corroborated checkpoint exists.
+- Retained RB3-compatible piano wire encoding and fixed piano anchors.
+- Moved all new tests under `tests/`.
+
+### Checkpoint 7.1 timing-origin hotfix v2
+
+The incoming `--count-in-offset` value is now treated explicitly as the post-padding audio content start. `process()` initializes `audio_content_start`, derives a separate `chart_offset` after resolving configured tracks, and uses only `chart_offset` for score, notation, timeline, and GP-vocal shifts. This fixes the undefined-variable crash and prevents the two timing concepts from being silently reused as one variable. Orchestration-level regression tests verify initialization order and downstream wiring.
+
+
+
+
+## Checkpoint 7.1 multi-pitch lyrics and guitar coverage diagnostic
+
+Audio-derived vocal export now mirrors every stable discrete pitch block with a lyric record. The first block retains the syllable text and later blocks use `+`, while unpitched syllables and Pyphen trailing hyphens are preserved. The timestamps and durations of these lyric continuation records exactly match the corresponding CREPE-derived discrete pitch blocks.
+
+The alignment report now includes `decision.guitar_coverage_diagnostic`. It compares the first and last warped GP guitar-note times with sustained activity and strong-onset timing measured from the padded guitar stem. This diagnostic does not alter chart timing. A console warning is emitted when substantial guitar-stem activity begins more than one second before the configured GP guitar track.
+
+
+
+
+## Checkpoint 7.2 multi-note lyrics and explicit alignment-stem routing
+
+Multi-note audio-derived lyrics are enabled: the first discrete pitch block keeps the syllable text and additional stable pitch blocks use `+` with timing identical to `vocal_pitch.json`.
+
+Alignment evidence can now be routed independently from packaged stem names. This allows a mislabeled but piano-dominant `guitar` stem to be used for piano evidence while disabling unreliable bass and guitar evidence:
+
+```powershell
+python build_feedpak.py my_test_song_2 output `
+  --alignment-mode checkpoint-dtw-selective `
+  --piano-alignment-stem guitar `
+  --bass-alignment-stem none `
+  --guitar-alignment-stem none `
+  --reuse-vocals `
+  --keep-work-dir
+```
+
+The files remain packaged under their original stem ids. These options affect alignment evidence only and are saved in versioned `feedpak-project*.yaml` configuration files. Guitar coverage wording is now explicitly inconclusive for contaminated or cross-instrument stems, and its count is labeled `unique_onset_count` rather than `note_count`.
+
+
+
+
+## Checkpoint 7.3: timed GP lyric allocator
+
+GP vocals now use only explicit `beat.text` lyric anchors. The anchor text is assigned to the first matching vocal note, and every following note before the next timed lyric anchor is emitted as `+`. Allocation is continuous across measure boundaries.
+
+Song-level GP lyric lines are retained in diagnostics but not allocated, because their individual tokens are untimed. `gp_vocal_diagnostics.json` reports timed anchors, continuation notes, unresolved notes, polyphonic onsets, and ignored untimed lyric-line tokens.
+
+
+
+
+## Checkpoint 7.5
+
+GP lyric-line tokens with embedded hyphens are expanded to note-owning syllables, and measure-local allocation uses only actual GP vocal-note onsets. Playable piano notes now use explicit `d` release durations rather than guitar-style `sus`, preventing keys from remaining held through empty measures.
+
+
+
+
+## Checkpoint 8.0.1: guarded global linear baseline
+
+Checkpoint modes again fit a start-fixed global linear baseline from the authored score span to the sustained full-mix content end. The proposed scale is accepted only inside the inclusive 0.95..1.05 gate. Missing or implausible content-end evidence falls back to the count-in-shifted native GP tempo map. Checkpoint-linear and selective local DTW remain residual layers on top of this baseline.

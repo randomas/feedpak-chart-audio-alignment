@@ -314,6 +314,133 @@ def diagnose_local_dtw(baseline,checkpoint_report,silence_report,chroma_report,l
     states=[x['decision']['state'] for x in segments];summary={'generated_segments':len(segments),'evaluated_segments':sum('candidate' in x for x in segments),'eligible_segments':sum(s.startswith('rejected_') or s=='would_apply' for s in states),'boundary_assignments':sum(bool(x.get('assigned_boundary_activation')) for x in segments),'boundary_activated_evaluated':sum(bool(x.get('assigned_boundary_activation')) and 'candidate' in x for x in segments),'boundary_activated_skipped':sum(bool(x.get('assigned_boundary_activation')) and 'candidate' not in x for x in segments),'skipped_baseline_accurate':states.count('skipped_baseline_accurate'),'skipped_insufficient_features':states.count('skipped_insufficient_features'),'would_apply':states.count('would_apply'),'rejected':sum(s.startswith('rejected_') for s in states),'maximum_proposed_change_ms':round(max([x.get('path',{}).get('maximum_residual_excursion_ms',0) for x in segments] or [0]),3),'timing_changes_applied':False}
     return {'version':'1.2.1','status':'diagnostic_only','timing_changes_applied':False,'config':asdict(cfg),'summary':summary,'boundaries':bounds,'segments':segments}
 
+def diagnose_segment_source_dtw(baseline, measure_downbeats, score_events, audio_paths,
+                                segment_measures=4, sr=22050, config=None):
+    """Evaluate drums, bass, guitar and piano independently per score segment.
+
+    The full mix owns the global frame. Isolated stems may only add a bounded
+    endpoint-zero local residual inside each configurable measure segment.
+    """
+    cfg=config or LocalDTWConfig()
+    beats=sorted(measure_downbeats,key=lambda x:float(x['t_gp']))
+    step=max(1,int(segment_measures)); boundaries=list(range(0,len(beats),step))
+    if boundaries[-1] != len(beats)-1: boundaries.append(len(beats)-1)
+    sources=('drums','bass','guitar','piano')
+    segments=[]
+    for left,right in zip(boundaries,boundaries[1:]):
+        a,b=beats[left],beats[right]
+        start,end=float(a['t_gp']),float(b['t_gp'])
+        meter=_meter_profile(beats,start,end)
+        rec={'segment_id':f"m{int(a['measure']):03d}-m{int(b['measure']):03d}",
+             'start_measure':int(a['measure']),'end_measure':int(b['measure']),
+             'start_nominal_time':round(start,6),'end_nominal_time':round(end,6),
+             'duration_seconds':round(float(baseline(end)-baseline(start)),4),
+             'meter_derived_beats':round(meter['beat_units'],6),
+             'complete_beat_intervals':meter['complete_intervals'],
+             'partial_start_beat':round(meter['partial_start'],6),
+             'partial_end_beat':round(meter['partial_end'],6),
+             'boundary_sources':{'start':['full_mix_frame'],'end':['full_mix_frame']},
+             'boundary_kinds':{'start':'fixed_segment','end':'fixed_segment'},
+             'assigned_boundary_activation':[],'source_candidates':[]}
+        candidates=[]
+        for source in sources:
+            events=[float(t) for t in score_events.get(source,[]) if start<=float(t)<=end]
+            path=audio_paths.get(source); feat=_features(path,sr,cfg.hop_length)
+            if len(events)<cfg.minimum_symbolic_events or feat is None:
+                rec['source_candidates'].append({'source':source,'state':'unavailable',
+                    'event_count':len(events),'reason':'insufficient_events_or_audio'})
+                continue
+            obs=_fixed_observations(events,feat[2],baseline)
+            bm=_metrics(_residuals(obs,baseline))
+            if len(obs)<cfg.minimum_symbolic_events:
+                rec['source_candidates'].append({'source':source,'state':'unavailable',
+                    'event_count':len(events),'matched_events':len(obs),'reason':'insufficient_fixed_observations'})
+                continue
+            cand,error=_candidate(events,path,baseline,start,end,'fixed','fixed',sr,cfg)
+            if cand is None:
+                rec['source_candidates'].append({'source':source,'state':'rejected',
+                    'event_count':len(events),'baseline':bm,'reason':error}); continue
+            warp=cand.pop('warp'); cm=_metrics(_residuals(obs,warp))
+            med=bm['median_residual_ms']-cm['median_residual_ms']
+            p95=bm['p95_residual_ms']-cm['p95_residual_ms']
+            relative=med/max(bm['median_residual_ms'],1e-9)
+            held={}; degraded=False; corroborated=0
+            for other in sources:
+                if other==source: continue
+                oe=[float(t) for t in score_events.get(other,[]) if start<=float(t)<=end]
+                of=_features(audio_paths.get(other),sr,cfg.hop_length)
+                if len(oe)<cfg.minimum_symbolic_events or of is None: continue
+                fixed=_fixed_observations(oe,of[2],baseline)
+                if len(fixed)<cfg.minimum_symbolic_events: continue
+                before=_metrics(_residuals(fixed,baseline)); after=_metrics(_residuals(fixed,warp))
+                gain=before['median_residual_ms']-after['median_residual_ms']
+                tail=before['p95_residual_ms']-after['p95_residual_ms']
+                bad=gain < -cfg.maximum_median_degradation_ms or tail < -cfg.maximum_p95_degradation_ms
+                degraded|=bad; corroborated+=int(gain>0 and not bad)
+                held[other+'_onsets']={'baseline':before,'candidate':after,
+                    'fixed_observation_count':len(fixed),'coverage_preserved':True,
+                    'median_improvement_ms':round(gain,3),'degraded':bad}
+            meaningful=(med>=cfg.minimum_median_improvement_ms and
+                        p95>=cfg.minimum_p95_improvement_ms and
+                        relative>=cfg.minimum_relative_improvement)
+            safe=(not degraded and cand['maximum_residual_excursion_ms']<=cfg.maximum_residual_excursion_ms)
+            state='would_apply' if meaningful and safe else ('rejected_held_out_degradation' if degraded else 'rejected_no_meaningful_improvement')
+            cm.update({'median_improvement_ms':round(med,3),'p95_improvement_ms':round(p95,3),
+                       'relative_median_improvement':round(relative,4)})
+            item={'source':source,'state':state,'event_count':len(events),'baseline':bm,
+                  'candidate':cm,'held_out_evaluation':held,'corroborating_sources':corroborated,
+                  'path':cand}
+            rec['source_candidates'].append(item)
+            if state=='would_apply':
+                # Prefer larger relative gain, then corroboration, then lower candidate p95.
+                rank=(relative,corroborated,-cm['p95_residual_ms'])
+                candidates.append((rank,source,warp,cand,bm,cm,held))
+        if not candidates:
+            rec['optimization_sources']=[]; rec['held_out_sources']=[]
+            rec['baseline']={'matched_events':0,'median_residual_ms':None,'p95_residual_ms':None,
+                             'maximum_residual_ms':None,'signed_median_residual_ms':None}
+            rec['decision']={'state':'skipped_no_accepted_source','warnings':['no_segment_source_passed_gates']}
+            segments.append(rec); continue
+        _,source,warp,cand,bm,cm,held=max(candidates,key=lambda x:x[0])
+        beat_grid=[(x,y) for x,y,_ in meter['intervals']]
+        measure_times=[float(q['t_gp']) for q in beats if start<=float(q['t_gp'])<=end]
+        measure_st=[(warp(y)-warp(x))/(baseline(y)-baseline(x)) for x,y in zip(measure_times,measure_times[1:]) if baseline(y)>baseline(x)]
+        beat_st=[(warp(y)-warp(x))/(baseline(y)-baseline(x)) for x,y in beat_grid if baseline(y)>baseline(x)]
+        path={**cand,'minimum_measure_stretch':round(min(measure_st or [1]),6),
+              'maximum_measure_stretch':round(max(measure_st or [1]),6),
+              'minimum_beat_stretch':round(min(beat_st or [1]),6),
+              'maximum_beat_stretch':round(max(beat_st or [1]),6),
+              'monotonic':all(warp(y)>warp(x) for x,y in beat_grid),
+              'fixed_start_error_ms':round((warp(start)-baseline(start))*1000,6),
+              'fixed_end_error_ms':round((warp(end)-baseline(end))*1000,6)}
+        valid=(path['monotonic'] and path['minimum_measure_stretch']>=cfg.minimum_measure_stretch and
+               path['maximum_measure_stretch']<=cfg.maximum_measure_stretch and
+               path['minimum_beat_stretch']>=cfg.minimum_beat_stretch and
+               path['maximum_beat_stretch']<=cfg.maximum_beat_stretch)
+        rec.update({'optimization_sources':[source],
+                    'held_out_sources':list(held),'baseline':bm,'candidate':cm,
+                    'held_out_evaluation':held,'path':path,
+                    'simplification':{'raw_path_points':path['raw_path_points'],
+                        'control_points':path['control_points'],'simplified_candidate_still_passes':valid},
+                    'decision':{'state':'would_apply' if valid else 'rejected_stretch_violation',
+                                'warnings':[] if valid else ['beat_or_measure_stretch']}})
+        segments.append(rec)
+    states=[x['decision']['state'] for x in segments]
+    summary={'generated_segments':len(segments),'evaluated_segments':sum(bool(x.get('source_candidates')) for x in segments),
+             'eligible_segments':sum(s=='would_apply' for s in states),'boundary_assignments':0,
+             'boundary_activated_evaluated':0,'boundary_activated_skipped':0,
+             'skipped_baseline_accurate':0,
+             'skipped_insufficient_features':sum(s=='skipped_no_accepted_source' for s in states),
+             'would_apply':states.count('would_apply'),'rejected':sum(s.startswith('rejected_') for s in states),
+             'maximum_proposed_change_ms':round(max([x.get('path',{}).get('maximum_residual_excursion_ms',0) for x in segments] or [0]),3),
+             'timing_changes_applied':False,
+             'selected_sources':{name:sum(x.get('optimization_sources')==[name] for x in segments) for name in sources}}
+    boundaries_out=[{'measure':int(beats[i]['measure']),'nominal_time':float(beats[i]['t_gp']),
+                     'tier':'fixed','evidence':['full_mix_frame'],'boundary_kind':'fixed_segment'} for i in boundaries]
+    return {'version':'2.0','status':'diagnostic_only','timing_changes_applied':False,
+            'config':{**asdict(cfg),'segment_measures':step,'global_frame_source':'full'},
+            'summary':summary,'boundaries':boundaries_out,'segments':segments}
+
 def build_selective_warp(baseline, local_report, measure_downbeats, config=None):
     """Promote only ``would_apply`` local candidates into a production warp.
 
@@ -390,6 +517,18 @@ def build_selective_warp(baseline, local_report, measure_downbeats, config=None)
         'minimum_measure_stretch':round(measure_min,6),'maximum_measure_stretch':round(measure_max,6),
         'fallback_used':not bool(applied)}}
     return final,report
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
