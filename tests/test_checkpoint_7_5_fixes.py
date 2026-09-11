@@ -22,3 +22,6 @@ def test_piano_duration_is_d_and_release_precedes_resume():
     assert notes[0]=={'t':121.9266,'s':2,'f':12,'d':.3852}
     assert 'sus' not in notes[0]
     assert notes[0]['t']+notes[0]['d']<notes[1]['t']
+
+
+

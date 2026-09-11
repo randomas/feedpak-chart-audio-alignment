@@ -118,3 +118,9 @@ def classify_vocal_capability(song, inventory=None, roles=None):
     elif lines: kind,ok,why='flat_untimed_lyrics',False,'song-level lyrics have no beat or recoverable measure timing'
     else: kind,ok,why='notes_only',False,'vocal notes exist without synchronized lyric text'
     return {'classification':kind,'direct_gp_lyrics_supported':ok,'reason':why,'configured_tracks':names,'vocal_note_count':notes,'timed_beat_text_count':len(timed),'timed_beat_text':timed,'nonempty_lyric_lines':lines,'distinct_starting_measures':starts}
+
+
+
+
+
+

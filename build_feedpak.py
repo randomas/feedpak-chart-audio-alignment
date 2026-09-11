@@ -42,6 +42,7 @@ import yaml
 import feedpak_common as fc
 import process_gp_alignment as pga
 import project_config as pc
+import alphatab_score as ats
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_EXTENSIONS = (".ogg", ".wav", ".flac")
@@ -61,8 +62,9 @@ def load_metadata(song_folder):
     return {}
 
 
-def find_gp_file(song_folder):
-    candidates = glob.glob(os.path.join(song_folder, "*.gp5"))
+def find_gp_file(song_folder, gp_parser="gp5"):
+    pattern = "*.gp5" if gp_parser == "gp5" else "*.gp"
+    candidates = glob.glob(os.path.join(song_folder, pattern))
     if not candidates:
         return None
     if len(candidates) > 1:
@@ -181,7 +183,7 @@ def compress_padded_stem(wav_path, out_dir):
 
 
 def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
-                                 min_pad_epsilon=0.005):
+                                 min_pad_epsilon=0.005, initial_bpm=None):
     """
     Ensures every stem has a full 4-beat count-in of silence before the
     song starts, padding with only as much silence as is missing —
@@ -211,7 +213,7 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     os.makedirs(stems_out_dir, exist_ok=True)
 
     if gp_path:
-        bpm = pga.get_initial_tempo(gp_path)
+        bpm = float(initial_bpm) if initial_bpm else pga.get_initial_tempo(gp_path)
     else:
         bpm = 120.0
         fc.log("No .gp5 file to read tempo from; assuming 120 BPM for count-in sizing", indent=1)
@@ -220,7 +222,7 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     # Measure only the full mix when available, then add only the missing
     # difference needed to reach exactly four beats of total leading space.
     if gp_path:
-        bpm = pga.get_initial_tempo(gp_path)
+        bpm = float(initial_bpm) if initial_bpm else pga.get_initial_tempo(gp_path)
     else:
         bpm = 120.0
         fc.log("No .gp5 file to read tempo from; assuming 120 BPM for count-in sizing", indent=1)
@@ -318,8 +320,11 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   timeline_mode="both",
                   allow_severe_alignment=False,anchors_path=None,padding_added=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
-                  checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None):
-    cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path]
+                  checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
+                  gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node"):
+    cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
+    if score_json_path: cmd += ["--score-json",score_json_path]
+    if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
     if drums_path: cmd.append(drums_path)
     cmd += ["--out",out_path,"--sr",str(sr),"--count-in-offset",str(count_in_offset),
             "--timeline-mode",timeline_mode]
@@ -774,15 +779,16 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           vocal_batch_size=16,vocal_compute_type=None,vocal_language=None,
           anchors_path=None,auto_chunk_measures=16,alignment_mode="dtw",
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
-          bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None):
+          bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
+          gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node"):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps=7
     fc.log(f"Building feedpak from: {song_folder}")
-    gp_path=find_gp_file(song_folder); metadata_path=song_json_path or os.path.join(song_folder,"metadata.json")
+    gp_path=find_gp_file(song_folder,gp_parser); metadata_path=song_json_path or os.path.join(song_folder,"metadata.json")
     fc.log_step(0,total_steps,"Inspecting GP5 and validating song configuration")
     gp_vocal_capability={"classification":"no_vocal_material","direct_gp_lyrics_supported":False,"reason":"GP unavailable"}
-    if gp_path and not skip_gp:
+    if gp_path and not skip_gp and gp_parser == "gp5":
         song=pga.guitarpro.parse(gp_path); inventory=pc.inventory_song(song); metadata,created=pc.ensure_song_json(metadata_path,os.path.basename(gp_path),inventory); validation=pc.validate_song_config(metadata,inventory)
         inspection_path=os.path.join(song_folder,"gp5_inspection.json"); fc.write_json(inspection_path,pc.inspect_song(song,gp_path,metadata,inventory,validation))
         if created: fc.log(f"Created song configuration: {metadata_path}",indent=1)
@@ -795,9 +801,17 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         inspection=pc.inspect_song(song,gp_path,metadata,inventory,validation); inspection["vocal_capability"]=gp_vocal_capability; fc.write_json(inspection_path,inspection)
         for item in inventory: fc.log(f"Track {item['index']}: '{item['name']}' -> {roles[item['name']]}",indent=1)
         fc.log(f"GP vocal capability: {gp_vocal_capability['classification']} ({gp_vocal_capability['reason']})",indent=1)
+    elif gp_path and not skip_gp and gp_parser == "alphatab":
+        metadata=load_metadata(song_folder)
+        score_json_path=score_json_path or ats.ensure_json(gp_path,extractor=alphatab_extractor,node=node_executable)
+        alpha_data=ats.load(score_json_path)
+        alpha_roles=ats.resolved_roles(alpha_data,metadata_path if os.path.isfile(metadata_path) else None)
+        vocal_indexes={t["index"] for t in alpha_data.get("tracks",[]) if alpha_roles.get(t.get("name"))=="lead_vocal"}
+        lyric_count=sum(bool(x.get("lyric_fragments")) for x in alpha_data["playback"].get("beat_occurrences",[]) if x.get("track_index") in vocal_indexes)
+        gp_vocal_capability={"classification":"native_timed_lyrics" if lyric_count else "notation_only","direct_gp_lyrics_supported":bool(lyric_count),"reason":f"alphaTab schema-v4 found {lyric_count} timed lyric events"}
     else: metadata=load_metadata(song_folder)
     gp_vocal_configured=bool(((metadata.get("feedpak_project") or {}).get("tracks") or {}).get("lead_vocal"))
-    gp_vocal_production=bool(gp_vocal_configured and gp_vocal_capability.get("direct_gp_lyrics_supported"))
+    gp_vocal_production=bool(gp_vocal_capability.get("direct_gp_lyrics_supported") and (gp_vocal_configured or gp_parser=="alphatab"))
     fc.log_step(1,total_steps,"Discovering stems and metadata")
     stems, vocals_path, drums_path = discover_stems(song_folder, vocals_stem_name, drums_stem_name)
     original_vocals_path=vocals_path
@@ -812,7 +826,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
 
     fc.log_step(2, total_steps, "Count-in check (padding stems if needed)")
     count_in_offset, padding_added, stems_dir, padded_paths = prepare_stems_with_count_in(
-        song_folder, stems, gp_path, work_dir)
+        song_folder, stems, gp_path, work_dir,
+        initial_bpm=((alpha_data.get("metadata") or {}).get("tempo") if gp_parser=="alphatab" and gp_path else None))
     # From here on, use the padded copies for everything — DTW reference,
     # vocal processing input, and duration probing all need to see the
     # same audio that ends up in the archive.
@@ -877,7 +892,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       anchors_path=anchors_path,padding_added=padding_added,
                       auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode,
                       checkpoint_measures=checkpoint_measures,
-                      checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None)
+                      checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None,
+                      gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         if gp_vocal_production:
@@ -966,6 +982,10 @@ def main():
     parser=argparse.ArgumentParser(description="Build a .feedpak from a song folder.")
     parser.add_argument("song_folder"); parser.add_argument("output_folder"); parser.add_argument("--config",default=known.config)
     parser.add_argument("--song-json",default=None)
+    parser.add_argument("--gp-parser",choices=("gp5","alphatab"),default="gp5")
+    parser.add_argument("--score-json",default=None)
+    parser.add_argument("--alphatab-extractor",default=os.path.join(SCRIPT_DIR,"alphatab-extractor","extract-score.mjs"))
+    parser.add_argument("--node-executable",default="node")
     parser.add_argument("--vocals-stem",default=defaults.get("vocals_stem") or "vocals")
     parser.add_argument("--drums-stem",default=defaults.get("drums_stem") or "drums")
     parser.add_argument("--bass-alignment-stem",default=defaults.get("bass_alignment_stem"),help="Stem id used as bass alignment evidence; use 'none' to disable")
@@ -1009,11 +1029,18 @@ def main():
           checkpoint_measures=args.checkpoint_measures,
           checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)),
           bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
-          guitar_alignment_stem=args.guitar_alignment_stem)
+          guitar_alignment_stem=args.guitar_alignment_stem,gp_parser=args.gp_parser,score_json_path=args.score_json,
+          alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
 
 
 

@@ -1,15 +1,32 @@
 from pathlib import Path
 
+
 SOURCE = Path(__file__).resolve().parents[1] / "process_gp_alignment.py"
 
 
 def test_timing_origin_is_initialized_before_report_use():
     source = SOURCE.read_text(encoding="utf-8")
-    init_audio = source.index("audio_content_start = float(count_in_offset)")
-    init_chart = source.index("chart_offset=choose_chart_offset(")
-    report = source.index('decision["timing_origin"]')
-    assert init_audio < init_chart < report
 
+    report = source.index('decision["timing_origin"]')
+
+    alphatab_audio = source.index(
+        "audio_content_start=float(count_in_offset)"
+    )
+    alphatab_chart = source.index(
+        "chart_offset=choose_chart_offset(",
+        alphatab_audio,
+    )
+
+    gp5_audio = source.index(
+        "audio_content_start = float(count_in_offset)"
+    )
+    gp5_chart = source.index(
+        "chart_offset=choose_chart_offset(",
+        gp5_audio,
+    )
+
+    assert alphatab_audio < alphatab_chart < report
+    assert gp5_audio < gp5_chart < report
 
 def test_audio_content_start_and_chart_offset_are_not_reused_as_one_variable():
     source = SOURCE.read_text(encoding="utf-8")
@@ -28,3 +45,6 @@ def test_all_downstream_score_shifts_use_chart_offset():
     ]
     for expression in required:
         assert expression in source
+
+
+

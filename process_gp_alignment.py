@@ -24,6 +24,7 @@ import numpy as np
 import feedpak_common as fc
 import checkpoint_dtw as cdtw
 import project_config as pc
+import alphatab_score as ats
 
 try:
     import guitarpro
@@ -1819,87 +1820,102 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             sr=22050, count_in_offset=0.0, timeline_mode="both",
             allow_severe_alignment=False, anchors_path=None, padding_added=0.0,
             auto_chunk_measures=16, alignment_mode="dtw",
-            checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None):
-    if guitarpro is None:
-        raise RuntimeError("pyguitarpro is required: pip install pyguitarpro")
+            checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
+            gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node"):
+    if gp_parser not in ("gp5", "alphatab"):
+        raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
+    if gp_parser == "alphatab":
+        fc.log(f"Processing modern GP through alphaTab: {gp_path}")
+        json_path = score_json_path or ats.ensure_json(gp_path, extractor=alphatab_extractor, node=node_executable)
+        score_data=ats.load(json_path); ap=ats.products(score_data, project_config_path=project_config_path)
+        tempo_events=ap["tempo_events"]; role_by_name=ap["role_by_name"]; fretted_tracks=ap["fretted_tracks"]
+        drum_hits_gp=ap["drum_hits_gp"]; bass_alignment_events=ap["bass_alignment_events"]; piano_alignment_events=ap["piano_alignment_events"]
+        guitar_alignment_events=ap["guitar_alignment_events"]; bass_pitch_events=ap["bass_pitch_events"]; guitar_pitch_events=ap["guitar_pitch_events"]
+        piano_pitch_events=ap["piano_pitch_events"]; notation_tracks=ap["notation_tracks"]; gp_vocals=ap["gp_vocals"]
+        key_events_gp=ap["key_events_gp"]; song_timeline_gp=ap["song_timeline_gp"]
+        audio_content_start=float(count_in_offset); score_content_time=ap["score_content_time"]
+        chart_offset=choose_chart_offset(audio_content_start,score_content_time)
+        fc.log(f"alphaTab: {ap['track_count']} track(s), {ap['measure_count']} playback measure(s), {len(tempo_events)} tempo segment(s)",indent=1)
+    else:
+        if guitarpro is None:
+            raise RuntimeError("pyguitarpro is required for --gp-parser gp5: pip install pyguitarpro")
+        fc.log(f"Processing GP file: {gp_path}")
+        audio_content_start = float(count_in_offset)
+        if audio_content_start:
+            fc.log(f"Post-padding audio content start: {audio_content_start:.3f}s "
+                   f"(chart offset will be derived after GP parsing)")
+        fc.log_step(1, 5, "Parsing .gp5 structure")
+        with fc.timed_step("guitarpro.parse()", indent=1):
+            song = guitarpro.parse(gp_path)
+        first_tick = song.measureHeaders[0].start if song.measureHeaders else 0
+        tempo_events = rebase_tempo_events(build_tempo_events(song), first_tick)
+        fc.log(f"{len(song.tracks)} track(s), {len(song.measureHeaders)} measure(s), "
+               f"{len(tempo_events)} tempo segment(s) (starting {tempo_events[0][1]:.0f} BPM)",
+               indent=1)
 
-    fc.log(f"Processing GP file: {gp_path}")
-    audio_content_start = float(count_in_offset)
-    if audio_content_start:
-        fc.log(f"Post-padding audio content start: {audio_content_start:.3f}s "
-               f"(chart offset will be derived after GP parsing)")
-    fc.log_step(1, 5, "Parsing .gp5 structure")
-    with fc.timed_step("guitarpro.parse()", indent=1):
-        song = guitarpro.parse(gp_path)
-    first_tick = song.measureHeaders[0].start if song.measureHeaders else 0
-    tempo_events = rebase_tempo_events(build_tempo_events(song), first_tick)
-    fc.log(f"{len(song.tracks)} track(s), {len(song.measureHeaders)} measure(s), "
-           f"{len(tempo_events)} tempo segment(s) (starting {tempo_events[0][1]:.0f} BPM)",
-           indent=1)
+        fc.log_step(2, 5, "Routing tracks (fretted / drum / keyboard)")
+        fretted_tracks = {}
+        drum_hits_gp = []
+        bass_alignment_events = []
+        piano_alignment_events = []
+        guitar_alignment_events = []
+        bass_pitch_events = []
+        guitar_pitch_events = []
+        piano_pitch_events = []
+        notation_tracks = {}
+        gp_vocals = None
+        inventory=pc.inventory_song(song)
+        if project_config_path:
+            with open(project_config_path,"r",encoding="utf-8") as f: project_data=json.load(f)
+            validation=pc.validate_song_config(project_data,inventory)
+            if not validation["valid"]: raise ValueError("Invalid project track configuration: "+json.dumps(validation["errors"],ensure_ascii=False))
+            role_by_name=pc.resolved_roles(project_data,inventory)
+        else: role_by_name={x["name"]:x["automatic_role"] for x in inventory}
 
-    fc.log_step(2, 5, "Routing tracks (fretted / drum / keyboard)")
-    fretted_tracks = {}
-    drum_hits_gp = []
-    bass_alignment_events = []
-    piano_alignment_events = []
-    guitar_alignment_events = []
-    bass_pitch_events = []
-    guitar_pitch_events = []
-    piano_pitch_events = []
-    notation_tracks = {}
-    gp_vocals = None
-    inventory=pc.inventory_song(song)
-    if project_config_path:
-        with open(project_config_path,"r",encoding="utf-8") as f: project_data=json.load(f)
-        validation=pc.validate_song_config(project_data,inventory)
-        if not validation["valid"]: raise ValueError("Invalid project track configuration: "+json.dumps(validation["errors"],ensure_ascii=False))
-        role_by_name=pc.resolved_roles(project_data,inventory)
-    else: role_by_name={x["name"]:x["automatic_role"] for x in inventory}
+        score_content_time=first_configured_instrument_time(
+            song,role_by_name,tempo_events,first_tick)
+        chart_offset=choose_chart_offset(audio_content_start,score_content_time)
+        fc.log(f"Timing origin: audio content {audio_content_start:.3f}s; "
+               f"first configured instrumental score onset {score_content_time:.3f}s; "
+               f"chart offset {chart_offset:+.3f}s",indent=1)
 
-    score_content_time=first_configured_instrument_time(
-        song,role_by_name,tempo_events,first_tick)
-    chart_offset=choose_chart_offset(audio_content_start,score_content_time)
-    fc.log(f"Timing origin: audio content {audio_content_start:.3f}s; "
-           f"first configured instrumental score onset {score_content_time:.3f}s; "
-           f"chart offset {chart_offset:+.3f}s",indent=1)
+        for track in song.tracks:
+            if not track.measures: continue
+            role=role_by_name.get(track.name,"unsupported")
+            if role == "drums":
+                fc.log(f"'{track.name}' -> main drums", indent=1); drum_hits_gp=parse_drum_track(track,tempo_events,first_tick); fc.log(f"{len(drum_hits_gp)} drum hits parsed",indent=2)
+            elif role in ("piano_left","piano_right","piano_combined"):
+                fc.log(f"'{track.name}' -> {role}",indent=1)
+                hand={"piano_left":"left","piano_right":"right","piano_combined":"combined"}[role]
+                notation=parse_keyboard_track(track,tempo_events,first_tick,hand=hand); notation_tracks[_safe_track_id(track)]=notation
+                piano_alignment_events.extend({"t_gp":t} for t in _keyboard_onsets(notation))
+                for measure in notation.get("measures",[]):
+                    for stave in measure.get("staves",{}).values():
+                        for voice in stave.get("voices",[]):
+                            for beat in voice.get("beats",[]):
+                                for note in beat.get("notes",[]): piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
+            elif role == "lead_vocal":
+                capability=pc.classify_vocal_capability(song,inventory,role_by_name)
+                if capability.get("direct_gp_lyrics_supported"):
+                    fc.log(f"'{track.name}' -> GP lead vocal ({capability['classification']})",indent=1)
+                    gp_vocals=parse_gp_vocals(song,track,tempo_events,first_tick)
+                else:
+                    fc.log(f"'{track.name}' -> GP vocal lyrics rejected: {capability['classification']}",indent=1)
+                    fc.log(capability["reason"],indent=2)
+            elif role in ("guitar","bass"):
+                fc.log(f"'{track.name}' -> {role} fretted track",indent=1); data=parse_fretted_track(track,tempo_events,first_tick); fretted_tracks[_safe_track_id(track)]=data
+                if role=="bass":
+                    bass_alignment_events.extend({"t_gp":n["t_gp"]} for n in data["notes"]); bass_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
+                else:
+                    guitar_alignment_events.extend({"t_gp":n["t_gp"]} for n in data["notes"]); guitar_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
+                fc.log(f"{len(data['notes'])} notes, {len(data['anchors'])} anchors",indent=2)
+            else: fc.log(f"'{track.name}' -> {role}; skipped",indent=1)
 
-    for track in song.tracks:
-        if not track.measures: continue
-        role=role_by_name.get(track.name,"unsupported")
-        if role == "drums":
-            fc.log(f"'{track.name}' -> main drums", indent=1); drum_hits_gp=parse_drum_track(track,tempo_events,first_tick); fc.log(f"{len(drum_hits_gp)} drum hits parsed",indent=2)
-        elif role in ("piano_left","piano_right","piano_combined"):
-            fc.log(f"'{track.name}' -> {role}",indent=1)
-            hand={"piano_left":"left","piano_right":"right","piano_combined":"combined"}[role]
-            notation=parse_keyboard_track(track,tempo_events,first_tick,hand=hand); notation_tracks[_safe_track_id(track)]=notation
-            piano_alignment_events.extend({"t_gp":t} for t in _keyboard_onsets(notation))
-            for measure in notation.get("measures",[]):
-                for stave in measure.get("staves",{}).values():
-                    for voice in stave.get("voices",[]):
-                        for beat in voice.get("beats",[]):
-                            for note in beat.get("notes",[]): piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
-        elif role == "lead_vocal":
-            capability=pc.classify_vocal_capability(song,inventory,role_by_name)
-            if capability.get("direct_gp_lyrics_supported"):
-                fc.log(f"'{track.name}' -> GP lead vocal ({capability['classification']})",indent=1)
-                gp_vocals=parse_gp_vocals(song,track,tempo_events,first_tick)
-            else:
-                fc.log(f"'{track.name}' -> GP vocal lyrics rejected: {capability['classification']}",indent=1)
-                fc.log(capability["reason"],indent=2)
-        elif role in ("guitar","bass"):
-            fc.log(f"'{track.name}' -> {role} fretted track",indent=1); data=parse_fretted_track(track,tempo_events,first_tick); fretted_tracks[_safe_track_id(track)]=data
-            if role=="bass":
-                bass_alignment_events.extend({"t_gp":n["t_gp"]} for n in data["notes"]); bass_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
-            else:
-                guitar_alignment_events.extend({"t_gp":n["t_gp"]} for n in data["notes"]); guitar_pitch_events.extend({"t_gp":n["t_gp"],"midi":int(data["absolute_tuning_midi"][n["s"]]+n["f"])} for n in data["notes"])
-            fc.log(f"{len(data['notes'])} notes, {len(data['anchors'])} anchors",indent=2)
-        else: fc.log(f"'{track.name}' -> {role}; skipped",indent=1)
-
-    fc.log_step(3, 5, "Reading key signatures + building song timeline")
-    key_events_gp = build_key_signature_events(song, tempo_events, first_tick)
-    song_timeline_gp = build_song_timeline(song, tempo_events, first_tick)
-    fc.log(f"{len(key_events_gp)} key change event(s), "
-           f"{len(song_timeline_gp['beats'])} measure boundaries", indent=1)
+        fc.log_step(3, 5, "Reading key signatures + building song timeline")
+        key_events_gp = build_key_signature_events(song, tempo_events, first_tick)
+        song_timeline_gp = build_song_timeline(song, tempo_events, first_tick)
+        fc.log(f"{len(key_events_gp)} key change event(s), "
+               f"{len(song_timeline_gp['beats'])} measure boundaries", indent=1)
 
     # Apply the count-in offset to every nominal (GP-clock) time before
     # DTW, so the synthetic click track (built from these same nominal
@@ -2194,8 +2210,12 @@ def _safe_track_id(track):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse a .gp5 file and align it to real audio via DTW.")
-    parser.add_argument("gp_file", help="Path to the .gp5 file")
+    parser = argparse.ArgumentParser(description="Parse a GP score and align it to real audio via DTW.")
+    parser.add_argument("gp_file", help="Path to .gp5, modern .gp, or schema-v4 JSON")
+    parser.add_argument("--gp-parser", choices=("gp5","alphatab"), default="gp5")
+    parser.add_argument("--score-json", default=None)
+    parser.add_argument("--alphatab-extractor", default=None)
+    parser.add_argument("--node-executable", default="node")
     parser.add_argument("drums_audio", nargs="?", default=None, help="Optional isolated drums stem")
     parser.add_argument("--bass-audio", default=None)
     parser.add_argument("--piano-audio", default=None)
@@ -2228,13 +2248,20 @@ def main():
                    anchors_path=args.anchors, padding_added=args.padding_added,
                    auto_chunk_measures=args.auto_chunk_measures,alignment_mode=args.alignment_mode,
                    checkpoint_measures=args.checkpoint_measures,
-                   checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config)
+                   checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config,
+                   gp_parser=args.gp_parser, score_json_path=args.score_json, alphatab_extractor=args.alphatab_extractor, node_executable=args.node_executable)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
 
 
 

@@ -1615,3 +1615,22 @@ GP lyric-line tokens with embedded hyphens are expanded to note-owning syllables
 ## Checkpoint 8.0.1: guarded global linear baseline
 
 Checkpoint modes again fit a start-fixed global linear baseline from the authored score span to the sustained full-mix content end. The proposed scale is accepted only inside the inclusive 0.95..1.05 gate. Missing or implausible content-end evidence falls back to the count-in-shifted native GP tempo map. Checkpoint-linear and selective local DTW remain residual layers on top of this baseline.
+
+
+
+
+
+## Optional alphaTab parser for modern `.gp` files
+
+The existing PyGuitarPro `.gp5` parser remains the default and is unchanged. Opt in with:
+
+```powershell
+python build_feedpak.py SONG_FOLDER OUTPUT_FOLDER `
+  --gp-parser alphatab `
+  --alphatab-extractor .\alphatab-extractor\extract-score.mjs
+```
+
+A pre-extracted schema-v4 JSON can be supplied with `--score-json`. The adapter expands the playback timeline, including repeats, and maps the result into the existing alignment and Feedpak writing stages.
+
+
+

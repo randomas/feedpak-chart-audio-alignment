@@ -23,3 +23,6 @@ def test_start_is_fixed(monkeypatch):
     monkeypatch.setattr(p,'detect_audio_content_end',lambda *a,**k:(10.2,{'available':True}))
     warp,r=p.build_guarded_global_span_warp(b,'x',2.5)
     assert warp(2.5)==2.5
+
+
+
