@@ -11,24 +11,3 @@ def test_piano_fixed_anchor():
     out=pga.playable_keyboard_from_notation(notation)
     assert out["anchors"]==[{"time":0.0,"fret":1,"width":4}]
     assert out["notes"]==[{"t":2.0,"s":2,"f":12,"d":0.5}]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

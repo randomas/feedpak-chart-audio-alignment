@@ -13,6 +13,7 @@ import re
 import subprocess
 
 import feedpak_common as fc
+import expression_encoding as ee
 
 SUPPORTED_SCHEMA = 4
 
@@ -137,6 +138,20 @@ def _safe_id(name, index):
     return stem or f"track_{index + 1}"
 
 
+def _effective_duration_ticks(event, note=None):
+    """Return note release length in ticks, honoring alphaTab durationPercent."""
+    ticks = max(0.0, float(event.get("duration_ticks") or 0.0))
+    value = event.get("duration_percent")
+    if value is None and note is not None:
+        value = (note.get("duration") or {}).get("percent")
+    if value is None:
+        return ticks
+    ratio = max(0.0, float(value))
+    if ratio > 1.0:
+        ratio /= 100.0
+    return ticks * ratio
+
+
 def _drum_midi(event):
     percussion = event.get("percussion") or {}
     value = percussion.get("output_midi_number")
@@ -152,11 +167,13 @@ def products(data, project_config_path=None):
     tracks = {int(t["index"]): t for t in data.get("tracks", [])}
 
     notes_by_id = {}
+    beats_by_id = {}
     for track in tracks.values():
         for staff in track.get("staves", []):
             for bar in staff.get("bars", []):
                 for voice in bar.get("voices", []):
                     for beat in voice.get("beats", []):
+                        beats_by_id[beat.get("id")] = beat
                         for note in beat.get("notes", []):
                             notes_by_id[note.get("id")] = note
 
@@ -184,42 +201,39 @@ def products(data, project_config_path=None):
             props = (track.get("staves") or [{}])[0].get("properties", {})
             tuning = [int(x) for x in (props.get("tuning") or [])]
             out = []
-            for event in events:
-                start = _seconds(event["absolute_start_tick"], tempo, ppq)
-                end = _seconds(
-                    event["absolute_start_tick"] + event.get("duration_ticks", 0),
-                    tempo,
-                    ppq,
-                )
-                string = event.get("string")
-                fret = event.get("fret")
-                if string is None or fret is None:
-                    continue
-                # alphaTab strings are one-based in the same low-to-high order
-                # used by Feedpak's zero-based lanes. Do not mirror by count.
+            ordered_events = sorted(events, key=lambda x: (int(x.get("occurrence", 0)), float(x.get("absolute_start_tick", 0)), int(x.get("string") or 0)))
+            event_lookup = {(int(x.get("occurrence", 0)), x.get("note_id")): x for x in ordered_events}
+            next_fret = {}
+            lanes = {}
+            for x in ordered_events: lanes.setdefault((int(x.get("occurrence", 0)), x.get("string")), []).append(x)
+            for lane in lanes.values():
+                for current, following in zip(lane, lane[1:]): next_fret[id(current)] = following.get("fret")
+            for event in ordered_events:
+                semantic = notes_by_id.get(event.get("note_id")) or {}
+                links = semantic.get("links") or {}
+                if links.get("is_tie_destination"): continue
+                start_tick = float(event["absolute_start_tick"]); duration_ticks = _effective_duration_ticks(event, semantic)
+                destination_id = links.get("tie_destination_id"); seen = set()
+                while destination_id is not None and destination_id not in seen:
+                    seen.add(destination_id); continuation = event_lookup.get((int(event.get("occurrence", 0)), destination_id)); continuation_note = notes_by_id.get(destination_id) or {}
+                    if continuation is None: break
+                    duration_ticks = max(duration_ticks, float(continuation["absolute_start_tick"]) + _effective_duration_ticks(continuation, continuation_note) - start_tick)
+                    destination_id = (continuation_note.get("links") or {}).get("tie_destination_id")
+                start = _seconds(start_tick, tempo, ppq); end = _seconds(start_tick + duration_ticks, tempo, ppq)
+                string, fret = event.get("string"), event.get("fret")
+                if string is None or fret is None: continue
                 string_index = int(string) - 1
-                if string_index < 0:
-                    continue
-                out.append(
-                    {
-                        "t_gp": start,
-                        "s": string_index,
-                        "f": int(fret),
-                        # Keep an ordinary nominal sustain in the common model.
-                        # Expression/tie handling can refine this later.
-                        "sus": max(0.0, end - start),
-                    }
-                )
-                onset = {"t_gp": start}
-                pitch = {"t_gp": start, "midi": int(event["pitch_midi"])}
-                (bass_on if role == "bass" else guitar_on).append(onset)
-                (bass_pitch if role == "bass" else guitar_pitch).append(pitch)
+                if string_index < 0: continue
+                row = {"t_gp": start, "s": string_index, "f": int(fret), "sus": max(0.0, end-start)}
+                row.update(ee.encode_alphatab(semantic, {**event, "sus": row["sus"]}, next_fret.get(id(event)), beats_by_id.get(event.get("beat_id"))))
+                out.append(row)
             fretted[tid] = {
                 "name": name,
                 "absolute_tuning_midi": tuning,
                 "capo": int(props.get("capo") or 0),
                 "notes": out,
                 "anchors": [],
+                "expression_diagnostics": {"encoded": ee.count_fields(out)},
             }
 
         elif role == "drums":
@@ -261,7 +275,7 @@ def products(data, project_config_path=None):
                     midi = int(event["pitch_midi"])
                     staff_id = "lh" if hand == "left" else "rh" if hand == "right" else ("rh" if midi >= 60 else "lh")
                     start = _seconds(event["absolute_start_tick"], tempo, ppq)
-                    end = _seconds(event["absolute_start_tick"] + event.get("duration_ticks", 0), tempo, ppq)
+                    end = _seconds(event["absolute_start_tick"] + _effective_duration_ticks(event, notes_by_id.get(event.get("note_id"))), tempo, ppq)
                     voice_beats[staff_id].append({"t_gp": start, "notes": [{"midi": midi, "end_gp": end}]})
                     piano_on.append({"t_gp": start})
                     piano_pitch.append({"t_gp": start, "midi": midi})
@@ -351,3 +365,6 @@ def products(data, project_config_path=None):
             "unresolved_articulations": dict(unresolved_drums),
         },
     }
+
+
+

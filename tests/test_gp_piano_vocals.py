@@ -30,24 +30,3 @@ class GPInterpreterTests(unittest.TestCase):
   self.assertEqual(v['diagnostics']['bars_skipped'],1)
   self.assertEqual([x['w'] for x in v['lyrics']],['hello','again'])
 if __name__=='__main__': unittest.main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

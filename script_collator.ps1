@@ -20,5 +20,3 @@ foreach ($File in $Files) {
 }
 
 Write-Host "Exported $($Files.Count) file(s) to $OutputFile"
-
-

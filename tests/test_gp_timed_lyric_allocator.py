@@ -30,15 +30,3 @@ def test_anchor_without_near_note_is_reported():
     lyrics,pitch,diag=allocate_timed_gp_lyrics(slots,anchors)
     assert lyrics==[] and pitch==[]
     assert diag["anchors_without_notes"][0]["reason"]=="no_vocal_note_near_anchor"
-
-
-
-
-
-
-
-
-
-
-
-

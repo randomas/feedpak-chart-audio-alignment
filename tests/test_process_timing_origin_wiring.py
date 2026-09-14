@@ -45,6 +45,3 @@ def test_all_downstream_score_shifts_use_chart_offset():
     ]
     for expression in required:
         assert expression in source
-
-
-

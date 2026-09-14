@@ -31,6 +31,3 @@ class SegmentBoundaryTests(unittest.TestCase):
         self.assertEqual(r['config']['global_frame_source'],'full')
 
 if __name__=='__main__': unittest.main()
-
-
-

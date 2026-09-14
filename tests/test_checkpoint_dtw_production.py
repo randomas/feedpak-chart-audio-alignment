@@ -37,24 +37,3 @@ class ProductionWarpTests(unittest.TestCase):
   self.assertFalse(report['validation']['overlap_free']);self.assertFalse(report['timing_changes_applied'])
 
 if __name__=='__main__':unittest.main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

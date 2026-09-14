@@ -35,21 +35,3 @@ def test_note_is_not_reused_by_adjacent_syllable():
     notes=[{"t":0.0,"d":0.5,"midi":60},{"t":0.5,"d":0.5,"midi":62}]
     got=b.expand_lyrics_with_pitch_continuations(words,notes)
     assert [x["w"] for x in got]==["a-","part"]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

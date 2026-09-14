@@ -196,6 +196,9 @@ function buildPlayback(score, settings) {
                                 playback_master_bar_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence,
                                 track_index: context.track_index ?? null, staff_index: context.staff_index ?? null, voice_index: context.voice_index ?? null, beat_index: context.beat_index ?? null,
                                 beat_id: context.beat_id ?? null, note_id: num(note.id), absolute_start_tick: absoluteStart, duration_ticks: num(beat?.playbackDuration),
+                                duration_percent: num(note.durationPercent, 1),
+                                tie_origin_id: num(note.tieOrigin?.id), tie_destination_id: num(note.tieDestination?.id),
+                                is_tie_origin: Boolean(note.tieDestination), is_tie_destination: Boolean(note.tieOrigin),
                                 pitch_midi: num(note.realValue ?? note.displayValue ?? note.value), string: num(note.string), fret: num(note.fret), percussion
                             });
                         }
@@ -205,7 +208,24 @@ function buildPlayback(score, settings) {
                 beatLookup = beatLookup.nextBeat;
             }
         });
-        for (const visit of visits) for (const change of arr(visit.tempoChanges)) output.tempo_events.push({ tick: num(visit.start, 0) + num(change.tick ?? change.offset, 0), tempo: num(change.tempo ?? change.value) });
+        for (const visit of visits) {
+            for (const change of arr(visit.tempoChanges)) {
+                // alphaTab exposes change.tick on the absolute playback timeline.
+                // Add the visit start only when the API provides a bar-relative
+                // offset instead. Adding visit.start to change.tick doubled every
+                // nonzero tempo-change position.
+                const absoluteTick = num(change.tick);
+                const relativeOffset = num(change.offset);
+                const tick = absoluteTick !== null
+                    ? absoluteTick
+                    : num(visit.start, 0) + num(relativeOffset, 0);
+
+                output.tempo_events.push({
+                    tick,
+                    tempo: num(change.tempo ?? change.value)
+                });
+            }
+        }
         output.tempo_events = output.tempo_events.filter((x) => x.tempo !== null).sort((a, b) => a.tick - b.tick).filter((x, i, all) => i === 0 || x.tick !== all[i - 1].tick || x.tempo !== all[i - 1].tempo);
         output.sync_points = arr(generator.syncPoints).map((p) => ({ bar_index: num(p.barIndex), bar_position: num(p.barPosition), millisecond_offset: num(p.millisecondOffset), absolute_time: num(p.absoluteTime) }));
         output.available = true;
@@ -287,3 +307,6 @@ async function main() {
 }
 
 main().catch((error) => { console.error(error instanceof Error ? error.stack : String(error)); process.exit(1); });
+
+
+

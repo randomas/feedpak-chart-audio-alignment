@@ -12,6 +12,3 @@ def test_source_can_be_disabled_without_removing_packaged_stem():
 def test_automatic_alias_fallback_is_preserved():
     paths={"keys":"Keys.ogg"}
     assert b.select_stem_path(paths,None,("piano","keys","keyboard"))=="Keys.ogg"
-
-
-

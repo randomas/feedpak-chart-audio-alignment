@@ -25,6 +25,7 @@ import feedpak_common as fc
 import checkpoint_dtw as cdtw
 import project_config as pc
 import alphatab_score as ats
+import expression_encoding as ee
 
 try:
     import guitarpro
@@ -798,109 +799,29 @@ def shift_nominal_times(entries, offset, time_key="t_gp"):
 # --------------------------------------------------------------------------
 
 def parse_fretted_track(track, tempo_events, first_tick):
-    string_count = len(track.strings)
-    notes = []
-
+    string_count=len(track.strings); pending=[]
     for measure in track.measures:
         for voice in measure.voices:
             for beat in voice.beats:
-                if beat.start is None:
-                    continue
-                beat_t = fc.tick_to_seconds(beat.start - first_tick, tempo_events)
-                dur_ticks = beat.duration.time
-                beat_end_t = fc.tick_to_seconds(
-                    beat.start - first_tick + dur_ticks, tempo_events
-                )
-                sustain = beat_end_t - beat_t
-
-                for note in beat.notes:
-                    s = fc.remap_string_index(note.string, string_count)
-                    entry = {"t_gp": beat_t, "s": s, "f": note.value}
-                    fc.omit_if_negligible(entry, "sus", sustain, SUSTAIN_MIN_SECONDS)
-                    notes.append(entry)
-
-    notes.sort(key=lambda n: (n["t_gp"], n["s"]))
-
-    absolute_midi = sorted(
-        (gs.number, gs.value) for gs in track.strings
-    )
-    # track.strings numbers are 1-based highest-first, same convention as
-    # notes; sort ascending by string number then reverse to get low->high
-    absolute_midi_low_to_high = [v for _, v in sorted(absolute_midi, key=lambda x: -x[0])]
-
-    anchors = compute_anchors(notes)
-
-    return {
-        "name": track.name or ("Bass" if track.channel and track.channel.instrument in (33, 34, 35, 36, 37, 38, 39) else "Guitar"),
-        "string_count": string_count,
-        "absolute_tuning_midi": absolute_midi_low_to_high,
-        "capo": getattr(track, "offset", 0) or 0,
-        "notes": notes,
-        "anchors": anchors,
-    }
-
-
-def compute_anchors(notes, window_seconds=2.0):
-    """
-    Hand-position anchors, computed dynamically from played notes since
-    there's no native GP marker for this (ported from a prior converter's
-    tested heuristic — see architecture doc §2.2a).
-    """
-    from collections import Counter
-
-    fretted = [n for n in notes if n["f"] > 0]
-    if not fretted:
-        return [{"time": 0.0, "fret": 1, "width": 4}]
-
-    grouped = {}
-    for n in fretted:
-        grouped.setdefault(n["t_gp"], []).append(n)
-
-    timestamps = sorted(grouped.keys())
-    anchors = []
-    last_fret = None
-    last_width = None
-    start_idx = 0
-
-    while start_idx < len(timestamps):
-        window_start = timestamps[start_idx]
-        window_end = window_start + window_seconds
-
-        window_frets = []
-        chord_found = False
-        chord_lowest = chord_highest = None
-
-        end_idx = start_idx
-        while end_idx < len(timestamps) and timestamps[end_idx] <= window_end:
-            simultaneous = grouped[timestamps[end_idx]]
-            if len(simultaneous) > 1:
-                chord_found = True
-                chord_lowest = min(n["f"] for n in simultaneous)
-                chord_highest = max(n["f"] for n in simultaneous)
-                break
-            window_frets.append(simultaneous[0]["f"])
-            end_idx += 1
-
-        if chord_found:
-            target_fret = chord_lowest
-            target_width = max(4, chord_highest - chord_lowest + 1)
-            start_idx = end_idx + 1
-        else:
-            if not window_frets:
-                start_idx = end_idx + 1
-                continue
-            counts = Counter(window_frets)
-            top_count = counts.most_common(1)[0][1]
-            target_fret = min(f for f, c in counts.items() if c == top_count)
-            close_frets = [f for f in window_frets if abs(f - target_fret) <= 4]
-            target_width = max(4, max(close_frets) - min(close_frets) + 1) if close_frets else 4
-            start_idx = end_idx
-
-        if target_fret != last_fret or target_width != last_width:
-            anchors.append({"time": window_start, "fret": target_fret, "width": target_width})
-            last_fret, last_width = target_fret, target_width
-
-    return anchors if anchors else [{"time": 0.0, "fret": 1, "width": 4}]
+                if beat.start is None: continue
+                t=fc.tick_to_seconds(beat.start-first_tick,tempo_events); end=fc.tick_to_seconds(beat.start-first_tick+beat.duration.time,tempo_events)
+                for note in beat.notes: pending.append({"note":note,"beat":beat,"t_gp":t,"s":fc.remap_string_index(note.string,string_count),"f":int(note.value),"sus":max(0,end-t)})
+    pending.sort(key=lambda x:(x["t_gp"],x["s"])); lanes={}
+    for x in pending:lanes.setdefault(x["s"],[]).append(x)
+    next_fret={}
+    for lane in lanes.values():
+        for x,y in zip(lane,lane[1:]):next_fret[id(x)]=y["f"]
+    notes=[]
+    for item in pending:
+        note=item["note"]
+        if "tie" in ee.enum_name(getattr(note,"type",None)):
+            previous=next((x for x in reversed(notes) if x["s"]==item["s"]),None)
+            if previous is not None:previous["sus"]=max(float(previous.get("sus",0)),item["t_gp"]+item["sus"]-previous["t_gp"])
+            continue
+        row={"t_gp":item["t_gp"],"s":item["s"],"f":item["f"]};fc.omit_if_negligible(row,"sus",item["sus"],SUSTAIN_MIN_SECONDS)
+        row.update(ee.encode_gp5(note,item["beat"],item["sus"],next_fret.get(id(item))));notes.append(row)
+    absolute=sorted((gs.number,gs.value) for gs in track.strings);tuning=[v for _,v in sorted(absolute,key=lambda x:-x[0])]
+    return {"name":track.name,"absolute_tuning_midi":tuning,"capo":getattr(track,"offset",0) or 0,"notes":notes,"anchors":compute_anchors(notes),"expression_diagnostics":{"encoded":ee.count_fields(notes)}}
 
 
 # --------------------------------------------------------------------------
@@ -1144,10 +1065,29 @@ def midi_to_virtual_position(midi):
     return midi // 24, midi % 24
 
 
-def playable_keyboard_from_notation(notation):
+def _quantize_piano_duration(duration, quantum_ms):
+    """Quantize one positive exported piano duration; 0 disables the feature."""
+    value=max(0.0,float(duration))
+    quantum=float(quantum_ms or 0.0)/1000.0
+    if value <= 0.0 or quantum <= 0.0:
+        return value
+    return max(quantum, round(value/quantum)*quantum)
+
+def _piano_duration_diagnostics(before, after, quantum_ms):
+    def key(x): return round(float(x),6)
+    a=sorted({key(x) for x in before if x > 0})
+    b=sorted({key(x) for x in after if x > 0})
+    return {"enabled":bool(float(quantum_ms or 0)>0),"quantum_ms":float(quantum_ms or 0),
+            "note_count":len(before),"positive_duration_count":sum(x>0 for x in before),
+            "unique_before_count":len(a),"unique_after_count":len(b),
+            "unique_before_seconds":a,"unique_after_seconds":b}
+
+def playable_keyboard_from_notation(notation, piano_duration_quantize_ms=0.0):
     """Flatten one configured GP piano track into an RB3-compatible keys lane."""
     notes = []
     skipped_out_of_range = 0
+    durations_before = []
+    durations_after = []
     for measure in notation.get("measures", []):
         for stave in measure.get("staves", {}).values():
             for voice in stave.get("voices", []):
@@ -1159,10 +1099,17 @@ def playable_keyboard_from_notation(notation):
                         except ValueError:
                             skipped_out_of_range += 1
                             continue
+                        raw_duration = max(0.0, float(raw.get("d", 0.0)))
+                        duration = _quantize_piano_duration(raw_duration, piano_duration_quantize_ms)
+                        durations_before.append(raw_duration)
+                        durations_after.append(duration)
                         note = {"t": round(start, 4), "s": string, "f": fret}
-                        fc.omit_if_negligible(
-                            note, "d", float(raw.get("d", 0.0)), SUSTAIN_MIN_SECONDS
-                        )
+                        # Notation notes use ``d`` internally, but playable
+                        # arrangement notes use the Feedpak sustain field
+                        # ``sus``. Preserve every positive piano release and do
+                        # not apply the guitar sustain threshold here.
+                        if duration > 0.0:
+                            note["sus"] = round(duration, 4)
                         notes.append(note)
     notes.sort(key=lambda n: (n["t"], n["s"], n["f"]))
     if skipped_out_of_range:
@@ -1183,6 +1130,7 @@ def playable_keyboard_from_notation(notation):
         "anchors": [{"time": 0.0, "fret": 1, "width": 4}],
         "handshapes": [],
         "templates": [],
+        "piano_duration_diagnostics": _piano_duration_diagnostics(durations_before, durations_after, piano_duration_quantize_ms),
     }
 
 def shift_and_warp_notation(notation, offset, warp_fn):
@@ -1821,7 +1769,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             allow_severe_alignment=False, anchors_path=None, padding_added=0.0,
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
-            gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node"):
+            gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
+            piano_duration_quantize_ms=0.0):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
     if gp_parser == "alphatab":
@@ -2176,13 +2125,18 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             "anchors": warped_anchors,
             "handshapes": [],
             "templates": [],
+            "expression_diagnostics": data.get("expression_diagnostics", {"encoded": ee.count_fields(warped_notes)}),
         }
-        fc.log(f"'{data['name']}' warped ({len(warped_notes)} notes)", indent=1)
+        fc.log(f"'{data['name']}' warped ({len(warped_notes)} notes); Tier 1 expressions: {arrangements_out[track_id]['expression_diagnostics'].get('encoded', {})}", indent=1)
 
     warped_notation = {}
     for track_id, notation in notation_tracks.items():
         warped_notation[track_id] = shift_and_warp_notation(notation, chart_offset, warp_fn)
-        arrangements_out[track_id] = playable_keyboard_from_notation(warped_notation[track_id])
+        arrangements_out[track_id] = playable_keyboard_from_notation(
+            warped_notation[track_id], piano_duration_quantize_ms=piano_duration_quantize_ms)
+        piano_diag=arrangements_out[track_id].pop("piano_duration_diagnostics")
+        alignment_report.setdefault("piano_duration_quantization", {})[track_id]=piano_diag
+        fc.log(f"Piano duration quantization {track_id}: {piano_diag['unique_before_count']} -> {piano_diag['unique_after_count']} unique durations (quantum={piano_diag['quantum_ms']}ms)",indent=2)
         fc.log(f"'{track_id}' notation and playable piano lane warped ({len(arrangements_out[track_id]['notes'])} notes)", indent=1)
     result = {
         "arrangements": arrangements_out,
@@ -2232,6 +2186,8 @@ def main():
     parser.add_argument("--checkpoint-measures",type=int,default=4)
     parser.add_argument("--checkpoint-search-radius",type=float,default=1.0)
     parser.add_argument("--project-config",default=None)
+    parser.add_argument("--piano-duration-quantize-ms",type=float,default=0.0,
+                        help="Quantize exported piano note durations to this millisecond grid; 0 disables")
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)
     parser.add_argument("--count-in-offset", type=float, default=0.0,
@@ -2249,31 +2205,14 @@ def main():
                    auto_chunk_measures=args.auto_chunk_measures,alignment_mode=args.alignment_mode,
                    checkpoint_measures=args.checkpoint_measures,
                    checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config,
-                   gp_parser=args.gp_parser, score_json_path=args.score_json, alphatab_extractor=args.alphatab_extractor, node_executable=args.node_executable)
+                   gp_parser=args.gp_parser, score_json_path=args.score_json, alphatab_extractor=args.alphatab_extractor, node_executable=args.node_executable,
+                   piano_duration_quantize_ms=args.piano_duration_quantize_ms)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

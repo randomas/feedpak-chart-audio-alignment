@@ -1631,6 +1631,3 @@ python build_feedpak.py SONG_FOLDER OUTPUT_FOLDER `
 ```
 
 A pre-extracted schema-v4 JSON can be supplied with `--score-json`. The adapter expands the playback timeline, including repeats, and maps the result into the existing alignment and Feedpak writing stages.
-
-
-

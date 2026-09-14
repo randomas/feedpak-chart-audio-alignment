@@ -12,9 +12,7 @@ v1 scope (see architecture doc §2.4 for full rationale):
   - rigs.json / tones: NOT generated. Arrangement JSON omits `tones`
     entirely for v1, so there's nothing that can dangle-reference a
     missing rig id.
-  - Technique fields (bends, slides, ho/po, fingering): NOT extracted.
-    Arrangement notes are strictly {t, s, f, sus} for v1, per project
-    decision to solve timing/sync first.
+  - Tier 1 fretted expressions use Feedpak 1.19 short fields.
   - keys.json: generated, deterministically, from GP measure key
     signatures (see process_gp_alignment.py).
 
@@ -321,7 +319,8 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   allow_severe_alignment=False,anchors_path=None,padding_added=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
-                  gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node"):
+                  gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
+                  piano_duration_quantize_ms=0.0):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -339,6 +338,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
             "--checkpoint-measures",str(checkpoint_measures),
             "--checkpoint-search-radius",str(checkpoint_search_radius)]
     if project_config_path: cmd += ["--project-config",project_config_path]
+    cmd += ["--piano-duration-quantize-ms",str(float(piano_duration_quantize_ms or 0.0))]
     fc.log("Launching guarded multi-reference GP/audio alignment")
     subprocess.run(cmd,check=True)
 
@@ -730,7 +730,8 @@ def load_project_defaults(path):
             "checkpoint_measures":alignment.get("checkpoint_measures"),
             "checkpoint_search_radius":alignment.get("checkpoint_search_radius"),
             "allow_severe_alignment":alignment.get("allow_severe"),
-            "timeline_mode":timeline.get("mode"),"keep_work_dir":build.get("keep_work_dir")}
+            "timeline_mode":timeline.get("mode"),"keep_work_dir":build.get("keep_work_dir"),
+            "piano_duration_quantize_ms":build.get("piano_duration_quantize_ms")}
 
 
 def project_document(args):
@@ -746,7 +747,8 @@ def project_document(args):
                          "checkpoint_search_radius":args.checkpoint_search_radius,
                          "allow_severe":args.allow_severe_alignment},
             "timeline":{"mode":args.timeline_mode},
-            "build":{"keep_work_dir":args.keep_work_dir}}
+            "build":{"keep_work_dir":args.keep_work_dir,
+                     "piano_duration_quantize_ms":args.piano_duration_quantize_ms}}
 
 
 def write_project_version(song_folder, document, current_path=None):
@@ -780,7 +782,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           anchors_path=None,auto_chunk_measures=16,alignment_mode="dtw",
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
-          gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node"):
+          gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
+          piano_duration_quantize_ms=0.0):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps=7
@@ -883,6 +886,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     arrangements = []
     drum_tab_file=keys_file=song_timeline_file=None
     alignment_report=None
+    expression_report=None
     if gp_path and (drums_path or bass_path or piano_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
         run_gp_script(gp_path,drums_path,gp_intermediate,count_in_offset=count_in_offset,
@@ -893,7 +897,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode,
                       checkpoint_measures=checkpoint_measures,
                       checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None,
-                      gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable)
+                      gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable,
+                      piano_duration_quantize_ms=piano_duration_quantize_ms)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         if gp_vocal_production:
@@ -910,6 +915,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         song_timeline_file=write_song_timeline(gp_data,work_dir)
         embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,arrangements)
         alignment_report=gp_data.get("alignment_report")
+        expression_report=gp_data.get("expression_report")
         fc.log(f"Wrote {len(arrangements)} arrangement entr(y/ies), "
                f"drum_tab={'yes' if drum_tab_file else 'no'}, "
                f"keys={'yes' if keys_file else 'no'}, "
@@ -951,6 +957,10 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.log(f"Wrote alignment report: {report_path}",indent=1)
     else:
         fc.log("No alignment report returned by process_gp_alignment.py",indent=1)
+    if expression_report:
+        expression_report_path=output_path+".expression_report.json"
+        fc.write_json(expression_report_path,expression_report)
+        fc.log(f"Wrote expression report: {expression_report_path}",indent=1)
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     fc.log(f"Wrote {output_path} ({size_mb:.1f} MB)", indent=1)
 
@@ -1009,6 +1019,9 @@ def main():
     parser.add_argument("--vocal-compute-type",default=defaults.get("vocal_compute_type"))
     parser.add_argument("--vocal-language",default=defaults.get("vocal_language"))
     parser.add_argument("--keep-work-dir",action="store_true",default=bool(defaults.get("keep_work_dir",False)))
+    parser.add_argument("--piano-duration-quantize-ms",type=float,
+                        default=float(defaults.get("piano_duration_quantize_ms") or 0.0),
+                        help="Quantize exported piano durations to this millisecond grid; 0 disables")
     args=parser.parse_args()
 
     # Explicit CLI values have already overridden project-derived parser defaults.
@@ -1030,29 +1043,12 @@ def main():
           checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)),
           bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
           guitar_alignment_stem=args.guitar_alignment_stem,gp_parser=args.gp_parser,score_json_path=args.score_json,
-          alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable)
+          alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
+          piano_duration_quantize_ms=args.piano_duration_quantize_ms)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
