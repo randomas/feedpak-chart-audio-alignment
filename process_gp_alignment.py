@@ -2159,6 +2159,11 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                  if key_events else None,
         "song_timeline": song_timeline,
         "alignment_report": alignment_report,
+        "expression_report": {
+            track_id: arrangement.get("expression_diagnostics", {"encoded": ee.count_fields(arrangement.get("notes", []))})
+            for track_id, arrangement in arrangements_out.items()
+            if arrangement.get("type") != "piano"
+        },
         "gp_vocals": warp_gp_vocals(gp_vocals,chart_offset,warp_fn) if gp_vocals else None,
     }
     fc.log(f"Done: {len(arrangements_out)} fretted arrangement(s), "

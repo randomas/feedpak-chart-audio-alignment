@@ -152,6 +152,76 @@ def _effective_duration_ticks(event, note=None):
     return ticks * ratio
 
 
+
+
+def _playback_segment_metadata(playback):
+    """Return visit->segment and segment end ticks for contiguous source playback.
+
+    A new segment starts whenever playback does not advance to the next written
+    master bar. This includes backward repeats and alternate-ending jumps.
+    Ties and note releases must not resolve across those discontinuities.
+    """
+    visits = sorted(
+        playback.get("master_bar_visits", []),
+        key=lambda x: int(x.get("playback_index", 0)),
+    )
+    segment_by_visit = {}
+    segment_end_tick = {}
+    segment = 0
+    previous_source = None
+    for visit in visits:
+        playback_index = int(visit.get("playback_index", 0))
+        source_index = int(visit.get("source_master_bar_index", -1))
+        explicit = visit.get("playback_segment_index")
+        if explicit is not None:
+            segment = int(explicit)
+        elif previous_source is not None and source_index != previous_source + 1:
+            segment += 1
+        segment_by_visit[playback_index] = segment
+        segment_end_tick[segment] = float(visit.get("end_tick") or visit.get("start_tick") or 0.0)
+        previous_source = source_index
+    return segment_by_visit, segment_end_tick
+
+
+def _event_playback_identity(event, segment_by_visit):
+    """Identity of one note occurrence on the expanded playback timeline."""
+    playback_index = int(event.get("playback_master_bar_index", -1))
+    segment = int(event.get("playback_segment_index", segment_by_visit.get(playback_index, 0)))
+    return (
+        segment,
+        int(event.get("track_index", -1)),
+        int(event.get("staff_index", -1)),
+        int(event.get("voice_index", -1)),
+        event.get("note_id"),
+    )
+
+
+def _resolved_tied_duration_ticks(event, semantic, notes_by_key, event_lookup,
+                                    segment_by_visit, segment_end_tick):
+    """Resolve a tie chain within one continuous playback segment only."""
+    start_tick = float(event.get("absolute_start_tick") or 0.0)
+    playback_index = int(event.get("playback_master_bar_index", -1))
+    segment = int(event.get("playback_segment_index", segment_by_visit.get(playback_index, 0)))
+    end_limit = float(segment_end_tick.get(segment, float("inf")))
+    duration_ticks = _effective_duration_ticks(event, semantic)
+    resolved_end = min(start_tick + duration_ticks, end_limit)
+    destination_id = (semantic.get("links") or {}).get("tie_destination_id")
+    seen = set()
+    base = _event_playback_identity(event, segment_by_visit)[:-1]
+    while destination_id is not None and destination_id not in seen:
+        seen.add(destination_id)
+        continuation = event_lookup.get(base + (destination_id,))
+        continuation_note = notes_by_key.get((base[1], destination_id)) or {}
+        if continuation is None:
+            break
+        continuation_start = float(continuation.get("absolute_start_tick") or 0.0)
+        if continuation_start < start_tick or continuation_start >= end_limit:
+            break
+        continuation_end = continuation_start + _effective_duration_ticks(continuation, continuation_note)
+        resolved_end = min(max(resolved_end, continuation_end), end_limit)
+        destination_id = (continuation_note.get("links") or {}).get("tie_destination_id")
+    return max(0.0, resolved_end - start_tick)
+
 def _drum_midi(event):
     percussion = event.get("percussion") or {}
     value = percussion.get("output_midi_number")
@@ -173,9 +243,9 @@ def products(data, project_config_path=None):
             for bar in staff.get("bars", []):
                 for voice in bar.get("voices", []):
                     for beat in voice.get("beats", []):
-                        beats_by_id[beat.get("id")] = beat
+                        beats_by_id[(int(track["index"]), beat.get("id"))] = beat
                         for note in beat.get("notes", []):
-                            notes_by_id[note.get("id")] = note
+                            notes_by_id[(int(track["index"]), note.get("id"))] = note
 
     fretted = {}
     drums = []
@@ -187,6 +257,7 @@ def products(data, project_config_path=None):
 
     occurrences = data["playback"].get("beat_occurrences", [])
     pnotes = data["playback"].get("playback_notes", [])
+    segment_by_visit, segment_end_tick = _playback_segment_metadata(data["playback"])
     by_track = {i: [] for i in tracks}
     for note in pnotes:
         by_track.setdefault(int(note.get("track_index", -1)), []).append(note)
@@ -201,31 +272,52 @@ def products(data, project_config_path=None):
             props = (track.get("staves") or [{}])[0].get("properties", {})
             tuning = [int(x) for x in (props.get("tuning") or [])]
             out = []
-            ordered_events = sorted(events, key=lambda x: (int(x.get("occurrence", 0)), float(x.get("absolute_start_tick", 0)), int(x.get("string") or 0)))
-            event_lookup = {(int(x.get("occurrence", 0)), x.get("note_id")): x for x in ordered_events}
+            ordered_events = sorted(events, key=lambda x: (float(x.get("absolute_start_tick", 0)), int(x.get("string") or 0)))
+            event_lookup = {_event_playback_identity(x, segment_by_visit): x for x in ordered_events}
             next_fret = {}
+            next_same_string = {}
             lanes = {}
-            for x in ordered_events: lanes.setdefault((int(x.get("occurrence", 0)), x.get("string")), []).append(x)
+            for x in ordered_events:
+                identity = _event_playback_identity(x, segment_by_visit)
+                lanes.setdefault((identity[0], x.get("string")), []).append(x)
             for lane in lanes.values():
-                for current, following in zip(lane, lane[1:]): next_fret[id(current)] = following.get("fret")
+                for current, following in zip(lane, lane[1:]):
+                    next_fret[id(current)] = following.get("fret")
+                    next_same_string[id(current)] = following
             for event in ordered_events:
-                semantic = notes_by_id.get(event.get("note_id")) or {}
+                semantic = notes_by_id.get((idx, event.get("note_id"))) or {}
                 links = semantic.get("links") or {}
                 if links.get("is_tie_destination"): continue
-                start_tick = float(event["absolute_start_tick"]); duration_ticks = _effective_duration_ticks(event, semantic)
-                destination_id = links.get("tie_destination_id"); seen = set()
-                while destination_id is not None and destination_id not in seen:
-                    seen.add(destination_id); continuation = event_lookup.get((int(event.get("occurrence", 0)), destination_id)); continuation_note = notes_by_id.get(destination_id) or {}
-                    if continuation is None: break
-                    duration_ticks = max(duration_ticks, float(continuation["absolute_start_tick"]) + _effective_duration_ticks(continuation, continuation_note) - start_tick)
-                    destination_id = (continuation_note.get("links") or {}).get("tie_destination_id")
+                start_tick = float(event["absolute_start_tick"])
+                duration_ticks = _resolved_tied_duration_ticks(
+                    event, semantic, notes_by_id, event_lookup,
+                    segment_by_visit, segment_end_tick,
+                )
                 start = _seconds(start_tick, tempo, ppq); end = _seconds(start_tick + duration_ticks, tempo, ppq)
                 string, fret = event.get("string"), event.get("fret")
                 if string is None or fret is None: continue
                 string_index = int(string) - 1
                 if string_index < 0: continue
-                row = {"t_gp": start, "s": string_index, "f": int(fret), "sus": max(0.0, end-start)}
-                row.update(ee.encode_alphatab(semantic, {**event, "sus": row["sus"]}, next_fret.get(id(event)), beats_by_id.get(event.get("beat_id"))))
+                beat_semantic = beats_by_id.get((idx, event.get("beat_id"))) or {}
+                next_event = next_same_string.get(id(event))
+                next_delta = None
+                if next_event is not None:
+                    next_start = _seconds(float(next_event["absolute_start_tick"]), tempo, ppq)
+                    next_delta = max(0.0, next_start - start)
+                segment = _event_playback_identity(event, segment_by_visit)[0]
+                segment_end = _seconds(float(segment_end_tick.get(segment, start_tick + duration_ticks)), tempo, ppq)
+                segment_remaining = max(0.0, segment_end - start)
+                techniques = semantic.get("techniques") or {}
+                state = beat_semantic.get("state") or {}
+                sustain = ee.apply_sustain_semantics(
+                    max(0.0, end - start),
+                    staccato=bool(techniques.get("staccato")),
+                    let_ring=bool(techniques.get("let_ring") or state.get("let_ring")),
+                    next_same_string_delta=next_delta,
+                    segment_remaining=segment_remaining,
+                )
+                row = {"t_gp": start, "s": string_index, "f": int(fret), "sus": sustain}
+                row.update(ee.encode_alphatab(semantic, {**event, "sus": sustain}, next_fret.get(id(event)), beat_semantic))
                 out.append(row)
             fretted[tid] = {
                 "name": name,
@@ -275,7 +367,7 @@ def products(data, project_config_path=None):
                     midi = int(event["pitch_midi"])
                     staff_id = "lh" if hand == "left" else "rh" if hand == "right" else ("rh" if midi >= 60 else "lh")
                     start = _seconds(event["absolute_start_tick"], tempo, ppq)
-                    end = _seconds(event["absolute_start_tick"] + _effective_duration_ticks(event, notes_by_id.get(event.get("note_id"))), tempo, ppq)
+                    end = _seconds(event["absolute_start_tick"] + _effective_duration_ticks(event, notes_by_id.get((idx, event.get("note_id")))), tempo, ppq)
                     voice_beats[staff_id].append({"t_gp": start, "notes": [{"midi": midi, "end_gp": end}]})
                     piano_on.append({"t_gp": start})
                     piano_pitch.append({"t_gp": start, "midi": midi})
@@ -296,7 +388,7 @@ def products(data, project_config_path=None):
                 if fragments:
                     lyrics.append({"t_gp": start, "end_gp": end, "w": fragments[0]["text"]})
                 for note_id in occurrence.get("note_ids") or []:
-                    note = notes_by_id.get(note_id) or {}
+                    note = notes_by_id.get((idx, note_id)) or {}
                     midi = (note.get("pitch") or {}).get("midi")
                     if midi is not None:
                         pitch_notes.append({"t_gp": start, "end_gp": end, "midi": int(midi)})
@@ -365,7 +457,6 @@ def products(data, project_config_path=None):
             "unresolved_articulations": dict(unresolved_drums),
         },
     }
-
 
 
 

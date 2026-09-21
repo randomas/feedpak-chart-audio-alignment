@@ -99,7 +99,7 @@ function exportNote(note, beat, context) {
             accentuation: enumValue(alphaTab.model?.AccentuationType, note.accentuated), bend_type: enumValue(alphaTab.model?.BendType, note.bendType), bend_style: enumValue(alphaTab.model?.BendStyle, note.bendStyle), bend_points: bendPoints,
             slide_in_type: enumValue(alphaTab.model?.SlideInType, note.slideInType), slide_out_type: enumValue(alphaTab.model?.SlideOutType, note.slideOutType), harmonic_type: enumValue(alphaTab.model?.HarmonicType, note.harmonicType), harmonic_value: num(note.harmonicValue),
             vibrato: enumValue(alphaTab.model?.VibratoType, note.vibrato), trill_value: num(note.trillValue), trill_speed: enumValue(alphaTab.model?.Duration, note.trillSpeed), ornament: enumValue(alphaTab.model?.NoteOrnament, note.ornament), dynamics: enumValue(alphaTab.model?.DynamicValue, note.dynamics),
-            left_hand_finger: enumValue(alphaTab.model?.Fingers, note.leftHandFinger), right_hand_finger: enumValue(alphaTab.model?.Fingers, note.rightHandFinger), dead: bool(note.isDead), ghost: bool(note.isGhost), let_ring: bool(note.isLetRing ?? beat.isLetRing), palm_mute: bool(note.isPalmMute ?? beat.isPalmMute), staccato: bool(note.isStaccato), tapping: bool(note.isTapping), slap: bool(note.isSlap), pop: bool(note.isPop), visible: note.isVisible !== false
+            left_hand_finger: enumValue(alphaTab.model?.Fingers, note.leftHandFinger), right_hand_finger: enumValue(alphaTab.model?.Fingers, note.rightHandFinger), dead: bool(note.isDead), fret_hand_mute: bool(note.isFretHandMute), ghost: bool(note.isGhost), let_ring: bool(note.isLetRing ?? beat.isLetRing), palm_mute: bool(note.isPalmMute ?? beat.isPalmMute), staccato: bool(note.isStaccato), tapping: bool(note.isTapping), slap: bool(note.isSlap), pop: bool(note.isPop), visible: note.isVisible !== false
         }
     };
 }
@@ -170,12 +170,16 @@ function buildPlayback(score, settings) {
         const visits = arr(lookup.masterBars);
         const occurrenceCounts = new Map();
         const beatKeys = new Set();
+        let playbackSegmentIndex = 0;
+        let previousSourceIndex = null;
         visits.forEach((visit, playbackIndex) => {
             const masterBar = visit.masterBar ?? visit.bar ?? null;
             const sourceIndex = num(masterBar?.index);
+            const continuousFromPrevious = previousSourceIndex === null || sourceIndex === previousSourceIndex + 1;
+            if (!continuousFromPrevious) playbackSegmentIndex += 1;
             const occurrence = (occurrenceCounts.get(sourceIndex) ?? 0) + 1;
             occurrenceCounts.set(sourceIndex, occurrence);
-            output.master_bar_visits.push({ playback_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence, start_tick: num(visit.start), end_tick: num(visit.end), duration_ticks: Number.isFinite(visit.start) && Number.isFinite(visit.end) ? Number(visit.end) - Number(visit.start) : num(visit.duration) });
+            output.master_bar_visits.push({ playback_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence, playback_segment_index: playbackSegmentIndex, continuous_from_previous: continuousFromPrevious, start_tick: num(visit.start), end_tick: num(visit.end), duration_ticks: Number.isFinite(visit.start) && Number.isFinite(visit.end) ? Number(visit.end) - Number(visit.start) : num(visit.duration) });
             let beatLookup = visit.firstBeat ?? visit.firstBeatLookup ?? null;
             const seen = new Set();
             while (beatLookup && !seen.has(beatLookup)) {
@@ -188,12 +192,13 @@ function buildPlayback(score, settings) {
                     const key = [playbackIndex, context.track_index, context.staff_index, context.voice_index, context.beat_id, relativeStart].join(":");
                     if (!beatKeys.has(key)) {
                         beatKeys.add(key);
-                        output.beat_occurrences.push({ playback_master_bar_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence, ...context, relative_start_tick: relativeStart, absolute_start_tick: absoluteStart, written_absolute_playback_tick: num(beat?.absolutePlaybackStart), playback_duration_ticks: num(beat?.playbackDuration), display_duration_ticks: num(beat?.displayDuration), is_rest: bool(beat?.isRest), is_empty: bool(beat?.isEmpty), is_full_bar_rest: bool(beat?.isFullBarRest), lyric_fragments: nonEmptyLyrics(beat?.lyrics), note_ids: arr(beat?.notes).map((n) => num(n.id)).filter((x) => x !== null) });
+                        output.beat_occurrences.push({ playback_master_bar_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence, playback_segment_index: playbackSegmentIndex, ...context, relative_start_tick: relativeStart, absolute_start_tick: absoluteStart, written_absolute_playback_tick: num(beat?.absolutePlaybackStart), playback_duration_ticks: num(beat?.playbackDuration), display_duration_ticks: num(beat?.displayDuration), is_rest: bool(beat?.isRest), is_empty: bool(beat?.isEmpty), is_full_bar_rest: bool(beat?.isFullBarRest), lyric_fragments: nonEmptyLyrics(beat?.lyrics), note_ids: arr(beat?.notes).map((n) => num(n.id)).filter((x) => x !== null) });
                         for (const note of arr(beat?.notes)) {
                             const track = arr(score.tracks)[context.track_index];
                             const percussion = resolvePercussion(track, note.percussionArticulation);
                             output.playback_notes.push({
-                                playback_master_bar_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence,
+                                playback_master_bar_index: playbackIndex, source_master_bar_index: sourceIndex, occurrence, playback_segment_index: playbackSegmentIndex,
+                                playback_note_occurrence_id: [playbackIndex, context.track_index, context.staff_index, context.voice_index, num(note.id)].join(":"),
                                 track_index: context.track_index ?? null, staff_index: context.staff_index ?? null, voice_index: context.voice_index ?? null, beat_index: context.beat_index ?? null,
                                 beat_id: context.beat_id ?? null, note_id: num(note.id), absolute_start_tick: absoluteStart, duration_ticks: num(beat?.playbackDuration),
                                 duration_percent: num(note.durationPercent, 1),
@@ -207,6 +212,7 @@ function buildPlayback(score, settings) {
                 }
                 beatLookup = beatLookup.nextBeat;
             }
+            previousSourceIndex = sourceIndex;
         });
         for (const visit of visits) {
             for (const change of arr(visit.tempoChanges)) {
@@ -307,6 +313,5 @@ async function main() {
 }
 
 main().catch((error) => { console.error(error instanceof Error ? error.stack : String(error)); process.exit(1); });
-
 
 
