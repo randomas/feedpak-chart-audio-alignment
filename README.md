@@ -229,6 +229,55 @@ Install Guitar Pro support:
 pip install pyguitarpro
 ```
 
+#### Node.js and alphaTab for modern `.gp` files
+
+The legacy `.gp3`, `.gp4`, and `.gp5` route uses PyGuitarPro. Modern Guitar
+Pro `.gp` files use the bundled alphaTab extractor and therefore also require
+Node.js and npm. Install the current Node.js **LTS** release from the official
+Node.js download page, or on Windows use:
+
+```powershell
+winget install OpenJS.NodeJS.LTS
+```
+
+Close and reopen PowerShell, then verify that both commands are available:
+
+```powershell
+node --version
+npm --version
+```
+
+Install the extractor dependency from the project root. `npm ci` uses the
+committed lock file and installs the tested alphaTab version deterministically:
+
+```powershell
+Push-Location .\alphatab-extractor
+npm ci
+node --check .\extract-score.mjs
+Pop-Location
+```
+
+The extractor currently depends on `@coderline/alphatab` 1.8.3. Do not run a
+blind `npm update` when reproducing a tested build; update alphaTab deliberately
+and rerun the parser regression songs. The generated `node_modules` directory is
+local build state and should not be committed to Git.
+
+Build a modern `.gp` chart with:
+
+```powershell
+python build_feedpak.py my_song output_folder `
+  --gp-parser alphatab `
+  --alphatab-extractor ".\alphatab-extractor\extract-score.mjs" `
+  --alignment-mode checkpoint-dtw-selective `
+  --checkpoint-measures 4 `
+  --checkpoint-search-radius 1.0 `
+  --keep-work-dir `
+  --hf-token $env:HF_TOKEN
+```
+
+A pre-extracted schema-v4 alphaTab JSON can be reused with `--score-json`; this
+is useful for CPU-only parser and encoding tests and avoids rerunning Node.js.
+
 Install utilities:
 
 ```powershell
@@ -1631,3 +1680,6 @@ python build_feedpak.py SONG_FOLDER OUTPUT_FOLDER `
 ```
 
 A pre-extracted schema-v4 JSON can be supplied with `--score-json`. The adapter expands the playback timeline, including repeats, and maps the result into the existing alignment and Feedpak writing stages.
+
+
+

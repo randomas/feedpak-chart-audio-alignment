@@ -16,3 +16,6 @@ def test_none_is_no_material():
     assert pc.classify_vocal_capability(_song(False),[],{})['classification']=='no_vocal_material'
 def test_tail_warning():
     d={'speakers':{'s':{'words':[{'t':0,'d':1}],'pitch_notes':[{'t':0,'d':1}]}}}; assert validate_vocal_coverage(d,200)['status']=='warning'
+
+
+

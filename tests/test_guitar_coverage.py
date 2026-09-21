@@ -28,3 +28,6 @@ def test_missing_audio_is_diagnostic_only_and_timing_neutral():
     assert out["status"]=="diagnostic_only"
     assert out["gp"]["first_note_time"]==12.0
     assert not out["audio"]["available"]
+
+
+

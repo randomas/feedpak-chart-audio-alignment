@@ -14,9 +14,4 @@ foreach ($File in $Files) {
         continue
     }
 
-    Add-Content -Path $OutputFile -Value "===== $(Split-Path $File -Leaf) ====="
-    Add-Content -Path $OutputFile -Value (Get-Content $File -Raw)
-    Add-Content -Path $OutputFile -Value "`r`n"
-}
-
-Write-Host "Exported $($Files.Count) file(s) to $OutputFile"
+    Add-Content -Path $OutputFile -Value "

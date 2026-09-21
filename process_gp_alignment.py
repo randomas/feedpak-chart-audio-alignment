@@ -2109,12 +2109,25 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             {"time": round(warp_fn(a["time"]), 4), "fret": a["fret"], "width": a["width"]}
             for a in data["anchors"]
         ]
+        is_bass = "bass" in data["name"].lower()
         tuning_offsets, nonstandard = fc.tuning_offsets_from_absolute(
-            data["absolute_tuning_midi"], is_bass="bass" in data["name"].lower()
+            data["absolute_tuning_midi"], is_bass=is_bass
+        )
+        tuning_reference, _ = fc.standard_tuning_midi(
+            len(data["absolute_tuning_midi"]), is_bass=is_bass
+        )
+        source_high_to_low = list(data["absolute_tuning_midi"])
+        normalized_low_to_high = list(reversed(source_high_to_low))
+        fc.log(
+            f"'{data['name']}' tuning: source_high_to_low={source_high_to_low} "
+            f"normalized_low_to_high={normalized_low_to_high} "
+            f"reference_low_to_high={tuning_reference} "
+            f"serialized_offsets_low_to_high={tuning_offsets}",
+            indent=1,
         )
         if nonstandard:
-            fc.log(f"'{data['name']}': nonstandard string count, tuning offsets "
-                   f"are best-effort", indent=1)
+            fc.log(f"'{data['name']}': unsupported string count; tuning offsets "
+                   f"use a best-effort reference", indent=1)
         arrangements_out[track_id] = {
             "name": data["name"],
             "tuning": tuning_offsets,
@@ -2213,6 +2226,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 

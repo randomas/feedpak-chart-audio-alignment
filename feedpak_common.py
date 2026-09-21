@@ -193,33 +193,43 @@ def gm_drum_to_piece(gm_note):
 # `tuning` array the arrangement/manifest schemas expect.
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Feedpak tuning uses lowest-pitched string first. Source parser tuning arrays
+# arrive highest-to-lowest, so reverse exactly once before serialization.
+# Feedpak playable notes also use s=0 for the lowest string.
+# --------------------------------------------------------------------------
+
 STANDARD_GUITAR_TUNING_MIDI = [40, 45, 50, 55, 59, 64]   # E2 A2 D3 G3 B3 E4
 STANDARD_BASS_TUNING_MIDI = [28, 33, 38, 43]              # E1 A1 D2 G2
 
 
-def tuning_offsets_from_absolute(absolute_midi_low_to_high, is_bass):
-    """
-    absolute_midi_low_to_high: list of absolute MIDI pitches, index 0 =
-    lowest-pitched string (i.e. already remapped to feedpak's convention).
-    Returns per-string integer offsets from standard tuning. If the string
-    count doesn't match the standard reference (e.g. 7-string guitar,
-    5-string bass), pads/truncates the reference by extending downward
-    (best-effort; flagged in the returned `nonstandard_count` bool).
-    """
-    reference = STANDARD_BASS_TUNING_MIDI if is_bass else STANDARD_GUITAR_TUNING_MIDI
-    n = len(absolute_midi_low_to_high)
-    nonstandard_count = n != len(reference)
-    if n <= len(reference):
-        ref = reference[:n]
-    else:
-        # extend downward in perfect fourths (the standard interval used
-        # elsewhere in both tunings) for any extra low strings
-        ref = list(reference)
-        while len(ref) < n:
-            ref.insert(0, ref[0] - 5)
-        ref = ref[-n:] if len(ref) > n else ref
-    offsets = [absolute_midi_low_to_high[i] - ref[i] for i in range(n)]
-    return offsets, nonstandard_count
+def standard_tuning_midi(string_count, is_bass):
+    count = int(string_count)
+    if count <= 0:
+        return [], True
+    base = list(STANDARD_BASS_TUNING_MIDI if is_bass else STANDARD_GUITAR_TUNING_MIDI)
+    supported = (4 <= count <= 6) if is_bass else (6 <= count <= 8)
+    reference = list(base)
+    while len(reference) < count:
+        reference.insert(0, reference[0] - 5)
+    if len(reference) > count:
+        reference = reference[:count]
+    return reference, not supported
+
+
+def tuning_offsets_from_absolute(absolute_midi_high_to_low, is_bass):
+    source_high_to_low = [int(x) for x in absolute_midi_high_to_low]
+    actual_low_to_high = list(reversed(source_high_to_low))
+    reference, unsupported_count = standard_tuning_midi(len(actual_low_to_high), is_bass)
+    offsets = [pitch - standard for pitch, standard in zip(actual_low_to_high, reference)]
+    if any(abs(offset) > 12 for offset in offsets):
+        family = "bass" if is_bass else "guitar"
+        raise ValueError(
+            f"Implausible {family} tuning offsets {offsets}; source high-to-low "
+            f"{source_high_to_low}, normalized low-to-high {actual_low_to_high}, "
+            f"reference low-to-high {reference}; possible string-order mismatch"
+        )
+    return offsets, unsupported_count
 
 
 # --------------------------------------------------------------------------
@@ -386,3 +396,6 @@ def pad_audio_with_silence(src_path, dst_path, pad_seconds):
     silence = np.zeros((pad_samples, data.shape[1]), dtype="float32")
     padded = np.concatenate([silence, data], axis=0)
     sf.write(dst_path, padded, sr, format="WAV")
+
+
+

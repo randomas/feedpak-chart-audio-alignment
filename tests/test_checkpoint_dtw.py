@@ -44,3 +44,6 @@ class Checkpoint62Tests(unittest.TestCase):
   self.assertEqual(r['version'],'1.2.1');self.assertFalse(r['timing_changes_applied'])
 
 if __name__=='__main__':unittest.main()
+
+
+

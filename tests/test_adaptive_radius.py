@@ -9,3 +9,6 @@ def test_radius_doubles_whole_song(monkeypatch):
     out=pga.adaptive_checkpoint_diagnostic({}, {}, lambda t:t, [], {}, {"measured_boundaries":0},4,1.0)
     assert calls==[1.0,2.0,4.0]
     assert out["trustworthy"]==1 and out["expanded"] is True
+
+
+
