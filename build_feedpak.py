@@ -52,6 +52,14 @@ COUNT_IN_BEATS = 4
 # Metadata / stem discovery
 # --------------------------------------------------------------------------
 
+def resolve_manual_anchor_path(metadata, metadata_path, explicit_path=None):
+    """Use an explicit anchor file, otherwise reuse metadata.json when configured."""
+    if explicit_path:
+        return explicit_path
+    alignment = (metadata or {}).get("alignment") or {}
+    rows = alignment.get("manual_anchors") or []
+    return metadata_path if rows and metadata_path and os.path.isfile(metadata_path) else None
+
 def load_metadata(song_folder):
     path = os.path.join(song_folder, "metadata.json")
     if os.path.exists(path):
@@ -813,6 +821,9 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         lyric_count=sum(bool(x.get("lyric_fragments")) for x in alpha_data["playback"].get("beat_occurrences",[]) if x.get("track_index") in vocal_indexes)
         gp_vocal_capability={"classification":"native_timed_lyrics" if lyric_count else "notation_only","direct_gp_lyrics_supported":bool(lyric_count),"reason":f"alphaTab schema-v4 found {lyric_count} timed lyric events"}
     else: metadata=load_metadata(song_folder)
+    anchors_path = resolve_manual_anchor_path(metadata, metadata_path, anchors_path)
+    if anchors_path:
+        fc.log(f"Manual anchor configuration: {anchors_path}", indent=1)
     gp_vocal_configured=bool(((metadata.get("feedpak_project") or {}).get("tracks") or {}).get("lead_vocal"))
     gp_vocal_production=bool(gp_vocal_capability.get("direct_gp_lyrics_supported") and (gp_vocal_configured or gp_parser=="alphatab"))
     fc.log_step(1,total_steps,"Discovering stems and metadata")

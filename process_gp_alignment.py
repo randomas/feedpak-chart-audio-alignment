@@ -26,6 +26,7 @@ import checkpoint_dtw as cdtw
 import project_config as pc
 import alphatab_score as ats
 import expression_encoding as ee
+import manual_anchors as ma
 
 try:
     import guitarpro
@@ -168,7 +169,14 @@ def build_song_timeline(song, tempo_events, first_tick):
                 time_signatures.append({"t_gp": t_gp, "ts": list(ts)})
                 last_ts = ts
             active_num = ts[0]
-        beats.append({"t_gp": t_gp, "measure": header.number, "ts_num": active_num})
+        beats.append({
+            "t_gp": t_gp,
+            "measure": header.number,
+            "source_bar": header.number,
+            "occurrence": 1,
+            "playback_segment": 0,
+            "ts_num": active_num,
+        })
 
     return {"time_signatures": time_signatures, "beats": beats}
 
@@ -221,6 +229,43 @@ def _source_click_frequency(source):
     return {"bass": 90.0, "piano": 880.0, "drums": 180.0}.get(source, 180.0)
 
 
+
+def apply_manual_anchor_layer(baseline_warp, anchors_path, nominal_downbeats, padding_added=0.0):
+    """Resolve, assess, and apply metadata manual anchors after automatic alignment.
+
+    Exact anchors are immutable production control points. Search anchors remain
+    diagnostic-only and may suggest a nearby bar or a different audio clock.
+    Existing projects are timing-neutral when no anchor configuration is present.
+    """
+    anchors, load_report = ma.load_and_resolve(
+        anchors_path, nominal_downbeats, padding_added=padding_added
+    )
+    if not anchors:
+        return baseline_warp, {
+            "version": 1,
+            "status": "not_configured",
+            "timing_changes_applied": False,
+            "load": load_report,
+            "quality": {"version": 1, "anchors": [], "segments": [],
+                        "exact_anchor_count": 0, "search_anchor_count": 0},
+            "warp": {"status": "no_exact_anchors", "timing_changes_applied": False,
+                     "points": []},
+        }
+    quality = ma.assess_anchors(
+        anchors, baseline_warp, nominal_downbeats, padding_added=padding_added
+    )
+    final_warp, warp_report = ma.apply_exact_anchors(
+        baseline_warp, quality, nominal_downbeats
+    )
+    report = {
+        "version": 1,
+        "status": "applied" if warp_report.get("timing_changes_applied") else "diagnostic_only",
+        "timing_changes_applied": bool(warp_report.get("timing_changes_applied")),
+        "load": load_report,
+        "quality": quality,
+        "warp": warp_report,
+    }
+    return final_warp, report
 
 def load_alignment_anchors(path, nominal_downbeats, padding_added=0.0):
     """Load manual anchors. Missing time_reference defaults to original source audio."""
@@ -818,8 +863,13 @@ def parse_fretted_track(track, tempo_events, first_tick):
             previous=next((x for x in reversed(notes) if x["s"]==item["s"]),None)
             if previous is not None:previous["sus"]=max(float(previous.get("sus",0)),item["t_gp"]+item["sus"]-previous["t_gp"])
             continue
-        row={"t_gp":item["t_gp"],"s":item["s"],"f":item["f"]};fc.omit_if_negligible(row,"sus",item["sus"],SUSTAIN_MIN_SECONDS)
-        row.update(ee.encode_gp5(note,item["beat"],item["sus"],next_fret.get(id(item))));notes.append(row)
+        ne=getattr(note,"effect",None); be=getattr(item["beat"],"effect",None)
+        let_ring=bool(getattr(ne,"letRing",False) or getattr(be,"letRing",False))
+        staccato=bool(getattr(ne,"staccato",False))
+        dead=("dead" in ee.enum_name(getattr(note,"type",None)))
+        sustain=ee.apply_sustain_semantics(item["sus"],staccato=staccato,let_ring=let_ring,dead=dead)
+        row={"t_gp":item["t_gp"],"s":item["s"],"f":item["f"],"sus":sustain}
+        row.update(ee.encode_gp5(note,item["beat"],sustain,next_fret.get(id(item))));notes.append(row)
     absolute=sorted((gs.number,gs.value) for gs in track.strings);tuning=[v for _,v in sorted(absolute,key=lambda x:-x[0])]
     return {"name":track.name,"absolute_tuning_midi":tuning,"capo":getattr(track,"offset",0) or 0,"notes":notes,"anchors":compute_anchors(notes),"expression_diagnostics":{"encoded":ee.count_fields(notes)}}
 
@@ -1751,6 +1801,24 @@ def apply_warp(entries, warp_fn, time_key="t_gp", out_key="t"):
 # Main
 # --------------------------------------------------------------------------
 
+def apply_fretted_note_warp(entries, warp_fn, minimum_sustain=0.03):
+    """Warp every fretted attack and release and retain explicit ``sus``."""
+    out=[]
+    for raw in entries:
+        note=dict(raw)
+        nominal_start=float(note.pop("t_gp"))
+        nominal_sustain=max(0.0,float(note.get("sus",0.0) or 0.0))
+        real_start=float(warp_fn(nominal_start))
+        real_end=float(warp_fn(nominal_start+nominal_sustain))
+        warped_sustain=max(float(minimum_sustain),real_end-real_start) if nominal_sustain>0 else float(minimum_sustain)
+        note["t"]=round(real_start,4)
+        note["sus"]=round(warped_sustain,4)
+        if note.get("bnv"):
+            ratio=warped_sustain/nominal_sustain if nominal_sustain>0 else 1.0
+            note["bnv"]=[{**point,"t":round(max(0.0,min(warped_sustain,float(point.get("t",0.0))*ratio)),4)} for point in note["bnv"]]
+        out.append(note)
+    return out
+
 def get_initial_tempo(gp_path):
     """
     Lightweight helper for build_feedpak.py to call directly (as a module
@@ -1886,10 +1954,9 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         song_timeline_gp["time_signatures"], chart_offset)
     song_timeline_gp["beats"] = shift_nominal_times(song_timeline_gp["beats"], chart_offset)
 
-    manual_anchors, anchor_reference = load_alignment_anchors(
-        anchors_path, song_timeline_gp["beats"], padding_added=padding_added)
-    if manual_anchors:
-        fc.log(f"Loaded {len(manual_anchors)} manual anchor(s); input clock={anchor_reference}, padding conversion=+{padding_added:.3f}s", indent=1)
+    # Manual anchors are deliberately resolved after the complete automatic
+    # baseline is built, so quality feedback compares against the actual
+    # production warp and exact anchors can override every alignment mode.
 
     fc.log_step(4, 5, "DTW-aligning nominal GP timing to real audio")
     specs=[("drums",_event_times(drum_hits_gp),drums_audio_path),
@@ -1904,11 +1971,6 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         sample_times=[b["t_gp"] for b in song_timeline_gp["beats"]]
         warp_fn=choose_probabilistic_warp(candidates,sample_times)
         decision=warp_fn.alignment_diagnostics
-        warp_fn,chunk_points=apply_hard_anchors(warp_fn,manual_anchors,song_timeline_gp["beats"],
-                                                max_chunk_measures=auto_chunk_measures)
-        decision["manual_anchors"]=manual_anchors
-        decision["chunk_points"]=chunk_points
-        decision["anchor_time_reference"]=anchor_reference
         decision["padding_added"]=padding_added
     else:
         reference=next(((source,times,path) for source,times,path in specs if times and path),None)
@@ -1975,7 +2037,6 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         decision=warp_fn.alignment_diagnostics
         if not checkpoint_mode:
             decision["selected_source"]=source if source != "none" else None
-        decision["manual_anchors_ignored"]=bool(manual_anchors)
         decision["padding_added"]=padding_added
         decision["timing_origin"]={"audio_content_start":round(audio_content_start,6),
             "first_configured_instrument_score_onset":round(score_content_time,6),
@@ -2057,6 +2118,32 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             fc.log(f"Checkpoints: {checkpoint_report.get('strong',0)} strong, "
                    f"{checkpoint_report.get('rejected',0)} rejected; "
                    f"timing {'selective local DTW production' if alignment_mode=='checkpoint-dtw-selective' else ('diagnostic local DTW; packaged checkpoint-linear' if alignment_mode=='checkpoint-dtw-diagnostic' else ('guardedly corrected' if alignment_mode=='checkpoint-linear' else 'unchanged'))}",indent=2)
+    automatic_warp = warp_fn
+    warp_fn, manual_anchor_report = apply_manual_anchor_layer(
+        automatic_warp, anchors_path, song_timeline_gp["beats"],
+        padding_added=padding_added,
+    )
+    decision["manual_anchor_load_report"] = manual_anchor_report.get("load")
+    decision["manual_anchor_quality"] = manual_anchor_report.get("quality")
+    decision["manual_anchor_warp"] = manual_anchor_report.get("warp")
+    decision["manual_anchor_status"] = manual_anchor_report.get("status")
+    if manual_anchor_report.get("quality", {}).get("anchors"):
+        q = manual_anchor_report["quality"]
+        fc.log(
+            f"Manual anchors: {q.get('exact_anchor_count', 0)} exact, "
+            f"{q.get('search_anchor_count', 0)} search; "
+            f"timing changes applied={manual_anchor_report['timing_changes_applied']}",
+            indent=1,
+        )
+        for item in q.get("anchors", []):
+            fc.log(
+                f"Anchor {item['id']}: playback bar {item['playback_bar']} beat {item['beat']}; "
+                f"audio={item['padded_audio_time']:.3f}s padded; "
+                f"baseline residual={item['residual_seconds']:+.3f}s; "
+                f"confidence={item['confidence']}; warnings={item['warnings']}",
+                indent=2,
+            )
+
     guitar_coverage=diagnose_track_audio_coverage(
         _event_times(guitar_alignment_events),guitar_audio_path,warp_fn,sr=sr,source="guitar")
     decision["guitar_coverage_diagnostic"]=guitar_coverage
@@ -2104,7 +2191,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     fc.log_step(5, 5, "Applying warp to all tracks")
     arrangements_out = {}
     for track_id, data in fretted_tracks.items():
-        warped_notes = apply_warp(data["notes"], warp_fn)
+        warped_notes = apply_fretted_note_warp(data["notes"], warp_fn)
         warped_anchors = [
             {"time": round(warp_fn(a["time"]), 4), "fret": a["fret"], "width": a["width"]}
             for a in data["anchors"]
@@ -2231,7 +2318,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

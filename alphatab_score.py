@@ -313,6 +313,7 @@ def products(data, project_config_path=None):
                     max(0.0, end - start),
                     staccato=bool(techniques.get("staccato")),
                     let_ring=bool(techniques.get("let_ring") or state.get("let_ring")),
+                    dead=bool(techniques.get("dead")),
                     next_same_string_delta=next_delta,
                     segment_remaining=segment_remaining,
                 )
@@ -421,7 +422,14 @@ def products(data, project_config_path=None):
         if ts != last:
             time_sigs.append({"t_gp": t, "ts": ts})
             last = ts
-        beats.append({"t_gp": t, "measure": int(visit["playback_index"]) + 1, "ts_num": ts[0]})
+        beats.append({
+            "t_gp": t,
+            "measure": int(visit["playback_index"]) + 1,
+            "source_bar": int(visit["source_master_bar_index"]) + 1,
+            "occurrence": int(visit.get("occurrence") or 1),
+            "playback_segment": int(visit.get("playback_segment_index") or 0),
+            "ts_num": ts[0],
+        })
 
     keys, last_key = [], None
     for visit in bars:
@@ -457,7 +465,6 @@ def products(data, project_config_path=None):
             "unresolved_articulations": dict(unresolved_drums),
         },
     }
-
 
 
 

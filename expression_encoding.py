@@ -2,7 +2,10 @@
 from __future__ import annotations
 from collections import Counter
 
+NORMAL_GATE_RATIO = 0.95
 STACCATO_RATIO = 0.50
+DEAD_NOTE_MAX_SECONDS = 0.10
+MINIMUM_EMITTED_SUSTAIN_SECONDS = 0.03
 
 
 def enum_name(v):
@@ -69,17 +72,17 @@ def _is_active_enum(value):
     return enum_name(value) not in ("", "none", "0", "false")
 
 
-def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False,
-                            next_same_string_delta=None, segment_remaining=None):
-    """Apply Tier 2 release semantics without crossing playback discontinuities.
-
-    Staccato halves the authored release. Let-ring may extend only to the next
-    attack on the same string or the end of the current continuous playback
-    segment. If no safe endpoint is known, the authored sustain is retained.
-    """
-    sustain = max(0.0, float(base_sustain or 0.0))
+def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False, dead=False,
+                            next_same_string_delta=None, segment_remaining=None,
+                            normal_gate_ratio=NORMAL_GATE_RATIO,
+                            minimum_seconds=MINIMUM_EMITTED_SUSTAIN_SECONDS):
+    """Return the explicit sounding duration for every fretted note."""
+    authored = max(0.0, float(base_sustain or 0.0))
+    sustain = authored if let_ring else authored * float(normal_gate_ratio)
     if staccato:
         sustain *= STACCATO_RATIO
+    if dead:
+        sustain = min(sustain, DEAD_NOTE_MAX_SECONDS)
     if let_ring:
         limits = []
         for value in (next_same_string_delta, segment_remaining):
@@ -94,8 +97,9 @@ def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False,
             sustain = max(sustain, min(limits))
     if segment_remaining is not None:
         sustain = min(sustain, max(0.0, float(segment_remaining)))
+    if authored > 0.0:
+        sustain = max(float(minimum_seconds), sustain)
     return max(0.0, sustain)
-
 
 def encode_alphatab(note, event, destination_fret=None, beat=None):
     t = (note or {}).get("techniques") or {}

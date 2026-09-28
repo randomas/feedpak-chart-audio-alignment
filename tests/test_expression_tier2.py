@@ -18,7 +18,7 @@ def test_tremolo_is_not_trill():
 
 
 def test_staccato_shortens_and_let_ring_uses_safe_boundary():
-    assert ee.apply_sustain_semantics(1.0, staccato=True) == .5
+    assert ee.apply_sustain_semantics(1.0, staccato=True) == .475
     assert ee.apply_sustain_semantics(.5, let_ring=True, next_same_string_delta=2.0, segment_remaining=3.0) == 2.0
     assert ee.apply_sustain_semantics(.5, let_ring=True, next_same_string_delta=4.0, segment_remaining=3.0) == 3.0
 
