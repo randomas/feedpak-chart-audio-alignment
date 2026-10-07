@@ -520,3 +520,205 @@ def build_selective_warp(baseline, local_report, measure_downbeats, config=None)
 
 
 
+
+@dataclass(frozen=True)
+class TrustedAnchorDTWConfig(LocalDTWConfig):
+    """Guardrails for DTW inside already trusted structural intervals.
+
+    These limits are deliberately wider than the legacy checkpoint-local pass:
+    trusted continuous/manual boundaries prevent occurrence jumps, while the
+    wider corridor lets the interior follow rubato, solos, and authored tempo
+    curves that a straight line cannot represent.
+    """
+    preferred_maximum_measures:int=8
+    hard_maximum_measures:int=12
+    corridor_interior_ms:float=1250.0
+    corridor_tier_a_boundary_ms:float=180.0
+    minimum_baseline_median_ms:float=25.0
+    minimum_baseline_p95_ms:float=60.0
+    minimum_median_improvement_ms:float=10.0
+    minimum_p95_improvement_ms:float=20.0
+    minimum_relative_improvement:float=.15
+    minimum_held_out_relative_improvement:float=.05
+    maximum_median_degradation_ms:float=18.0
+    maximum_p95_degradation_ms:float=35.0
+    maximum_residual_excursion_ms:float=1000.0
+    maximum_corridor_edge_percent:float=8.0
+    maximum_non_diagonal_percent:float=45.0
+    maximum_direction_changes_per_measure:float=4.0
+    minimum_beat_stretch:float=.75
+    maximum_beat_stretch:float=1.25
+    minimum_measure_stretch:float=.80
+    maximum_measure_stretch:float=1.20
+
+
+def _trusted_controls(linear_report, measure_downbeats, maximum_measures):
+    """Build generic trusted/computational boundaries from applied controls."""
+    beats=sorted(measure_downbeats or [],key=lambda x:float(x['t_gp']))
+    if len(beats)<2:
+        return []
+    controls=[]
+    for row in (linear_report or {}).get('controls',[]):
+        controls.append({'nominal_time':float(row['score_time']),
+                         'measure':int(min(beats,key=lambda b:abs(float(b['t_gp'])-float(row['score_time'])))['measure']),
+                         'tier':'A','boundary_kind':'trusted',
+                         'evidence':[row.get('kind','trusted_anchor')],
+                         'id':row.get('id')})
+    # The active production map's exterior is a safe fixed boundary even when
+    # the first/last structural control is interior to the song.
+    exterior=[{'nominal_time':float(beats[0]['t_gp']),'measure':int(beats[0]['measure']),
+               'tier':'fixed','boundary_kind':'baseline_exterior','evidence':['fixed_start'],'id':'fixed-start'},
+              {'nominal_time':float(beats[-1]['t_gp']),'measure':int(beats[-1]['measure']),
+               'tier':'fixed','boundary_kind':'baseline_exterior','evidence':['fixed_end'],'id':'fixed-end'}]
+    rows=exterior+controls
+    rows.sort(key=lambda x:x['nominal_time'])
+    ded=[]
+    for row in rows:
+        if ded and abs(row['nominal_time']-ded[-1]['nominal_time'])<=.05:
+            if row['tier']=='A': ded[-1]=row
+            else: ded[-1]['evidence']=sorted(set(ded[-1]['evidence']+row['evidence']))
+        else: ded.append(row)
+    by_measure={int(x['measure']):x for x in beats}
+    out=[ded[0]]
+    for target in ded[1:]:
+        prev=out[-1]
+        while target['measure']-prev['measure']>int(maximum_measures):
+            desired=prev['measure']+int(maximum_measures)
+            candidates=[b for b in beats if prev['nominal_time']<float(b['t_gp'])<target['nominal_time']]
+            if not candidates: break
+            beat=min(candidates,key=lambda b:abs(int(b['measure'])-desired))
+            split={'nominal_time':float(beat['t_gp']),'measure':int(beat['measure']),
+                   'tier':'computational','boundary_kind':'computational',
+                   'evidence':['computational_split'],'id':f"split-m{int(beat['measure']):03d}"}
+            if split['nominal_time']<=prev['nominal_time']+.05: break
+            out.append(split);prev=split
+        out.append(target)
+    return out
+
+
+def diagnose_trusted_anchor_segment_dtw(baseline, linear_report, measure_downbeats,
+                                        score_events, audio_paths, sr=22050, config=None):
+    """Evaluate source-aware DTW independently between trusted controls.
+
+    Trusted continuous/manual anchors remain exact. Long trusted intervals may
+    receive computational measure-boundary splits solely to bound memory and
+    ambiguity; every split is endpoint-zero against the accepted linear/manual
+    baseline. A strong corresponding isolated stem may win by itself. Other
+    available stems are held-out safeguards, not mandatory confirmations.
+    """
+    cfg=config or TrustedAnchorDTWConfig()
+    beats=sorted(measure_downbeats or [],key=lambda x:float(x['t_gp']))
+    boundaries=_trusted_controls(linear_report,beats,cfg.preferred_maximum_measures)
+    sources=('drums','bass','guitar','piano')
+    segments=[]
+    for a,b in zip(boundaries,boundaries[1:]):
+        start,end=float(a['nominal_time']),float(b['nominal_time'])
+        meter=_meter_profile(beats,start,end)
+        measure_span=max(1,int(b['measure'])-int(a['measure']))
+        rec={'segment_id':f"m{int(a['measure']):03d}-m{int(b['measure']):03d}",
+             'start_measure':int(a['measure']),'end_measure':int(b['measure']),
+             'start_nominal_time':round(start,6),'end_nominal_time':round(end,6),
+             'duration_seconds':round(float(baseline(end)-baseline(start)),4),
+             'meter_derived_beats':round(meter['beat_units'],6),
+             'boundary_sources':{'start':a['evidence'],'end':b['evidence']},
+             'boundary_kinds':{'start':a['boundary_kind'],'end':b['boundary_kind']},
+             'source_candidates':[]}
+        if measure_span>cfg.hard_maximum_measures:
+            rec['decision']={'state':'skipped_insufficient_features','warnings':['hard_maximum_measures_exceeded']}
+            segments.append(rec);continue
+        accepted=[]
+        for source in sources:
+            events=[float(t) for t in score_events.get(source,[]) if start<=float(t)<=end]
+            feat=_features(audio_paths.get(source),sr,cfg.hop_length)
+            if len(events)<cfg.minimum_symbolic_events or feat is None:
+                rec['source_candidates'].append({'source':source,'state':'unavailable','event_count':len(events),
+                    'reason':'insufficient_events_or_audio'})
+                continue
+            observations=_fixed_observations(events,feat[2],baseline,radius=max(.12,min(.40,cfg.corridor_interior_ms/4000.0)))
+            before=_metrics(_residuals(observations,baseline))
+            if len(observations)<cfg.minimum_symbolic_events:
+                rec['source_candidates'].append({'source':source,'state':'unavailable','event_count':len(events),
+                    'matched_events':len(observations),'reason':'insufficient_fixed_observations'})
+                continue
+            baseline_needs_refinement=((before['median_residual_ms'] or 0)>=cfg.minimum_baseline_median_ms or
+                                       (before['p95_residual_ms'] or 0)>=cfg.minimum_baseline_p95_ms)
+            if not baseline_needs_refinement:
+                rec['source_candidates'].append({'source':source,'state':'skipped_baseline_accurate',
+                    'event_count':len(events),'baseline':before})
+                continue
+            candidate,error=_candidate(events,audio_paths.get(source),baseline,start,end,
+                                       a['tier'],b['tier'],sr,cfg)
+            if candidate is None:
+                rec['source_candidates'].append({'source':source,'state':'rejected','event_count':len(events),
+                    'baseline':before,'reason':error})
+                continue
+            warp=candidate.pop('warp')
+            after=_metrics(_residuals(observations,warp))
+            med=(before['median_residual_ms'] or 0)-(after['median_residual_ms'] or 0)
+            p95=(before['p95_residual_ms'] or 0)-(after['p95_residual_ms'] or 0)
+            relative=med/max(before['median_residual_ms'] or 0,1e-9)
+            held={};degraded=False;corroborating=0
+            for other in sources:
+                if other==source: continue
+                oe=[float(t) for t in score_events.get(other,[]) if start<=float(t)<=end]
+                of=_features(audio_paths.get(other),sr,cfg.hop_length)
+                if len(oe)<cfg.minimum_symbolic_events or of is None: continue
+                fixed=_fixed_observations(oe,of[2],baseline,radius=max(.12,min(.40,cfg.corridor_interior_ms/4000.0)))
+                if len(fixed)<cfg.minimum_symbolic_events: continue
+                hb=_metrics(_residuals(fixed,baseline));ha=_metrics(_residuals(fixed,warp))
+                gain=(hb['median_residual_ms'] or 0)-(ha['median_residual_ms'] or 0)
+                tail=(hb['p95_residual_ms'] or 0)-(ha['p95_residual_ms'] or 0)
+                bad=gain < -cfg.maximum_median_degradation_ms or tail < -cfg.maximum_p95_degradation_ms
+                degraded|=bad;corroborating+=int(gain>0 and not bad)
+                held[other+'_onsets']={'baseline':hb,'candidate':ha,'median_improvement_ms':round(gain,3),'degraded':bad}
+            beat_grid=[(x,y) for x,y,_ in meter['intervals']]
+            measure_times=[float(q['t_gp']) for q in beats if start<=float(q['t_gp'])<=end]
+            measure_st=[(warp(y)-warp(x))/(baseline(y)-baseline(x)) for x,y in zip(measure_times,measure_times[1:]) if baseline(y)>baseline(x)]
+            beat_st=[(warp(y)-warp(x))/(baseline(y)-baseline(x)) for x,y in beat_grid if baseline(y)>baseline(x)]
+            path={**candidate,
+                  'minimum_measure_stretch':round(min(measure_st or [1]),6),
+                  'maximum_measure_stretch':round(max(measure_st or [1]),6),
+                  'minimum_beat_stretch':round(min(beat_st or [1]),6),
+                  'maximum_beat_stretch':round(max(beat_st or [1]),6),
+                  'monotonic':all(warp(y)>warp(x) for x,y in beat_grid),
+                  'fixed_start_error_ms':round((warp(start)-baseline(start))*1000,6),
+                  'fixed_end_error_ms':round((warp(end)-baseline(end))*1000,6)}
+            safe=(path['monotonic'] and abs(path['fixed_start_error_ms'])<=.001 and abs(path['fixed_end_error_ms'])<=.001 and
+                  path['minimum_measure_stretch']>=cfg.minimum_measure_stretch and path['maximum_measure_stretch']<=cfg.maximum_measure_stretch and
+                  path['minimum_beat_stretch']>=cfg.minimum_beat_stretch and path['maximum_beat_stretch']<=cfg.maximum_beat_stretch and
+                  path['non_diagonal_percent']<=cfg.maximum_non_diagonal_percent and
+                  path['corridor_edge_percent']<=cfg.maximum_corridor_edge_percent and
+                  path['residual_direction_changes']<=cfg.maximum_direction_changes_per_measure*measure_span and not degraded)
+            meaningful=(med>=cfg.minimum_median_improvement_ms and p95>=cfg.minimum_p95_improvement_ms and
+                        relative>=cfg.minimum_relative_improvement)
+            state='would_apply' if safe and meaningful else ('rejected_held_out_degradation' if degraded else
+                  'rejected_stretch_or_path_complexity' if not safe else 'rejected_no_meaningful_improvement')
+            after.update({'median_improvement_ms':round(med,3),'p95_improvement_ms':round(p95,3),
+                          'relative_median_improvement':round(relative,4)})
+            item={'source':source,'state':state,'event_count':len(events),'baseline':before,'candidate':after,
+                  'held_out_evaluation':held,'corroborating_sources':corroborating,'path':path}
+            rec['source_candidates'].append(item)
+            if state=='would_apply':
+                rank=(relative,corroborating,-(after['p95_residual_ms'] or 1e9))
+                accepted.append((rank,source,path,before,after,held))
+        if not accepted:
+            rec['optimization_sources']=[];rec['held_out_sources']=[]
+            rec['decision']={'state':'skipped_no_accepted_source','warnings':['no_segment_source_passed_gates']}
+        else:
+            _,source,path,before,after,held=max(accepted,key=lambda x:x[0])
+            rec.update({'optimization_sources':[source],'held_out_sources':list(held),'baseline':before,
+                        'candidate':after,'held_out_evaluation':held,'path':path,
+                        'simplification':{'raw_path_points':path['raw_path_points'],
+                            'control_points':path['control_points'],'simplified_candidate_still_passes':True},
+                        'decision':{'state':'would_apply','warnings':[]}})
+        segments.append(rec)
+    states=[x['decision']['state'] for x in segments]
+    summary={'generated_segments':len(segments),'evaluated_segments':sum(bool(x.get('source_candidates')) for x in segments),
+             'would_apply':states.count('would_apply'),'rejected':sum(s.startswith('rejected_') for s in states),
+             'skipped':sum(s.startswith('skipped_') for s in states),
+             'maximum_proposed_change_ms':round(max([x.get('path',{}).get('maximum_residual_excursion_ms',0) for x in segments] or [0]),3),
+             'selected_sources':{name:sum(x.get('optimization_sources')==[name] for x in segments) for name in sources},
+             'timing_changes_applied':False}
+    return {'version':'3.0','status':'diagnostic_only','timing_changes_applied':False,
+            'method':'trusted_anchor_bounded_source_aware_local_dtw','config':asdict(cfg),
+            'boundaries':boundaries,'summary':summary,'segments':segments}

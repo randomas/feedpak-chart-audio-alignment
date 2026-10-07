@@ -93,8 +93,16 @@ def resolved_roles(data, project_config_path=None):
         assign(name, "unsupported")
     for name in tracks.get("ignored_tracks") or []:
         assign(name, "ignored")
-    for role in ("lead_vocal", "drums"):
-        assign(tracks.get(role), role)
+    # An explicit null disables automatic vocal selection. This lets a project
+    # keep a notated vocal track in the source score while deliberately using
+    # audio-derived vocals, or omitting vocals entirely.
+    if "lead_vocal" in tracks and tracks.get("lead_vocal") is None:
+        for name, role in list(roles.items()):
+            if role == "lead_vocal":
+                roles[name] = "ignored"
+    else:
+        assign(tracks.get("lead_vocal"), "lead_vocal")
+    assign(tracks.get("drums"), "drums")
     piano = tracks.get("piano") or {}
     if isinstance(piano, dict):
         for hand in ("left", "right", "combined"):
@@ -320,6 +328,26 @@ def products(data, project_config_path=None):
                 row = {"t_gp": start, "s": string_index, "f": int(fret), "sus": sustain}
                 row.update(ee.encode_alphatab(semantic, {**event, "sus": sustain}, next_fret.get(id(event)), beat_semantic))
                 out.append(row)
+
+                # Alignment evidence must come from the same configured score
+                # notes that are emitted as playable arrangements. Previously
+                # the alphaTab path populated fretted_tracks but left the
+                # guitar/bass alignment lists empty, allowing a later drum
+                # entrance to masquerade as the beginning of a guitar-first
+                # song. Preserve every unique scored onset and its pitch.
+                onset_row = {"t_gp": start}
+                pitch = event.get("pitch_midi")
+                if pitch is None and string_index < len(tuning):
+                    pitch = int(tuning[string_index]) + int(fret)
+                pitch_row = {"t_gp": start, "midi": int(pitch)} if pitch is not None else None
+                if role == "guitar":
+                    guitar_on.append(onset_row)
+                    if pitch_row is not None:
+                        guitar_pitch.append(pitch_row)
+                else:
+                    bass_on.append(onset_row)
+                    if pitch_row is not None:
+                        bass_pitch.append(pitch_row)
             fretted[tid] = {
                 "name": name,
                 "absolute_tuning_midi": tuning,
@@ -465,7 +493,6 @@ def products(data, project_config_path=None):
             "unresolved_articulations": dict(unresolved_drums),
         },
     }
-
 
 
 

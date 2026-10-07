@@ -60,6 +60,27 @@ def resolve_manual_anchor_path(metadata, metadata_path, explicit_path=None):
     rows = alignment.get("manual_anchors") or []
     return metadata_path if rows and metadata_path and os.path.isfile(metadata_path) else None
 
+def resolve_gp_vocal_policy(metadata, capability, gp_parser):
+    """Resolve whether score-derived vocals may be used in production.
+
+    A present ``lead_vocal`` key is authoritative, including an explicit null.
+    Automatic alphaTab vocal discovery is used only when no project track
+    configuration expresses a choice.
+    """
+    track_config=((metadata.get("feedpak_project") or {}).get("tracks") or {})
+    setting_present="lead_vocal" in track_config
+    configured_name=track_config.get("lead_vocal")
+    configured=bool(configured_name)
+    enabled=(configured if setting_present else gp_parser=="alphatab")
+    production=bool((capability or {}).get("direct_gp_lyrics_supported") and enabled)
+    return {
+        "setting_present": setting_present,
+        "configured_name": configured_name,
+        "configured": configured,
+        "enabled": enabled,
+        "production": production,
+    }
+
 def load_metadata(song_folder):
     path = os.path.join(song_folder, "metadata.json")
     if os.path.exists(path):
@@ -328,7 +349,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
                   gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-                  piano_duration_quantize_ms=0.0):
+                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -340,6 +361,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
     if guitar_path: cmd += ["--guitar-audio",guitar_path]
     if full_path: cmd += ["--full-audio",full_path]
     if allow_severe_alignment: cmd.append("--allow-severe-alignment")
+    if force_continuous_anchor_warp: cmd.append("--force-continuous-anchor-warp")
     if anchors_path: cmd += ["--anchors",anchors_path]
     cmd += ["--padding-added",str(padding_added),"--auto-chunk-measures",str(auto_chunk_measures),
             "--alignment-mode",alignment_mode,
@@ -791,7 +813,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
           gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-          piano_duration_quantize_ms=0.0):
+          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,
+          package_name_suffix=""):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps=7
@@ -824,8 +847,11 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     anchors_path = resolve_manual_anchor_path(metadata, metadata_path, anchors_path)
     if anchors_path:
         fc.log(f"Manual anchor configuration: {anchors_path}", indent=1)
-    gp_vocal_configured=bool(((metadata.get("feedpak_project") or {}).get("tracks") or {}).get("lead_vocal"))
-    gp_vocal_production=bool(gp_vocal_capability.get("direct_gp_lyrics_supported") and (gp_vocal_configured or gp_parser=="alphatab"))
+    gp_vocal_policy=resolve_gp_vocal_policy(metadata,gp_vocal_capability,gp_parser)
+    gp_vocal_configured=gp_vocal_policy["configured"]
+    gp_vocal_production=gp_vocal_policy["production"]
+    if gp_vocal_policy["setting_present"] and not gp_vocal_configured and gp_vocal_capability.get("direct_gp_lyrics_supported"):
+        fc.log("GP vocal material exists but is disabled by project configuration",indent=1)
     fc.log_step(1,total_steps,"Discovering stems and metadata")
     stems, vocals_path, drums_path = discover_stems(song_folder, vocals_stem_name, drums_stem_name)
     original_vocals_path=vocals_path
@@ -898,7 +924,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     drum_tab_file=keys_file=song_timeline_file=None
     alignment_report=None
     expression_report=None
-    if gp_path and (drums_path or bass_path or piano_path) and not skip_gp:
+    if gp_path and (drums_path or bass_path or piano_path or guitar_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
         run_gp_script(gp_path,drums_path,gp_intermediate,count_in_offset=count_in_offset,
                       bass_path=bass_path,piano_path=piano_path,guitar_path=guitar_path,
@@ -909,7 +935,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       checkpoint_measures=checkpoint_measures,
                       checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None,
                       gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable,
-                      piano_duration_quantize_ms=piano_duration_quantize_ms)
+                      piano_duration_quantize_ms=piano_duration_quantize_ms,
+                      force_continuous_anchor_warp=force_continuous_anchor_warp)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         if gp_vocal_production:
@@ -935,8 +962,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.log("--skip-gp set; skipping arrangement extraction.", indent=1)
     elif not gp_path:
         fc.log(f"No .gp5 file found in {song_folder}; skipping arrangement extraction.", indent=1)
-    elif not (drums_path or bass_path or piano_path):
-        fc.log("No drums, bass, or piano/keys alignment stem found; skipping GP alignment.",indent=1)
+    elif not (drums_path or bass_path or piano_path or guitar_path):
+        fc.log("No configured instrumental alignment stem found; skipping GP alignment.",indent=1)
 
     fc.log_step(5, total_steps, "Building manifest.yaml")
     cover_file = next(
@@ -953,12 +980,15 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         vocal_pitch_file, vocal_pitch_contour_file, drum_tab_file, keys_file,
         song_timeline_file, cover_file,
     )
+    if force_continuous_anchor_warp:
+        manifest["diagnostic_unsafe_timing"] = True
+        manifest["diagnostic_label"] = "UNSAFE-CONTINUOUS"
     validate_manifest_paths(manifest)
     fc.log(f"Manifest validated: {manifest['title']} — {manifest['artist']}", indent=1)
 
     fc.log_step(6, total_steps, "Packaging .feedpak")
     os.makedirs(output_folder, exist_ok=True)
-    safe_name = f"{manifest['artist']} - {manifest['title']}.feedpak".replace("/", "_")
+    safe_name = f"{manifest['artist']} - {manifest['title']}{package_name_suffix}.feedpak".replace("/", "_")
     output_path = os.path.join(output_folder, safe_name)
     package_feedpak(work_dir,manifest,output_path)
     if alignment_report:
@@ -1018,7 +1048,9 @@ def main():
     parser.add_argument("--vocal-layout",choices=("merged","separated","both"),default=defaults.get("vocal_layout") or "merged")
     parser.add_argument("--timeline-mode",choices=("tempos","beats","both"),default=defaults.get("timeline_mode") or "both")
     parser.add_argument("--allow-severe-alignment",action="store_true",default=bool(defaults.get("allow_severe_alignment",False)))
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"),
+    parser.add_argument("--build-unsafe-continuous-comparison",action="store_true",
+                        help="Build the safe package plus an explicitly labelled unsafe continuous-anchor comparison")
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw"),
                         default=defaults.get("alignment_mode") or "dtw")
     parser.add_argument("--anchors",default=defaults.get("anchors"))
     parser.add_argument("--auto-chunk-measures",type=int,default=defaults.get("auto_chunk_measures") or 16)
@@ -1057,11 +1089,31 @@ def main():
           alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
           piano_duration_quantize_ms=args.piano_duration_quantize_ms)
 
+    if args.build_unsafe_continuous_comparison:
+        if args.alignment_mode not in ("continuous-anchor-linear", "continuous-anchor-dtw"):
+            parser.error("--build-unsafe-continuous-comparison requires a continuous-anchor alignment mode")
+        fc.log("Building separately labelled UNSAFE continuous-anchor comparison package")
+        build(args.song_folder,args.output_folder,vocals_stem_name=args.vocals_stem,
+          drums_stem_name=args.drums_stem,device=args.device,hf_token=args.hf_token,
+          skip_vocals=args.skip_vocals,skip_gp=args.skip_gp,keep_work_dir=args.keep_work_dir,
+          vocal_layout=args.vocal_layout,timeline_mode=args.timeline_mode,
+          allow_severe_alignment=args.allow_severe_alignment,reuse_vocals=args.reuse_vocals,
+          vocals_cache=cache,vocal_batch_size=args.vocal_batch_size,
+          vocal_compute_type=args.vocal_compute_type,vocal_language=args.vocal_language,
+          anchors_path=anchors,auto_chunk_measures=args.auto_chunk_measures,
+          alignment_mode=args.alignment_mode,
+          checkpoint_measures=args.checkpoint_measures,
+          checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)),
+          bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
+          guitar_alignment_stem=args.guitar_alignment_stem,gp_parser=args.gp_parser,score_json_path=args.score_json,
+          alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
+              piano_duration_quantize_ms=args.piano_duration_quantize_ms,
+              force_continuous_anchor_warp=True,
+              package_name_suffix=".UNSAFE-CONTINUOUS")
+
 
 if __name__ == "__main__":
     main()
-
-
 
 
 

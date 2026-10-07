@@ -18,7 +18,7 @@ Usage:
 import argparse
 import json
 import math
-
+import os
 import numpy as np
 
 import feedpak_common as fc
@@ -27,6 +27,7 @@ import project_config as pc
 import alphatab_score as ats
 import expression_encoding as ee
 import manual_anchors as ma
+import continuous_anchors as ca
 
 try:
     import guitarpro
@@ -422,40 +423,128 @@ def choose_instrument_scale(candidates, agreement_tolerance=0.005):
                   "agreement_tolerance":agreement_tolerance,"candidates":candidates,
                   "applied_scale":round(float(scale),9)}
 
+def _detect_lenient_opening_time(audio_path, expected_time, sr=22050,
+                                 search_before=0.75, search_after=4.0):
+    """Find musical activity near a score-informed opening.
+
+    Opening notes may swell or have blurred attacks, so retain both onset and
+    sustained-RMS evidence rather than demanding a sharp transient.
+    """
+    if librosa is None or not audio_path:
+        return None, {"available": False, "reason": "missing_audio_or_librosa"}
+    y, actual_sr = librosa.load(audio_path, sr=sr, mono=True)
+    if not len(y):
+        return None, {"available": False, "reason": "empty_audio"}
+    hop = 256
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=actual_sr, hop_length=hop)
+    onset = librosa.onset.onset_strength(y=y, sr=actual_sr, hop_length=hop)
+    onset_times = librosa.frames_to_time(np.arange(len(onset)), sr=actual_sr, hop_length=hop)
+    lo = max(0.0, float(expected_time) - float(search_before))
+    hi = min(len(y) / actual_sr, float(expected_time) + float(search_after))
+
+    floor = float(np.percentile(rms, 20)) if len(rms) else 0.0
+    active = float(np.percentile(rms, 75)) if len(rms) else 0.0
+    rms_threshold = max(floor * 2.0, active * 0.08, 1e-6)
+    frame_window = (times >= lo) & (times <= hi)
+    width = max(1, int(round(0.08 * actual_sr / hop)))
+    sustained = np.convolve(
+        (rms >= rms_threshold).astype(int), np.ones(width, dtype=int), mode="same"
+    ) >= max(1, int(np.ceil(width * 0.60)))
+    activity_idx = np.where(frame_window & sustained)[0]
+    activity_time = float(times[activity_idx[0]]) if len(activity_idx) else None
+
+    onset_window = (onset_times >= lo) & (onset_times <= hi)
+    local_onset = onset[onset_window]
+    onset_time = None
+    if len(local_onset):
+        onset_threshold = max(float(np.percentile(local_onset, 65)), 1e-9)
+        onset_idx = np.where(onset_window & (onset >= onset_threshold))[0]
+        if len(onset_idx):
+            onset_time = float(onset_times[onset_idx[0]])
+
+    candidates = [value for value in (activity_time, onset_time) if value is not None]
+    if not candidates:
+        return None, {"available": False, "reason": "no_opening_activity",
+                      "search_window": [lo, hi]}
+    selected = min(candidates)
+    return selected, {
+        "available": True,
+        "method": "score_informed_lenient_activity_start",
+        "search_window": [round(lo, 6), round(hi, 6)],
+        "first_sustained_activity": None if activity_time is None else round(activity_time, 6),
+        "first_local_onset": None if onset_time is None else round(onset_time, 6),
+        "selected_time": round(selected, 6),
+        "rms_threshold": round(rms_threshold, 8),
+    }
+
+
 def build_opening_anchor_candidates(specs, score_start, audio_content_start, sr=22050,
                                     maximum_score_delay=15.0,
                                     maximum_anchor_shift=4.0,
-                                    minimum_events=4):
-    """Find a reliable early instrument anchor without changing simple linear.
+                                    minimum_events=4,
+                                    full_audio_path=None,
+                                    simultaneous_score_tolerance=.050):
+    """Build opening candidates under score-first precedence.
 
-    Sources qualify only when their first symbolic event is near the score
-    beginning. ``compute_simple_warp(..., "linear")`` supplies the measured
-    first audio onset, but its scale/offset are not used here.
+    The earliest configured instrumental note defines the symbolic opening.
+    Audio analysis only locates that entrance on its corresponding stem, with
+    the full mix as fallback. Later instruments can corroborate timing later,
+    but may not redefine the start simply because their attacks are clearer.
     """
-    out=[]
+    prepared=[]
     for priority,(source,event_times,audio_path) in enumerate(specs):
-        times=sorted(float(t) for t in event_times)
+        prepared.append((priority,source,sorted(float(t) for t in event_times),audio_path))
+    symbolic_firsts=[times[0] for _,_,times,_ in prepared if times]
+    earliest=min(symbolic_firsts) if symbolic_firsts else float(score_start)
+    out=[]
+    for priority,source,times,audio_path in prepared:
         first=times[0] if times else None
         delay=None if first is None else first-float(score_start)
-        item={'source':source,'priority':priority,'event_count':len(times),
-              'symbolic_first':first,'score_start_delay_seconds':delay,
-              'accepted':False,'warnings':[]}
-        if not audio_path:item['warnings'].append('missing_audio')
-        if len(times)<minimum_events:item['warnings'].append('insufficient_events')
-        if delay is None or delay<-.025 or delay>maximum_score_delay:
-            item['warnings'].append('not_an_early_score_entrance')
-        if item['warnings']:
-            out.append(item);continue
-        raw=compute_simple_warp(times,audio_path,'linear',sr=sr)
-        diag=dict(getattr(raw,'alignment_diagnostics',{}) or {})
-        audio_first=diag.get('audio_start')
+        is_earliest=first is not None and abs(float(first)-earliest)<=simultaneous_score_tolerance
+        item={"source":source,"priority":priority,"event_count":len(times),
+              "symbolic_first":first,"score_start_delay_seconds":delay,
+              "earliest_configured_score_entrance":bool(is_earliest),
+              "accepted":False,"warnings":[]}
+        if first is None:
+            item["warnings"].append("insufficient_events")
+        elif delay < -.025 or delay > maximum_score_delay:
+            item["warnings"].append("not_an_early_score_entrance")
+        if not is_earliest:
+            item["warnings"].append("later_than_earliest_configured_score_entrance")
+        required_events=1 if is_earliest else int(minimum_events)
+        if len(times)<required_events and "insufficient_events" not in item["warnings"]:
+            item["warnings"].append("insufficient_events")
+        if is_earliest and not audio_path and not full_audio_path:
+            item["warnings"].append("missing_audio")
+        if item["warnings"]:
+            out.append(item)
+            continue
+
+        audio_first,evidence=_detect_lenient_opening_time(
+            audio_path,audio_content_start,sr=sr,
+            search_before=.75,search_after=maximum_anchor_shift)
+        evidence_source=source
+        if audio_first is None and full_audio_path:
+            audio_first,evidence=_detect_lenient_opening_time(
+                full_audio_path,audio_content_start,sr=sr,
+                search_before=.75,search_after=maximum_anchor_shift)
+            evidence_source="full"
         shift=None if audio_first is None else float(audio_first)-float(audio_content_start)
-        item.update({'measured_audio_first':audio_first,
-                     'anchor_shift_from_content_start_seconds':shift,
-                     'raw_linear_diagnostics':diag})
-        if audio_first is None:item['warnings'].append('missing_audio_first_onset')
-        elif abs(shift)>maximum_anchor_shift:item['warnings'].append('opening_anchor_shift_too_large')
-        item['accepted']=not item['warnings']
+        item.update({"measured_audio_first":audio_first,
+                     "anchor_shift_from_content_start_seconds":shift,
+                     "audio_evidence_source":evidence_source,
+                     "lenient_opening_evidence":evidence})
+        if audio_first is None:
+            item["warnings"].append("missing_audio_first_onset")
+        elif abs(shift)>maximum_anchor_shift:
+            item["warnings"].append("opening_anchor_shift_too_large")
+        if full_audio_path and audio_path:
+            full_time,full_evidence=_detect_lenient_opening_time(
+                full_audio_path,audio_content_start,sr=sr,
+                search_before=.75,search_after=maximum_anchor_shift)
+            item["full_mix_corroboration"]={"time":full_time,"evidence":full_evidence}
+        item["accepted"]=not item["warnings"]
         out.append(item)
     return out
 
@@ -465,9 +554,12 @@ def choose_opening_anchor(candidates, score_start, audio_content_start,
     """Choose the earliest accepted score entrance, fusing corroborating audio."""
     accepted=[x for x in candidates if x.get('accepted')]
     if not accepted:
-        return float(score_start),float(audio_content_start),{
-            'status':'fallback_content_start','selected_sources':[],
-            'score_anchor':float(score_start),'audio_anchor':float(audio_content_start),
+        symbolic=[float(x['symbolic_first']) for x in candidates if x.get('symbolic_first') is not None]
+        fallback_score=min(symbolic) if symbolic else float(score_start)
+        return fallback_score,float(audio_content_start),{
+            'status':'fallback_content_start_for_earliest_configured_instrument','selected_sources':[],
+            'score_anchor':fallback_score,'audio_anchor':float(audio_content_start),
+            'warnings':['earliest_configured_instrument_audio_not_resolved'],
             'candidates':candidates}
     earliest=min(float(x['symbolic_first']) for x in accepted)
     cohort=[x for x in accepted if abs(float(x['symbolic_first'])-earliest)<=simultaneous_score_tolerance]
@@ -853,9 +945,11 @@ def parse_fretted_track(track, tempo_events, first_tick):
                 for note in beat.notes: pending.append({"note":note,"beat":beat,"t_gp":t,"s":fc.remap_string_index(note.string,string_count),"f":int(note.value),"sus":max(0,end-t)})
     pending.sort(key=lambda x:(x["t_gp"],x["s"])); lanes={}
     for x in pending:lanes.setdefault(x["s"],[]).append(x)
-    next_fret={}
+    next_fret={}; next_same_string_delta={}
     for lane in lanes.values():
-        for x,y in zip(lane,lane[1:]):next_fret[id(x)]=y["f"]
+        for x,y in zip(lane,lane[1:]):
+            next_fret[id(x)]=y["f"]
+            next_same_string_delta[id(x)]=max(0.0,float(y["t_gp"])-float(x["t_gp"]))
     notes=[]
     for item in pending:
         note=item["note"]
@@ -867,7 +961,9 @@ def parse_fretted_track(track, tempo_events, first_tick):
         let_ring=bool(getattr(ne,"letRing",False) or getattr(be,"letRing",False))
         staccato=bool(getattr(ne,"staccato",False))
         dead=("dead" in ee.enum_name(getattr(note,"type",None)))
-        sustain=ee.apply_sustain_semantics(item["sus"],staccato=staccato,let_ring=let_ring,dead=dead)
+        sustain=ee.apply_sustain_semantics(
+            item["sus"],staccato=staccato,let_ring=let_ring,dead=dead,
+            next_same_string_delta=next_same_string_delta.get(id(item)))
         row={"t_gp":item["t_gp"],"s":item["s"],"f":item["f"],"sus":sustain}
         row.update(ee.encode_gp5(note,item["beat"],sustain,next_fret.get(id(item))));notes.append(row)
     absolute=sorted((gs.number,gs.value) for gs in track.strings);tuning=[v for _,v in sorted(absolute,key=lambda x:-x[0])]
@@ -1838,7 +1934,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0):
+            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
     if gp_parser == "alphatab":
@@ -1975,7 +2071,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     else:
         reference=next(((source,times,path) for source,times,path in specs if times and path),None)
         source,event_times,audio_path=reference if reference else ("none",[],None)
-        checkpoint_mode=alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective")
+        checkpoint_mode=alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw")
         simple_mode="linear" if checkpoint_mode else alignment_mode
         if checkpoint_mode:
             # KISS baseline: times were already shifted by the known count-in.
@@ -2000,7 +2096,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             opening_specs=specs+[("guitar",_event_times(guitar_alignment_events),guitar_audio_path)]
             opening_candidates=build_opening_anchor_candidates(
                 opening_specs,score_start,audio_content_start,sr=sr,
-                maximum_score_delay=15.0,maximum_anchor_shift=4.0,minimum_events=4)
+                maximum_score_delay=15.0,maximum_anchor_shift=4.0,minimum_events=4,
+                full_audio_path=full_audio_path)
             score_anchor,audio_anchor,opening_report=choose_opening_anchor(
                 opening_candidates,score_start,audio_content_start,
                 simultaneous_score_tolerance=.050,audio_agreement_tolerance=.250)
@@ -2041,7 +2138,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         decision["timing_origin"]={"audio_content_start":round(audio_content_start,6),
             "first_configured_instrument_score_onset":round(score_content_time,6),
             "chart_offset":round(chart_offset,6),"tempo_events_rebased_to_first_tick":True}
-        if alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"):
+        if alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw"):
             diagnostic_reference=next(((name,times,path) for name,times,path in specs if times and path), ("none",[],None))
             diagnostic_source,diagnostic_times,diagnostic_path=diagnostic_reference
             fc.log(f"Detecting diagnostic {diagnostic_source} checkpoints every {checkpoint_measures} measures",indent=1)
@@ -2118,8 +2215,63 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             fc.log(f"Checkpoints: {checkpoint_report.get('strong',0)} strong, "
                    f"{checkpoint_report.get('rejected',0)} rejected; "
                    f"timing {'selective local DTW production' if alignment_mode=='checkpoint-dtw-selective' else ('diagnostic local DTW; packaged checkpoint-linear' if alignment_mode=='checkpoint-dtw-diagnostic' else ('guardedly corrected' if alignment_mode=='checkpoint-linear' else 'unchanged'))}",indent=2)
+    # Build a diagnostic-only, full-song structural candidate inventory
+    # before manual anchors modify the automatic baseline. Candidate discovery
+    # is intentionally lenient: a strong restart on the corresponding isolated
+    # stem can stand on its own, while multi-stem agreement adds support.
+    # Use sounding intervals, not attack times, for fretted instruments. This
+    # prevents long sustains and ties from being misclassified as silence.
+    continuous_score_events={"drums":[{"t_gp":t,"end_gp":t} for t in _event_times(drum_hits_gp)],
+                             "bass":[],"guitar":[],"piano":[]}
+    # Preserve authored releases and attach pitch identity from the canonical
+    # parser-neutral pitch products. Dense matching needs both rhythm and chroma.
+    role_pitch_events={"guitar":guitar_pitch_events,"bass":bass_pitch_events,"piano":piano_pitch_events}
+    pitch_by_role={}
+    for role,events in role_pitch_events.items():
+        lookup={}
+        for event in events or []:
+            lookup.setdefault(round(float(event["t_gp"]),6),[]).append(int(event["midi"]))
+        pitch_by_role[role]=lookup
+    for track_data in fretted_tracks.values():
+        role=role_by_name.get(track_data.get("name"))
+        if role not in ("guitar","bass"):
+            continue
+        for note in track_data.get("notes",[]):
+            start=float(note["t_gp"]); values=pitch_by_role[role].get(round(start,6),[])
+            midi=note.get("midi")
+            if midi is None and values: midi=values[0]
+            row={"t_gp":start,"end_gp":start+max(0.0,float(note.get("sus",0.0) or 0.0))}
+            if midi is not None: row["midi"]=int(midi)
+            continuous_score_events[role].append(row)
+    continuous_score_events["piano"]=[{"t_gp":float(x["t_gp"]),"end_gp":float(x.get("end_gp",x["t_gp"])),"midi":int(x["midi"])}
+                                             for x in (piano_pitch_events or [])]
+    continuous_audio_paths={
+        "drums":drums_audio_path,
+        "bass":bass_audio_path,
+        "guitar":guitar_audio_path,
+        "piano":piano_audio_path,
+        "full":full_audio_path,
+    }
+    continuous_anchor_report=ca.diagnose_continuous_anchors(
+        continuous_score_events,continuous_audio_paths,warp_fn,
+        song_timeline_gp["beats"],float(tempo_events[0][1]),sr=sr,
+        feature_cache_dir=os.path.join(os.path.dirname(os.path.abspath(gp_path)),"_alignment_cache","features"),
+    )
+    decision["continuous_anchor_diagnostics"]=continuous_anchor_report
+    cs=continuous_anchor_report["summary"]
+    fc.log(
+        f"Continuous anchors: {cs['score_candidates']} score candidates "
+        f"({cs.get('structural_score_candidates', 0)} structural, {cs.get('dense_score_candidates', 0)} dense), "
+        f"{cs['locally_searched_score_events']} chart-guided local searches, "
+        f"{cs['retained_audio_hypotheses']} retained audio hypotheses, "
+        f"{cs['matched_score_events']} matched score events, "
+        f"{cs['strong_single_stem_restarts']} strong single-stem restarts "
+        "(diagnostic only)",indent=1,
+    )
     automatic_warp = warp_fn
-    warp_fn, manual_anchor_report = apply_manual_anchor_layer(
+    # Resolve and assess manual anchors first so exact observations can act as
+    # immutable path constraints. The temporary manual warp is not yet chosen.
+    _manual_preview_warp, manual_anchor_report = apply_manual_anchor_layer(
         automatic_warp, anchors_path, song_timeline_gp["beats"],
         padding_added=padding_added,
     )
@@ -2127,6 +2279,119 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     decision["manual_anchor_quality"] = manual_anchor_report.get("quality")
     decision["manual_anchor_warp"] = manual_anchor_report.get("warp")
     decision["manual_anchor_status"] = manual_anchor_report.get("status")
+    anchor_path_preview=ca.preview_monotonic_anchor_path(
+        continuous_anchor_report,automatic_warp,
+        manual_anchor_quality=manual_anchor_report.get("quality"),
+    )
+    decision["continuous_anchor_path_preview"]=anchor_path_preview
+    fc.log(
+        f"Anchor path preview: {anchor_path_preview['selected_automatic_anchor_count']} automatic anchor(s) "
+        f"selected from {anchor_path_preview['score_cluster_count']} score cluster(s); "
+        f"{anchor_path_preview['skipped_cluster_count']} skipped; "
+        f"monotonic={anchor_path_preview['validation']['monotonic']} "
+        "(diagnostic only)",indent=1,
+    )
+    apply_continuous_linear = alignment_mode in ("continuous-anchor-linear", "continuous-anchor-dtw") and force_continuous_anchor_warp
+    decision["dense_production_enabled"] = False
+    decision["dense_joint_matcher_status"] = "diagnostic_only_until_corpus_validation"
+    continuous_linear_warp, continuous_linear_report = ca.build_continuous_anchor_linear_warp(
+        automatic_warp, anchor_path_preview, song_timeline_gp["beats"],
+        manual_anchor_quality=manual_anchor_report.get("quality"),
+        apply=apply_continuous_linear,
+        force_invalid=force_continuous_anchor_warp,
+    )
+    decision["continuous_anchor_linear"] = continuous_linear_report
+    decision["diagnostic_unsafe_timing"] = bool(continuous_linear_report.get("forced_invalid_diagnostic"))
+    clv=continuous_linear_report["validation"]
+    fc.log(
+        f"Continuous linear warp: status={continuous_linear_report['status']}; "
+        f"controls={len(continuous_linear_report['controls'])}; "
+        f"max change={clv['maximum_absolute_difference_seconds']:.3f}s; "
+        f"measure stretch={clv['minimum_measure_stretch_relative_to_baseline']:.4f}.."
+        f"{clv['maximum_measure_stretch_relative_to_baseline']:.4f}",indent=1,
+    )
+    # Exact manual anchors are already control points in the continuous map.
+    # Reapplying the manual layer here would rebuild a new interpolation using
+    # only manual points and baseline endpoints, unintentionally discarding the
+    # selected automatic controls between them.
+    if apply_continuous_linear and continuous_linear_report.get("timing_changes_applied"):
+        warp_fn = continuous_linear_warp
+    else:
+        warp_fn = _manual_preview_warp
+
+    # Optional second-stage refinement. DTW is evaluated independently inside
+    # trusted continuous/manual intervals, with the accepted linear/manual map
+    # as both initialization and exact endpoint constraint.
+    apply_continuous_dtw = alignment_mode == "continuous-anchor-dtw"
+    if apply_continuous_dtw:
+        if continuous_linear_report.get("timing_changes_applied"):
+            trusted_report = continuous_linear_report
+        else:
+            manual_controls = []
+            for item in (manual_anchor_report.get("quality", {}).get("anchors") or []):
+                if item.get("mode") == "exact":
+                    manual_controls.append({
+                        "score_time": float(item["nominal_time"]),
+                        "audio_time": float(item["padded_audio_time"]),
+                        "kind": "manual_exact",
+                        "id": item.get("id"),
+                    })
+            trusted_report = {"controls": manual_controls}
+        dtw_config = cdtw.TrustedAnchorDTWConfig()
+        if trusted_report.get("controls"):
+            trusted_dtw_report = cdtw.diagnose_trusted_anchor_segment_dtw(
+                warp_fn, trusted_report, song_timeline_gp["beats"],
+                {"drums": _event_times(drum_hits_gp),
+                 "bass": _event_times(bass_alignment_events),
+                 "guitar": _event_times(guitar_alignment_events),
+                 "piano": _event_times(piano_alignment_events)},
+                {"drums": drums_audio_path, "bass": bass_audio_path,
+                 "guitar": guitar_audio_path, "piano": piano_audio_path,
+                 "full": full_audio_path},
+                sr=sr, config=dtw_config,
+            )
+            dtw_warp, dtw_production_report = cdtw.build_selective_warp(
+                warp_fn, trusted_dtw_report, song_timeline_gp["beats"],
+                config=dtw_config,
+            )
+            decision["continuous_anchor_dtw"] = trusted_dtw_report
+            decision["continuous_anchor_dtw_production"] = dtw_production_report
+            if dtw_production_report.get("timing_changes_applied"):
+                warp_fn = dtw_warp
+            ds = trusted_dtw_report["summary"]
+            fc.log(
+                f"Trusted-anchor local DTW: {ds['generated_segments']} segment(s), "
+                f"{ds['would_apply']} accepted candidate(s), "
+                f"{dtw_production_report['applied_segment_count']} applied; "
+                f"status={dtw_production_report['status']}", indent=1,
+            )
+        else:
+            decision["continuous_anchor_dtw"] = {
+                "version": "3.0", "status": "unavailable_no_trusted_controls",
+                "timing_changes_applied": False, "segments": [],
+            }
+            decision["continuous_anchor_dtw_production"] = {
+                "version": "1.0", "status": "baseline_fallback_no_trusted_controls",
+                "timing_changes_applied": False, "applied_segment_count": 0,
+            }
+            fc.log("Trusted-anchor local DTW: no trusted controls; retaining fallback map", indent=1)
+    if apply_continuous_linear:
+        if apply_continuous_dtw:
+            decision["mode"] = "continuous-anchor-dtw-v1"
+            dtw_applied = bool((decision.get("continuous_anchor_dtw_production") or {}).get("timing_changes_applied"))
+            decision["timing_output"] = (
+                "continuous-anchor-dtw-v1" if dtw_applied else
+                "continuous-anchor-linear-v1" if continuous_linear_report.get("timing_changes_applied") else
+                "manual-anchor-fallback" if manual_anchor_report.get("timing_changes_applied") else
+                "automatic-baseline-fallback"
+            )
+        else:
+            decision["mode"] = "continuous-anchor-linear-v1"
+            decision["timing_output"] = (
+                "continuous-anchor-linear-v1"
+                if continuous_linear_report.get("timing_changes_applied")
+                else ("manual-anchor-fallback" if manual_anchor_report.get("timing_changes_applied") else "automatic-baseline-fallback")
+            )
     if manual_anchor_report.get("quality", {}).get("anchors"):
         q = manual_anchor_report["quality"]
         fc.log(
@@ -2280,9 +2545,11 @@ def main():
     parser.add_argument("--piano-audio", default=None)
     parser.add_argument("--guitar-audio", default=None)
     parser.add_argument("--full-audio", default=None)
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective"),default="dtw")
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw"),default="dtw")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
                         help="A/B test output: dense tempos only, explicit beats only, or both")
+    parser.add_argument("--force-continuous-anchor-warp", action="store_true",
+                        help="DIAGNOSTIC ONLY: apply an invalid continuous-anchor proposal for A/B listening")
     parser.add_argument("--allow-severe-alignment", action="store_true",
                         help="Package even if severe structural timing errors remain after repair")
     parser.add_argument("--anchors", default=None)
@@ -2311,15 +2578,12 @@ def main():
                    checkpoint_measures=args.checkpoint_measures,
                    checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config,
                    gp_parser=args.gp_parser, score_json_path=args.score_json, alphatab_extractor=args.alphatab_extractor, node_executable=args.node_executable,
-                   piano_duration_quantize_ms=args.piano_duration_quantize_ms)
+                   piano_duration_quantize_ms=args.piano_duration_quantize_ms,
+                   force_continuous_anchor_warp=args.force_continuous_anchor_warp)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
 

@@ -1,0 +1,10 @@
+numpy
+scipy
+librosa
+soundfile
+PyYAML
+pyphen
+PyGuitarPro
+jsonschema
+pytest
+# Optional vocal pipeline: whisperx, torchcrepe, and a matching PyTorch build

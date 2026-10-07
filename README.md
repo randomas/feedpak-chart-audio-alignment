@@ -1714,3 +1714,49 @@ rebuild.
 `original` means the unpadded source recording. The builder adds only the
 physical silence introduced during the current build. Use `padded` when the
 time was read from the already padded/package audio.
+
+## Diagnostic unsafe continuous-anchor comparison
+
+Use the comparison switch only for controlled A/B listening. The normal Feedpak remains guarded and unchanged. A second package is built from the same inputs with the rejected continuous-anchor proposal forced into the timing map.
+
+```powershell
+python build_feedpak.py .\my_test_song_gp .\output `
+  --alignment-mode continuous-anchor-dtw `
+  --build-unsafe-continuous-comparison `
+  --skip-vocals `
+  --keep-work-dir
+```
+
+The output pair is named like this:
+
+```text
+Artist - Song.feedpak
+Artist - Song.UNSAFE-CONTINUOUS.feedpak
+```
+
+The unsafe package is for diagnosis only. Its alignment report sets `decision.diagnostic_unsafe_timing` to `true` and the continuous-linear status to `forced_invalid_diagnostic`. Exact manual anchors remain controls. Do not distribute the unsafe package as a normal production build. The comparison option requires `continuous-anchor-linear` or `continuous-anchor-dtw`.
+
+The comparison currently performs a complete second build. With `--skip-vocals`, this mostly repeats score parsing and alignment rather than expensive vocal inference.
+
+## Joint rhythm and chroma dense-anchor diagnostics
+
+Dense pitched anchors now compare a score fingerprint with the corresponding isolated-stem audio window. The score fingerprint combines tempo-normalized onset rhythm with sustained pitch-class activity. The audio fingerprint combines onset strength with harmonic CQT chroma. Both rhythm and chroma must pass independent gates. A broad ±6 second search remains available, but a Gaussian-mixture temporal prior makes distant matches progressively less probable. Best-versus-runner-up margin and ratio gates reject ambiguous repeated material.
+
+Dense automatic anchors remain diagnostic-only in normal builds. Production timing retains the safe baseline, exact manual anchors, and existing guarded methods. `--build-unsafe-continuous-comparison` explicitly forces the joint-validated diagnostic path for corpus listening.
+
+Audio rhythm/chroma features are cached under each song folder:
+
+```text
+_alignment_cache/features/
+```
+
+The cache is content-addressed by the audio bytes, sample rate, hop length, and feature version. Safe and unsafe comparison passes therefore reuse identical padded-stem features even when temporary file timestamps change. Delete `_alignment_cache` to force feature regeneration.
+
+The comparison package name is now distinct and cannot overwrite the safe result:
+
+```text
+Artist - Song.feedpak
+Artist - Song.UNSAFE-CONTINUOUS.feedpak
+```
+
+The PowerShell corpus runner writes logs as UTF-8 and prefers a genuine modern `.gp` file when both `.gp` and `.gp5` are present.

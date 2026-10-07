@@ -1,6 +1,6 @@
 from types import SimpleNamespace as N
 import project_config as pc
-from build_feedpak import validate_vocal_coverage
+from build_feedpak import validate_vocal_coverage, resolve_gp_vocal_policy
 
 def _song(track=True,line=None,text=None):
     tracks=[N(name='Lead Vocals',measures=[N(voices=[N(beats=[N(start=0,text=text,notes=[N()])])])])] if track else []
@@ -19,3 +19,21 @@ def test_tail_warning():
 
 
 
+
+def test_explicit_null_disables_alphatab_gp_vocals():
+    metadata={"feedpak_project":{"tracks":{"lead_vocal":None}}}
+    capability={"direct_gp_lyrics_supported":True}
+    policy=resolve_gp_vocal_policy(metadata,capability,"alphatab")
+    assert policy["setting_present"] is True
+    assert policy["production"] is False
+
+
+def test_explicit_vocal_name_enables_gp_vocals():
+    metadata={"feedpak_project":{"tracks":{"lead_vocal":"Vocals"}}}
+    capability={"direct_gp_lyrics_supported":True}
+    assert resolve_gp_vocal_policy(metadata,capability,"alphatab")["production"] is True
+
+
+def test_unconfigured_alphatab_retains_automatic_vocals():
+    capability={"direct_gp_lyrics_supported":True}
+    assert resolve_gp_vocal_policy({},capability,"alphatab")["production"] is True

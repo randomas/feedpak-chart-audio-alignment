@@ -84,7 +84,10 @@ def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False, dea
     if dead:
         sustain = min(sustain, DEAD_NOTE_MAX_SECONDS)
     if let_ring:
-        limits = []
+        # Let-ring extends to the first physical interruption, but may never
+        # cross that interruption. This clips overlong authored durations at a
+        # same-string re-attack or playback-segment boundary.
+        boundaries = []
         for value in (next_same_string_delta, segment_remaining):
             if value is not None:
                 try:
@@ -92,9 +95,9 @@ def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False, dea
                 except (TypeError, ValueError):
                     continue
                 if value >= 0:
-                    limits.append(value)
-        if limits:
-            sustain = max(sustain, min(limits))
+                    boundaries.append(value)
+        if boundaries:
+            sustain = min(boundaries)
     if segment_remaining is not None:
         sustain = min(sustain, max(0.0, float(segment_remaining)))
     if authored > 0.0:
