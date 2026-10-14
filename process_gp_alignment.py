@@ -944,6 +944,19 @@ def parse_fretted_track(track, tempo_events, first_tick):
                 t=fc.tick_to_seconds(beat.start-first_tick,tempo_events); end=fc.tick_to_seconds(beat.start-first_tick+beat.duration.time,tempo_events)
                 for note in beat.notes: pending.append({"note":note,"beat":beat,"t_gp":t,"s":fc.remap_string_index(note.string,string_count),"f":int(note.value),"sus":max(0,end-t)})
     pending.sort(key=lambda x:(x["t_gp"],x["s"])); lanes={}
+    # A fresh non-let-ring chord interrupts an earlier let-ring texture across
+    # a merged track, even when it attacks a disjoint set of strings.
+    onset_groups={}
+    for x in pending:onset_groups.setdefault(round(float(x["t_gp"]),9),[]).append(x)
+    texture_boundaries=[]
+    for onset,group in onset_groups.items():
+        fresh=[]
+        for x in group:
+            note=x["note"]; ne=getattr(note,"effect",None); be=getattr(x["beat"],"effect",None)
+            tied="tie" in ee.enum_name(getattr(note,"type",None))
+            ringing=bool(getattr(ne,"letRing",False) or getattr(be,"letRing",False))
+            if not tied and not ringing:fresh.append(x)
+        if len(fresh)>=2:texture_boundaries.append(onset)
     for x in pending:lanes.setdefault(x["s"],[]).append(x)
     next_fret={}; next_same_string_delta={}
     for lane in lanes.values():
@@ -961,9 +974,11 @@ def parse_fretted_track(track, tempo_events, first_tick):
         let_ring=bool(getattr(ne,"letRing",False) or getattr(be,"letRing",False))
         staccato=bool(getattr(ne,"staccato",False))
         dead=("dead" in ee.enum_name(getattr(note,"type",None)))
+        texture_delta=next((max(0.0,t-item["t_gp"]) for t in texture_boundaries if t>item["t_gp"]),None)
         sustain=ee.apply_sustain_semantics(
             item["sus"],staccato=staccato,let_ring=let_ring,dead=dead,
-            next_same_string_delta=next_same_string_delta.get(id(item)))
+            next_same_string_delta=next_same_string_delta.get(id(item)),
+            texture_boundary_delta=texture_delta)
         row={"t_gp":item["t_gp"],"s":item["s"],"f":item["f"],"sus":sustain}
         row.update(ee.encode_gp5(note,item["beat"],sustain,next_fret.get(id(item))));notes.append(row)
     absolute=sorted((gs.number,gs.value) for gs in track.strings);tuning=[v for _,v in sorted(absolute,key=lambda x:-x[0])]

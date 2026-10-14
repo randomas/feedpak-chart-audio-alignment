@@ -73,7 +73,7 @@ def _is_active_enum(value):
 
 
 def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False, dead=False,
-                            next_same_string_delta=None, segment_remaining=None,
+                            next_same_string_delta=None, texture_boundary_delta=None, segment_remaining=None,
                             normal_gate_ratio=NORMAL_GATE_RATIO,
                             minimum_seconds=MINIMUM_EMITTED_SUSTAIN_SECONDS):
     """Return the explicit sounding duration for every fretted note."""
@@ -88,7 +88,7 @@ def apply_sustain_semantics(base_sustain, *, staccato=False, let_ring=False, dea
         # cross that interruption. This clips overlong authored durations at a
         # same-string re-attack or playback-segment boundary.
         boundaries = []
-        for value in (next_same_string_delta, segment_remaining):
+        for value in (next_same_string_delta, texture_boundary_delta, segment_remaining):
             if value is not None:
                 try:
                     value = float(value)

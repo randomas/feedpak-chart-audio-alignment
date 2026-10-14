@@ -284,6 +284,29 @@ def products(data, project_config_path=None):
             event_lookup = {_event_playback_identity(x, segment_by_visit): x for x in ordered_events}
             next_fret = {}
             next_same_string = {}
+            # Conservative track-wide interruption for pasted/merged parts.
+            texture_boundaries = []
+            onset_groups = {}
+            for x in ordered_events:
+                identity = _event_playback_identity(x, segment_by_visit)
+                key = (identity[0], float(x.get("absolute_start_tick") or 0.0))
+                onset_groups.setdefault(key, []).append(x)
+            for (segment_id, tick), group in onset_groups.items():
+                fresh = []
+                for x in group:
+                    note_semantic = notes_by_id.get((idx, x.get("note_id"))) or {}
+                    beat_semantic = beats_by_id.get((idx, x.get("beat_id"))) or {}
+                    links = note_semantic.get("links") or {}
+                    techniques = note_semantic.get("techniques") or {}
+                    state = beat_semantic.get("state") or {}
+                    if links.get("is_tie_destination"):
+                        continue
+                    if techniques.get("let_ring") or state.get("let_ring"):
+                        continue
+                    fresh.append(x)
+                if len(fresh) >= 2:
+                    texture_boundaries.append((segment_id, tick))
+            texture_boundaries.sort()
             lanes = {}
             for x in ordered_events:
                 identity = _event_playback_identity(x, segment_by_visit)
@@ -315,6 +338,11 @@ def products(data, project_config_path=None):
                 segment = _event_playback_identity(event, segment_by_visit)[0]
                 segment_end = _seconds(float(segment_end_tick.get(segment, start_tick + duration_ticks)), tempo, ppq)
                 segment_remaining = max(0.0, segment_end - start)
+                texture_delta = None
+                for boundary_segment, boundary_tick in texture_boundaries:
+                    if boundary_segment == segment and boundary_tick > start_tick:
+                        texture_delta = max(0.0, _seconds(boundary_tick, tempo, ppq) - start)
+                        break
                 techniques = semantic.get("techniques") or {}
                 state = beat_semantic.get("state") or {}
                 sustain = ee.apply_sustain_semantics(
@@ -323,6 +351,7 @@ def products(data, project_config_path=None):
                     let_ring=bool(techniques.get("let_ring") or state.get("let_ring")),
                     dead=bool(techniques.get("dead")),
                     next_same_string_delta=next_delta,
+                    texture_boundary_delta=texture_delta,
                     segment_remaining=segment_remaining,
                 )
                 row = {"t_gp": start, "s": string_index, "f": int(fret), "sus": sustain}
