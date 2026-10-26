@@ -1,0 +1,18 @@
+{
+  "fixture": "Supremacy continuous-anchor-dtw successful run 2026-10-22",
+  "implementation": "october-sparse-structural-v1",
+  "selected_anchor_count": 7,
+  "skipped_anchor_clusters": 0,
+  "linear_control_count": 7,
+  "linear_status": "applied",
+  "maximum_absolute_correction_seconds": 4.446,
+  "minimum_linear_measure_stretch": 1.0,
+  "maximum_linear_measure_stretch": 1.0296,
+  "trusted_interval_count": 16,
+  "applied_local_dtw_segments": 1,
+  "final_minimum_stretch": 0.988867,
+  "final_maximum_stretch": 1.018178,
+  "timeline_beat_mismatches": 0,
+  "timeline_tempo_mismatches": 0,
+  "repaired_measures": 0
+}
