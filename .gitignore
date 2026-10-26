@@ -8,3 +8,66 @@ _feedpak_build/
 *.feedpak
 *.alignment_report.json
 intermediate_*.json
+
+# Environments and caches
+env/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+Tokens And APIs.txt
+
+# Private song/test materials
+my_test_song*/
+materials/private/
+
+# Audio, stems, and commercial chart material
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.gp
+*.gp3
+*.gp4
+*.gp5
+*.gpx
+*.gpif
+*.alphatab.json
+
+# Generated FeedPaks and diagnostics
+*.feedpak
+*.feedpak.*
+*.alignment_report.json
+*.transcription_investigator.json
+run_*/
+Diagnostics/
+Diagnostics_light/
+Diagnostics_full/
+*_outputs/
+output*/
+patch_1_6_smoke/
+
+# Generated intermediates
+intermediate_arrangements.json
+intermediate_vocals.json
+
+# Backups and dumps
+*.bak
+*.before*
+*_backup
+*_dump.txt
+project_dump*.txt
+
+# Local inventories
+folder-size-inventory*.csv
+largest-files-inventory*.csv
+
+# Local archives
+*.zip
+*.zip.txt
