@@ -1760,3 +1760,93 @@ Artist - Song.UNSAFE-CONTINUOUS.feedpak
 ```
 
 The PowerShell corpus runner writes logs as UTF-8 and prefers a genuine modern `.gp` file when both `.gp` and `.gp5` are present.
+
+### Experimental structural second pass
+
+Enable drift-adjusted dual-centre candidate recovery only for the structural continuous method:
+
+```powershell
+.\run_all_alignment_methods.ps1 `
+  -MaterialsRoot "C:\path\to\materials" `
+  -OutputRoot "C:\path\to\outputs" `
+  -Only "my_song_folder" `
+  -Methods @("continuous-anchor-structural") `
+  -StructuralSecondPass `
+  -SkipUnitTests
+```
+
+Without `-StructuralSecondPass`, `continuous-anchor-structural` retains its previous single-pass behavior. The second pass uses the first-pass path only to move search centres, keeps baseline-centred candidates, merges both hypothesis sets, and reruns global monotonic path selection.
+
+## Optional transcription investigator
+
+The investigator is a method-independent, diagnostic-only prepared-evidence layer. It does not change production timing.
+
+Install either or both optional providers:
+
+```powershell
+pip install basic-pitch drumscript
+```
+
+Run with any alignment method:
+
+```powershell
+.\run_all_alignment_methods.ps1 `
+  -MaterialsRoot "C:\path\to\materials" `
+  -OutputRoot "C:\path\to\outputs" `
+  -Only "my_test_song*_gp" `
+  -Methods @("continuous-anchor-structural") `
+  -TranscriptionInvestigator `
+  -SkipUnitTests
+```
+
+Basic Pitch is attempted for available piano, guitar, and bass stems. DrumScript is attempted for the isolated drum stem. Missing or incompatible optional providers are reported and do not fail the build. Raw transcription is cached by audio hash, provider version, adapter settings, and adapter cache version under `_alignment_cache/transcription`.
+
+The investigator writes `<feedpak>.transcription_investigator.json`. All candidates are initially marked `production_eligible: false` and `timing_changes_applied: false`.
+
+## Prepared MuScriptor transcription evidence
+
+MuScriptor is a material-preparation stage, not a project dependency. Run it externally and place any available canonical MIDI files in each song folder:
+
+```text
+Piano.muscriptor.mid
+Guitar.muscriptor.mid
+Bass.muscriptor.mid
+Drums.muscriptor.mid
+```
+
+Files are optional and discovered case-insensitively. Missing roles are reported as `not_prepared` and do not fail the build. The prepared MIDI clock must reference the original unpadded source stem. The investigator adds the build's canonical `padding_added` during ingestion without modifying the MIDI.
+
+Enable prepared evidence with:
+
+```powershell
+-TranscriptionInvestigator
+```
+
+The option is available only for:
+
+```text
+dtw-checkpoint
+checkpoint-linear
+checkpoint-dtw-diagnostic
+checkpoint-dtw-selective
+continuous-anchor-linear
+continuous-anchor-dtw
+continuous-anchor-structural
+bar-landmark-regularized
+```
+
+It is deliberately unavailable for `nominal`, `offset`, `linear`, and unguarded `dtw`. The all-method runner automatically skips the investigator for those four methods. Direct unsupported invocations fail with a clear error.
+
+### Matching policy
+
+The matcher is always bidirectional. It discovers partial-sequence hypotheses, extends them forward and backward, reconciles both directions, previews a globally monotonic chain, and reports unsupported gaps. Matching is asymmetric: extra MuScriptor notes are cheap to skip, missing chart notes are tolerated at a higher cost, and incorrect pitch/order matches are discouraged. Exact pitch, octave-equivalent pitch, pitch class, relative timing, local stretch, timing prior, and runner-up margin contribute to candidate confidence.
+
+All transcription candidates remain diagnostic-only in this release:
+
+```text
+production_eligible: false
+timing_changes_applied: false
+candidate_count_applied: 0
+```
+
+The build writes `<feedpak>.transcription_investigator.json` containing prepared-file provenance, source and padded clocks, normalized events, forward/backward scores, candidates, the monotonic path preview, and unsupported gaps.
