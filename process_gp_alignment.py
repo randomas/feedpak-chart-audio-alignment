@@ -26,8 +26,17 @@ import checkpoint_dtw as cdtw
 import project_config as pc
 import alphatab_score as ats
 import expression_encoding as ee
+import beatmap as bm
+import beatmap_evidence as bme
+import instrument_evidence as ie
+import regional_source_fusion as rsf
+import alignment_proposals as alignment_proposals_module
+import bar_landmark_alignment as bar_landmark_alignment_module
+import structural_search as structural_search_module
 import manual_anchors as ma
 import continuous_anchors as ca
+import transcription_investigator as ti
+import continuous_anchors_legacy as ca_legacy
 
 try:
     import guitarpro
@@ -917,6 +926,59 @@ def analyze_alignment_quality(nominal,warped,warp_fn,sanitization):
     return {"version":1,"severity":severity,"decision":getattr(warp_fn,"alignment_diagnostics",{}),
             "sanitization":sanitization,"min_stretch":round(min(ratios or [1]),4),
             "max_stretch":round(max(ratios or [1]),4),"warnings":warnings}
+
+
+def finalize_production_timing(decision, requested_method):
+    """Create one authoritative layered production timing record."""
+    decision = decision if isinstance(decision, dict) else {}
+    linear=decision.get("continuous_anchor_linear") or {}
+    dtw=decision.get("continuous_anchor_dtw_production") or {}
+    bar=decision.get("bar_landmark_alignment") or {}
+    checkpoint=decision.get("local_dtw_production") or {}
+    output=decision.get("timing_output") or decision.get("mode") or "unknown"
+    continuous_changed=bool(linear.get("timing_changes_applied"))
+    checkpoint_linear=decision.get("checkpoint_linear") or {}
+    checkpoint_changed=bool(checkpoint.get("checkpoint_linear_changes_applied") or
+                            checkpoint_linear.get("timing_changes_applied"))
+    local_changed=bool(dtw.get("timing_changes_applied") or checkpoint.get("timing_changes_applied"))
+    bar_changed=bool(bar.get("timing_changes_applied"))
+    scale=float(decision.get("scale",1.0) or 1.0)
+    opening=decision.get("opening_anchor") or {}
+    opening_changed=(opening.get("score_anchor") is not None and opening.get("audio_anchor") is not None and
+                     abs(float(opening["audio_anchor"])-float(opening["score_anchor"]))>1e-6)
+    base_changed=bool(decision.get("base_timing_changed") or decision.get("global_timing",{}).get("timing_changes_applied") or
+                      abs(scale-1.0)>1e-9 or opening_changed)
+    sanitization=bool(decision.get("sanitization",{}).get("timing_changes_applied") or decision.get("sanitization_applied"))
+    any_changed=bool(base_changed or checkpoint_changed or continuous_changed or local_changed or bar_changed)
+    fallback=bool("fallback" in output or (requested_method=="checkpoint-dtw-selective" and not local_changed))
+    if requested_method=="checkpoint-dtw-selective" and not local_changed:
+        selected="checkpoint-linear" if checkpoint_changed or "checkpoint" in output else output.replace("-v1","")
+    elif any_changed:
+        selected=requested_method
+    else:
+        selected=output.replace("-v1","")
+    reason=None
+    if fallback:
+        reason=(checkpoint.get("fallback_reason") or checkpoint.get("status") or
+                linear.get("status") or bar.get("status") or "proposal_not_applied")
+    candidate_engine=("october-sparse-structural-v1" if requested_method in ("continuous-anchor-linear","continuous-anchor-dtw") else
+        "dense-rhythm-chroma-v2" if requested_method=="continuous-anchor-structural" else
+        "bar-landmark-regularized-v1" if requested_method=="bar-landmark-regularized" else "checkpoint-or-global")
+    record={"version":"2.0","requested_method":requested_method,"selected_production_method":selected,
+        "timing_output":output,"candidate_engine":candidate_engine,
+        "warp_engine":"piecewise-linear" if continuous_changed else "bar-landmark" if bar_changed else "checkpoint-or-global",
+        "refinement_engine":"trusted-segment-dtw" if requested_method=="continuous-anchor-dtw" else "checkpoint-segment-dtw" if requested_method=="checkpoint-dtw-selective" else None,
+        "timing_changes_applied":any_changed,
+        "base_timing_changed":base_changed,"checkpoint_linear_changed":checkpoint_changed,
+        "continuous_linear_changed":continuous_changed,"local_dtw_changed":local_changed,
+        "sanitization_applied":sanitization,
+        "linear_changes_applied":continuous_changed,"local_dtw_changes_applied":local_changed,
+        "bar_landmark_changes_applied":bar_changed,
+        "applied_local_dtw_segments":int(dtw.get("applied_segment_count",checkpoint.get("applied_segment_count",0)) or 0),
+        "fallback_used":fallback,"fallback_reason":reason,
+        "fallback_chain":[{"method":requested_method,"selected":selected,"reason":reason}] if fallback else []}
+    decision["requested_method"]=requested_method; decision["selected_production_method"]=selected; decision["production_timing"]=record
+    return record
 
 
 def shift_nominal_times(entries, offset, time_key="t_gp"):
@@ -1949,7 +2011,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False):
+            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
     if gp_parser == "alphatab":
@@ -2086,7 +2148,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     else:
         reference=next(((source,times,path) for source,times,path in specs if times and path),None)
         source,event_times,audio_path=reference if reference else ("none",[],None)
-        checkpoint_mode=alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw")
+        checkpoint_mode=alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw","bar-landmark-regularized")
         simple_mode="linear" if checkpoint_mode else alignment_mode
         if checkpoint_mode:
             # KISS baseline: times were already shifted by the known count-in.
@@ -2153,7 +2215,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         decision["timing_origin"]={"audio_content_start":round(audio_content_start,6),
             "first_configured_instrument_score_onset":round(score_content_time,6),
             "chart_offset":round(chart_offset,6),"tempo_events_rebased_to_first_tick":True}
-        if alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw"):
+        if alignment_mode in ("dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw","bar-landmark-regularized"):
             diagnostic_reference=next(((name,times,path) for name,times,path in specs if times and path), ("none",[],None))
             diagnostic_source,diagnostic_times,diagnostic_path=diagnostic_reference
             fc.log(f"Detecting diagnostic {diagnostic_source} checkpoints every {checkpoint_measures} measures",indent=1)
@@ -2215,7 +2277,12 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                     fc.log(f"Local DTW diagnostic: {q['boundary_assignments']} boundary assignments, {q['boundary_activated_evaluated']} evaluated, {q['boundary_activated_skipped']} skipped",indent=2)
                     fc.log(f"Local DTW diagnostic: {q['would_apply']} would apply, {q['rejected']} rejected",indent=2)
                     fc.log(f"Local DTW diagnostic: {q['skipped_baseline_accurate']} baseline-accurate, "
-                           f"{q['skipped_insufficient_features']} insufficient features",indent=2)
+                           f"{q.get('segments_insufficient_features',q.get('skipped_insufficient_features',0))} insufficient-feature segment(s), "
+                           f"{q.get('segments_no_source_passed_gates',0)} segment(s) with no source passing gates",indent=2)
+                    fc.log(f"Local DTW source candidates: {q.get('source_candidates_feature_evaluated',0)} feature-evaluated, "
+                           f"{q.get('source_candidates_unavailable',0)} unavailable, "
+                           f"{q.get('source_candidates_rejected_no_meaningful_improvement',0)} rejected for no meaningful improvement, "
+                           f"{q.get('source_candidates_accepted',0)} accepted",indent=2)
                     if alignment_mode=="checkpoint-dtw-selective":
                         pr=decision["local_dtw_production"]
                         fc.log(f"Selective local DTW: {pr['applied_segment_count']} segment(s) applied; status={pr['status']}",indent=2)
@@ -2236,7 +2303,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     # stem can stand on its own, while multi-stem agreement adds support.
     # Use sounding intervals, not attack times, for fretted instruments. This
     # prevents long sustains and ties from being misclassified as silence.
-    continuous_score_events={"drums":[{"t_gp":t,"end_gp":t} for t in _event_times(drum_hits_gp)],
+    continuous_score_events={"drums":[{"t_gp":float(x["t_gp"]),"end_gp":float(x["t_gp"]),"p":x.get("p")} for x in drum_hits_gp],
                              "bass":[],"guitar":[],"piano":[]}
     # Preserve authored releases and attach pitch identity from the canonical
     # parser-neutral pitch products. Dense matching needs both rhythm and chroma.
@@ -2267,10 +2334,62 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "piano":piano_audio_path,
         "full":full_audio_path,
     }
-    continuous_anchor_report=ca.diagnose_continuous_anchors(
+    transcription_report=None
+    if transcription_investigator:
+        ti.validate_method(alignment_mode)
+        fc.log("Reading prepared MuScriptor MIDI evidence (diagnostic only)",indent=1)
+        _diag=getattr(warp_fn,"alignment_diagnostics",{}) or {}
+        _opening=_diag.get("opening_anchor") or {}
+        _opening_score=_opening.get("score_anchor",_opening.get("score_time"))
+        _opening_audio=_opening.get("audio_anchor",_opening.get("audio_time"))
+        _scale=_diag.get("scale")
+        # Search MIDI sequences around two independent origin hypotheses:
+        # (1) the prepared chart/content clock, and (2) the offset method's
+        # observed musical incipit.  The observed incipit is a search centre,
+        # not an automatic whole-song warp.
+        nominal_midi_prior=lambda t:float(t)
+        nominal_midi_prior_report={
+            "kind":"expected_prepared_timeline","scale":1.0,"offset":0.0,
+            "chart_offset":float(chart_offset),"audio_content_start":float(audio_content_start),
+            "score_content_time":float(score_content_time),"padding_added":float(padding_added)}
+        observed_incipit_prior,observed_incipit_report=ti.make_nominal_opening_prior(
+            _opening_score,_opening_audio,_scale)
+        observed_incipit_report=dict(observed_incipit_report)
+        observed_incipit_report["kind"]="offset_method_incipit"
+        observed_incipit_report["authority"]="soft_search_hypothesis"
+        _midi_boundaries=[]
+        # Do not make the offset incipit an immutable boundary.  Recognizable
+        # note sequences must first confirm that it is the correct musical event.
+        transcription_report=ti.investigate(
+            continuous_score_events,os.path.dirname(os.path.abspath(gp_path)),warp_fn,
+            padding_added=padding_added,alignment_mode=alignment_mode,
+            nominal_prior=nominal_midi_prior,nominal_prior_report=nominal_midi_prior_report,
+            observed_incipit_prior=observed_incipit_prior,
+            observed_incipit_report=observed_incipit_report,
+            boundary_controls=_midi_boundaries,pass_label="dual_origin_sequence_search")
+        decision["transcription_investigator"]=transcription_report
+        ts=transcription_report.get("summary",{})
+        fc.log(f"MuScriptor evidence: prepared roles={ts.get('prepared_role_count',0)}/{ts.get('expected_role_count',0)}; "
+               f"events={ts.get('normalized_event_count',0)}; candidates={ts.get('candidate_correspondence_count',0)}; "
+               f"locally valid={ts.get('locally_valid_candidates',0)}; "
+               f"selected monotonic={ts.get('selected_monotonic_candidates',0)}; timing changes=0",indent=2)
+    else:
+        decision["transcription_investigator"]={"enabled":False,"status":"disabled","timing_changes_applied":False}
+    historical_continuous = alignment_mode in ("continuous-anchor-linear", "continuous-anchor-dtw")
+    continuous_engine = ca_legacy if historical_continuous else ca
+    # Keep the October engine byte-for-byte compatible at its call boundary.
+    # The newer structural engine accepts a feature cache; the historical one
+    # deliberately does not because changing extraction/caching could change
+    # its candidate ordering and break reproducibility.
+    continuous_diagnostic_kwargs = {"sr": sr}
+    if not historical_continuous:
+        continuous_diagnostic_kwargs["feature_cache_dir"] = os.path.join(
+            os.path.dirname(os.path.abspath(gp_path)), "_alignment_cache", "features"
+        )
+    continuous_anchor_report=continuous_engine.diagnose_continuous_anchors(
         continuous_score_events,continuous_audio_paths,warp_fn,
-        song_timeline_gp["beats"],float(tempo_events[0][1]),sr=sr,
-        feature_cache_dir=os.path.join(os.path.dirname(os.path.abspath(gp_path)),"_alignment_cache","features"),
+        song_timeline_gp["beats"],float(tempo_events[0][1]),
+        **continuous_diagnostic_kwargs,
     )
     decision["continuous_anchor_diagnostics"]=continuous_anchor_report
     cs=continuous_anchor_report["summary"]
@@ -2283,6 +2402,26 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         f"{cs['strong_single_stem_restarts']} strong single-stem restarts "
         "(diagnostic only)",indent=1,
     )
+    if alignment_mode == "bar-landmark-regularized":
+        bar_warp, bar_report = bar_landmark_alignment_module.build_bar_landmark_warp(
+            warp_fn, continuous_score_events, continuous_audio_paths,
+            song_timeline_gp["beats"], sr=sr,
+        )
+        decision["bar_landmark_alignment"] = bar_report
+        bs = bar_report.get("summary", {})
+        fc.log(
+            f"Bar-landmark alignment: status={bar_report.get('status')}; "
+            f"bars={bs.get('bars', 0)}; observed={bs.get('observed_bars', 0)}; "
+            f"interpolated={bs.get('interpolated_bars', 0)}; "
+            f"correction<={bs.get('maximum_absolute_correction_seconds', 0.0):.3f}s; "
+            f"stretch={bs.get('minimum_local_stretch', 1.0):.4f}..{bs.get('maximum_local_stretch', 1.0):.4f}",
+            indent=1,
+        )
+        if bar_report.get("timing_changes_applied"):
+            warp_fn = bar_warp
+            decision["mode"] = "bar-landmark-regularized-v1"
+            decision["timing_output"] = "bar-landmark-regularized-v1"
+
     automatic_warp = warp_fn
     # Resolve and assess manual anchors first so exact observations can act as
     # immutable path constraints. The temporary manual warp is not yet chosen.
@@ -2294,11 +2433,94 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     decision["manual_anchor_quality"] = manual_anchor_report.get("quality")
     decision["manual_anchor_warp"] = manual_anchor_report.get("warp")
     decision["manual_anchor_status"] = manual_anchor_report.get("status")
-    anchor_path_preview=ca.preview_monotonic_anchor_path(
+    anchor_path_preview=continuous_engine.preview_monotonic_anchor_path(
         continuous_anchor_report,automatic_warp,
         manual_anchor_quality=manual_anchor_report.get("quality"),
     )
     decision["continuous_anchor_path_preview"]=anchor_path_preview
+    midi_timing_trace={"midi_available":transcription_report is not None,"force_requested":bool(force_midi_authority),
+        "authority_gate_passed":False,"authority":None,"selected_as_production_baseline":False,
+        "final_output_contains_midi_warp":False,"rejection_reason":"transcription_unavailable" if transcription_report is None else None}
+    decision["midi_timing_decision"]=midi_timing_trace
+    if alignment_mode=="continuous-anchor-structural" and structural_second_pass:
+        drift_prior,prior_report=continuous_engine.build_drift_search_prior(automatic_warp,anchor_path_preview)
+        # Prepared MIDI remains diagnostic-only, but reliable globally-constrained
+        # phrases may centre structural Pass 2 searches. They never become
+        # production controls directly.
+        if transcription_report is not None:
+            midi_prior,midi_prior_report=ti.build_midi_authority_prior(transcription_report,nominal_midi_prior,force=force_midi_authority)
+            decision["transcription_structural_second_pass_prior"]=midi_prior_report
+            transcription_report["midi_authority"]=midi_prior_report
+            if force_midi_authority and midi_prior_report.get("status")=="force_blocked":
+                raise RuntimeError("MIDI AUTHORITY FORCE BLOCKED: "+str(midi_prior_report.get("force_blocked_reason")))
+            if midi_prior_report.get("status")=="available":
+                # Trusted performance-MIDI timing is the primary automatic clock.
+                # Audio evidence is evaluated against it, never averaged with a
+                # displaced legacy baseline.
+                automatic_warp=midi_prior
+                drift_prior=midi_prior
+                midi_timing_trace.update({"authority_gate_passed":bool(midi_prior_report.get("normal_gate_passed")),
+                    "authority":midi_prior_report.get("authority"),"selected_as_production_baseline":True,
+                    "rejection_reason":None,"trusted_control_count":midi_prior_report.get("trusted_control_count",0),
+                    "path_coverage":midi_prior_report.get("path_coverage"),"largest_score_gap_seconds":midi_prior_report.get("largest_score_gap_seconds"),
+                    "roles":midi_prior_report.get("roles",[])})
+                continuous_anchor_report=ti.classify_audio_anchor_compatibility(
+                    continuous_anchor_report,midi_prior)
+                decision["continuous_anchor_diagnostics"]=continuous_anchor_report
+                prior_report={"status":"available","source":midi_prior_report.get("authority","trusted_midi_primary"),
+                              "authority":"trusted_midi_primary",
+                              "control_count":midi_prior_report.get("trusted_control_count",0),
+                              "diagnostic_only":False,"forced":bool(force_midi_authority),
+                              "controls":midi_prior_report.get("representative_controls",[])}
+        decision["continuous_structural_second_pass_prior"]=prior_report
+        if prior_report.get("source")=="trusted_midi_primary":
+            fc.log(f"MIDI authority: {prior_report.get('control_count',0)} representative trusted control(s); audio anchors will corroborate/fill gaps",indent=1)
+        if prior_report.get("status")=="available":
+            second_report=continuous_engine.diagnose_continuous_anchors(
+                continuous_score_events,continuous_audio_paths,drift_prior,
+                song_timeline_gp["beats"],float(tempo_events[0][1]),
+                **continuous_diagnostic_kwargs,
+            )
+            if prior_report.get("source")=="trusted_midi_primary":
+                second_report=ti.classify_audio_anchor_compatibility(second_report,drift_prior)
+            continuous_anchor_report=continuous_engine.merge_dual_centre_reports(
+                continuous_anchor_report,second_report,automatic_warp,drift_prior)
+            decision["continuous_anchor_diagnostics"]=continuous_anchor_report
+            anchor_path_preview=continuous_engine.preview_monotonic_anchor_path(
+                continuous_anchor_report,automatic_warp,
+                manual_anchor_quality=manual_anchor_report.get("quality"),
+            )
+            decision["continuous_anchor_path_preview"]=anchor_path_preview
+            decision["continuous_structural_second_pass"]={
+                "enabled":True,"status":"completed","prior":prior_report,
+                "summary":continuous_anchor_report.get("summary",{}),
+                "final_selected_anchor_count":anchor_path_preview.get("selected_automatic_anchor_count",0)}
+            sp=continuous_anchor_report.get("summary",{})
+            fc.log(f"Structural second pass: recovered={sp.get('second_pass_recovered_score_events',0)}; "
+                   f"both-centres={sp.get('both_centres_matched_score_events',0)}; "
+                   f"baseline-only={sp.get('baseline_only_matched_score_events',0)}; "
+                   f"final anchors={anchor_path_preview.get('selected_automatic_anchor_count',0)}",indent=1)
+        else:
+            decision["continuous_structural_second_pass"]={"enabled":True,"status":"skipped","prior":prior_report}
+            fc.log(f"Structural second pass skipped: {prior_report.get('status')}",indent=1)
+    else:
+        decision["continuous_structural_second_pass"]={"enabled":False,"status":"disabled"}
+    if transcription_report is not None and alignment_mode=="continuous-anchor-structural" and structural_second_pass:
+        recovery_prior=(drift_prior if decision.get("continuous_structural_second_pass",{}).get("status")=="completed" else nominal_midi_prior)
+        manual_controls=[]
+        for row in ((manual_anchor_report.get("quality") or {}).get("accepted") or []):
+            if isinstance(row,dict): manual_controls.append(row)
+        second_transcription_report=ti.investigate(
+            continuous_score_events,os.path.dirname(os.path.abspath(gp_path)),warp_fn,
+            padding_added=padding_added,alignment_mode=alignment_mode,
+            nominal_prior=nominal_midi_prior,nominal_prior_report=nominal_midi_prior_report,
+            boundary_controls=_midi_boundaries+manual_controls,recovery_prior=recovery_prior,
+            pass_label="post_structural_recovery")
+        transcription_report["second_pass"]=second_transcription_report
+        transcription_report["final_global_monotonic_path_preview"]=second_transcription_report.get("global_monotonic_path_preview")
+        transcription_report["summary"]["second_pass_selected_monotonic_candidates"]=(second_transcription_report.get("summary") or {}).get("selected_monotonic_candidates",0)
+        decision["transcription_investigator"]=transcription_report
+        fc.log(f"MuScriptor recovery pass: selected={transcription_report['summary']['second_pass_selected_monotonic_candidates']}; timing changes=0",indent=1)
     fc.log(
         f"Anchor path preview: {anchor_path_preview['selected_automatic_anchor_count']} automatic anchor(s) "
         f"selected from {anchor_path_preview['score_cluster_count']} score cluster(s); "
@@ -2306,14 +2528,21 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         f"monotonic={anchor_path_preview['validation']['monotonic']} "
         "(diagnostic only)",indent=1,
     )
-    apply_continuous_linear = alignment_mode in ("continuous-anchor-linear", "continuous-anchor-dtw") and force_continuous_anchor_warp
+    apply_continuous_linear = alignment_mode in ("continuous-anchor-linear", "continuous-anchor-dtw", "continuous-anchor-structural")
     decision["dense_production_enabled"] = False
     decision["dense_joint_matcher_status"] = "diagnostic_only_until_corpus_validation"
-    continuous_linear_warp, continuous_linear_report = ca.build_continuous_anchor_linear_warp(
+    continuous_warp_kwargs = {
+        "manual_anchor_quality": manual_anchor_report.get("quality"),
+        "apply": apply_continuous_linear,
+    }
+    # force_invalid was added by the later diagnostic branch and is not part of
+    # the October linear/DTW implementation. Never pass it into the preserved
+    # historical methods. It remains available to the newer structural engine.
+    if not historical_continuous:
+        continuous_warp_kwargs["force_invalid"] = force_continuous_anchor_warp
+    continuous_linear_warp, continuous_linear_report = continuous_engine.build_continuous_anchor_linear_warp(
         automatic_warp, anchor_path_preview, song_timeline_gp["beats"],
-        manual_anchor_quality=manual_anchor_report.get("quality"),
-        apply=apply_continuous_linear,
-        force_invalid=force_continuous_anchor_warp,
+        **continuous_warp_kwargs,
     )
     decision["continuous_anchor_linear"] = continuous_linear_report
     decision["diagnostic_unsafe_timing"] = bool(continuous_linear_report.get("forced_invalid_diagnostic"))
@@ -2373,6 +2602,10 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             decision["continuous_anchor_dtw_production"] = dtw_production_report
             if dtw_production_report.get("timing_changes_applied"):
                 warp_fn = dtw_warp
+            for applied_segment in dtw_production_report.get("applied_segments", []):
+                fc.log(f"Local DTW applied: measures {applied_segment.get('start_measure')}..{applied_segment.get('end_measure')}; "
+                    f"median {applied_segment.get('baseline_median_residual_ms')}ms -> {applied_segment.get('candidate_median_residual_ms')}ms; "
+                    f"stretch={applied_segment.get('minimum_beat_stretch')}..{applied_segment.get('maximum_beat_stretch')}", indent=2)
             ds = trusted_dtw_report["summary"]
             fc.log(
                 f"Trusted-anchor local DTW: {ds['generated_segments']} segment(s), "
@@ -2401,12 +2634,23 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 "automatic-baseline-fallback"
             )
         else:
-            decision["mode"] = "continuous-anchor-linear-v1"
-            decision["timing_output"] = (
-                "continuous-anchor-linear-v1"
-                if continuous_linear_report.get("timing_changes_applied")
-                else ("manual-anchor-fallback" if manual_anchor_report.get("timing_changes_applied") else "automatic-baseline-fallback")
-            )
+            structural = alignment_mode == "continuous-anchor-structural"
+            label = "continuous-anchor-structural-v1" if structural else "continuous-anchor-linear-v1"
+            decision["mode"] = label
+            decision["timing_output"] = (label if continuous_linear_report.get("timing_changes_applied") else ("manual-anchor-fallback" if manual_anchor_report.get("timing_changes_applied") else "automatic-baseline-fallback"))
+    if midi_timing_trace.get("selected_as_production_baseline"):
+        refined=bool(continuous_linear_report.get("timing_changes_applied"))
+        midi_timing_trace.update({"final_output_contains_midi_warp":True,
+            "audio_refinement_applied":refined,
+            "final_output":("forced-midi-plus-compatible-audio" if force_midi_authority and refined else
+                            "forced-midi-baseline" if force_midi_authority else
+                            "trusted-midi-plus-compatible-audio" if refined else "trusted-midi-baseline")})
+        decision["timing_output"]=midi_timing_trace["final_output"]
+        fc.log(f"MIDI TIMING TRACE: authority={midi_timing_trace.get('authority')}; forced={force_midi_authority}; baseline_applied=True; audio_refinement={refined}; output={midi_timing_trace['final_output']}",indent=1)
+    elif transcription_report is not None and midi_timing_trace.get("rejection_reason") is None:
+        meta=decision.get("transcription_structural_second_pass_prior") or {}
+        midi_timing_trace["rejection_reason"]=meta.get("status","not_selected_by_final_output_router")
+        midi_timing_trace["authority"]=meta.get("authority")
     if manual_anchor_report.get("quality", {}).get("anchors"):
         q = manual_anchor_report["quality"]
         fc.log(
@@ -2448,9 +2692,50 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         for e in song_timeline_gp["beats"]
     ]
     warped_beats,sanitization=sanitize_warped_downbeats(song_timeline_gp["beats"],warped_beats)
-    dense_tempos=compute_dense_measure_tempos(warped_beats,fallback_bpm=float(tempo_events[0][1]))
-    explicit_beats=build_explicit_feedpak_beats(warped_beats)
+    legacy_dense_tempos=compute_dense_measure_tempos(warped_beats,fallback_bpm=float(tempo_events[0][1]))
+    legacy_explicit_beats=build_explicit_feedpak_beats(warped_beats)
+    production_timing=finalize_production_timing(decision, alignment_mode)
+    fc.log("FINAL PRODUCTION TIMING: "
+        f"requested={production_timing['requested_method']}; selected={production_timing['selected_production_method']}; "
+        f"output={production_timing['timing_output']}; changed={production_timing['timing_changes_applied']}; "
+        f"linear={production_timing['linear_changes_applied']}; local_dtw={production_timing['local_dtw_changes_applied']}; "
+        f"segments={production_timing['applied_local_dtw_segments']}; fallback={production_timing['fallback_used']}", indent=1)
     alignment_report=analyze_alignment_quality(song_timeline_gp["beats"],warped_beats,warp_fn,sanitization)
+    alignment_report["production_timing"]=production_timing
+    if transcription_report is not None: alignment_report["transcription_investigator_report"]=transcription_report
+    beatmap=bm.build_beatmap(song_timeline_gp,warped_beats,alignment_report=alignment_report,
+                             metadata={"gp_parser":gp_parser,"alignment_mode":alignment_mode,
+                                       "timeline_authority":"beatmap"})
+    explicit_beats=bm.beatmap_to_explicit_beats(beatmap)
+    dense_tempos=bm.beatmap_to_dense_tempos(beatmap,float(tempo_events[0][1]))
+    timeline_equivalence=bm.compare_timeline_outputs(legacy_explicit_beats,explicit_beats,
+                                                       legacy_dense_tempos,dense_tempos)
+    bm.require_timeline_equivalence(timeline_equivalence)
+    # Phase 3B is diagnostic-only: role-optimized adapters generate local
+    # residual observations but never replace or modify the accepted warp.
+    instrument_evidence_report=ie.analyze_all({
+        "drums":{"events":drum_hits_gp,"audio_path":drums_audio_path},
+        "bass":{"events":bass_alignment_events,"audio_path":bass_audio_path},
+        "guitar":{"events":guitar_alignment_events,"audio_path":guitar_audio_path},
+        "piano":{"events":piano_alignment_events,"audio_path":piano_audio_path},
+    },warp_fn,song_timeline_gp["beats"],sr=sr)
+    regional_source_fusion_report=rsf.analyse(instrument_evidence_report,beatmap)
+    beatmap,beatmap_evidence_report=bme.annotate_beatmap(
+        beatmap,alignment_report,instrument_evidence_report)
+    beatmap_evidence_report["regional_source_fusion_summary"]=regional_source_fusion_report["summary"]
+    alignment_proposals_report=alignment_proposals_module.generate(
+        beatmap,beatmap_evidence_report,regional_source_fusion_report)
+    structural_search_report=structural_search_module.analyse({
+        "drums":{"events":drum_hits_gp,"audio_path":drums_audio_path},
+        "bass":{"events":bass_alignment_events,"audio_path":bass_audio_path},
+        "guitar":{"events":guitar_alignment_events,"audio_path":guitar_audio_path},
+        "piano":{"events":piano_alignment_events,"audio_path":piano_audio_path},
+    },warp_fn,song_timeline_gp["beats"],regional_source_fusion_report,sr=sr)
+    alignment_proposals_report=structural_search_module.append_to_alignment_proposals(
+        alignment_proposals_report,structural_search_report,beatmap)
+    beatmap_report=bm.build_beatmap_report(beatmap,timeline_equivalence)
+    alignment_report["beatmap_timeline_equivalence"]=timeline_equivalence
+    alignment_report["beatmap_evidence_summary"]=beatmap_evidence_report["summary"]
     fc.log(f"ALIGNMENT QUALITY: {alignment_report['severity'].upper()}",indent=1)
     for repair in sanitization["repairs"]:
         fc.log(f"REPAIRED measures {repair['from_measure']}..{repair['to_measure']} by bounded interpolation",indent=2)
@@ -2526,6 +2811,14 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                  if key_events else None,
         "song_timeline": song_timeline,
         "alignment_report": alignment_report,
+        "beatmap": beatmap,
+        "beatmap_report": beatmap_report,
+        "beatmap_evidence_report": beatmap_evidence_report,
+        "instrument_evidence_report": instrument_evidence_report,
+        "regional_source_fusion_report": regional_source_fusion_report,
+        "alignment_proposals_report": alignment_proposals_report,
+        "structural_search_report": structural_search_report,
+        "transcription_investigator_report": transcription_report,
         "expression_report": {
             track_id: arrangement.get("expression_diagnostics", {"encoded": ee.count_fields(arrangement.get("notes", []))})
             for track_id, arrangement in arrangements_out.items()
@@ -2560,11 +2853,16 @@ def main():
     parser.add_argument("--piano-audio", default=None)
     parser.add_argument("--guitar-audio", default=None)
     parser.add_argument("--full-audio", default=None)
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw"),default="dtw")
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural","bar-landmark-regularized"),default="dtw")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
                         help="A/B test output: dense tempos only, explicit beats only, or both")
+    parser.add_argument("--force-midi-authority", action="store_true", help="Force a finite monotonic MIDI path to be the production baseline")
     parser.add_argument("--force-continuous-anchor-warp", action="store_true",
                         help="DIAGNOSTIC ONLY: apply an invalid continuous-anchor proposal for A/B listening")
+    parser.add_argument("--structural-second-pass", action="store_true",
+                        help="Enable dual-centre drift-adjusted anchor recovery for continuous-anchor-structural")
+    parser.add_argument("--transcription-investigator", action="store_true",
+                        help="Read prepared *.muscriptor.mid evidence diagnostically for guarded/checkpoint/continuous methods")
     parser.add_argument("--allow-severe-alignment", action="store_true",
                         help="Package even if severe structural timing errors remain after repair")
     parser.add_argument("--anchors", default=None)
@@ -2594,7 +2892,9 @@ def main():
                    checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config,
                    gp_parser=args.gp_parser, score_json_path=args.score_json, alphatab_extractor=args.alphatab_extractor, node_executable=args.node_executable,
                    piano_duration_quantize_ms=args.piano_duration_quantize_ms,
-                   force_continuous_anchor_warp=args.force_continuous_anchor_warp)
+                   force_continuous_anchor_warp=args.force_continuous_anchor_warp,
+                   structural_second_pass=args.structural_second_pass,
+                   transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

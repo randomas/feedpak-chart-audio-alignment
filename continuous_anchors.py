@@ -425,6 +425,61 @@ def diagnose_continuous_anchors(score_events,audio_paths,baseline,measure_downbe
                      "A wide search is retained, with probability decaying away from the baseline prediction.",
                      "Dense production remains disabled until corpus listening validates the joint matcher."]}
 
+
+def build_drift_search_prior(baseline, path_preview):
+    """Bounded residual interpolator used only to centre second-pass searches."""
+    selected=sorted((path_preview or {}).get('selected_anchors') or [],key=lambda x:float(x['score_time']))
+    if len(selected)<2:
+        return baseline,{'status':'insufficient_first_pass_controls','control_count':len(selected)}
+    xs=np.asarray([float(x['score_time']) for x in selected],float)
+    rs=np.asarray([float(x['audio_time'])-float(baseline(float(x['score_time']))) for x in selected],float)
+    def prior(t):
+        t=float(t)
+        if t<=xs[0]: residual=rs[0]
+        elif t>=xs[-1]: residual=rs[-1]
+        else: residual=float(np.interp(t,xs,rs))
+        return float(baseline(t))+float(residual)
+    return prior,{'status':'available','control_count':len(selected),
+        'controls':[{'score_time':round(float(x),6),'residual_seconds':round(float(r),6)} for x,r in zip(xs,rs)],
+        'exterior_behavior':'hold_nearest_residual'}
+
+
+def merge_dual_centre_reports(first_report, second_report, baseline, drift_prior):
+    """Merge baseline-centred and drift-centred hypotheses without privileging either."""
+    first_by={x['score_event_id']:x for x in (first_report or {}).get('matches',[])}
+    second_by={x['score_event_id']:x for x in (second_report or {}).get('matches',[])}
+    merged=[]; recovered=0; agreed=0; baseline_only=0; drift_only=0
+    for event_id in sorted(set(first_by)|set(second_by)):
+        a=first_by.get(event_id); b=second_by.get(event_id); template=dict(a or b)
+        score_time=float(template['score_time']); candidates=[]
+        for centre,row in (('baseline',a),('drift_adjusted',b)):
+            for raw in (row or {}).get('candidates',[]):
+                candidate=dict(raw); candidate['search_centre']=centre
+                candidate['distance_from_baseline_centre_seconds']=round(float(candidate['time'])-float(baseline(score_time)),6)
+                candidate['distance_from_drift_centre_seconds']=round(float(candidate['time'])-float(drift_prior(score_time)),6)
+                if not any(abs(float(candidate['time'])-float(x['time']))<=0.03 and candidate.get('evidence_source')==x.get('evidence_source') for x in candidates):
+                    candidates.append(candidate)
+        candidates.sort(key=lambda x:(-float(x.get('confidence',0)),abs(float(x['time'])-float(drift_prior(score_time)))))
+        ac=bool((a or {}).get('candidates')); bc=bool((b or {}).get('candidates'))
+        recovered+=int(bc and not ac); agreed+=int(ac and bc); baseline_only+=int(ac and not bc); drift_only+=int(bc and not ac)
+        template.update(baseline_prediction=round(float(baseline(score_time)),6),
+                        drift_adjusted_prediction=round(float(drift_prior(score_time)),6),
+                        candidate_count=len(candidates),candidates=candidates,
+                        best_candidate=candidates[0] if candidates else None,
+                        pass_coverage={'baseline_centre':ac,'drift_adjusted_centre':bc})
+        merged.append(template)
+    report=dict(first_report or {}); report['version']=5; report['matches']=merged; report['matching']={'matches':merged}
+    report['search_strategy']='dual_centre_drift_adjusted_second_pass'
+    summary=dict(report.get('summary') or {}); summary.update(
+        locally_searched_score_events=len(merged),retained_audio_hypotheses=sum(x['candidate_count'] for x in merged),
+        matched_score_events=sum(bool(x['candidate_count']) for x in merged),
+        second_pass_recovered_score_events=recovered,both_centres_matched_score_events=agreed,
+        baseline_only_matched_score_events=baseline_only,drift_only_matched_score_events=drift_only)
+    report['summary']=summary; report['second_pass']={'enabled':True,'mode':'dual_centre',
+        'first_pass_summary':(first_report or {}).get('summary',{}),'drift_pass_summary':(second_report or {}).get('summary',{})}
+    report.setdefault('notes',[]).append('Second pass changes search centres only; the merged global path is reselected from both centre hypotheses.')
+    return report
+
 @dataclass(frozen=True)
 class AnchorPathConfig:
     simultaneous_score_tolerance_seconds: float = 0.15
@@ -872,6 +927,20 @@ def build_continuous_anchor_linear_warp(
             "maximum_absolute_difference_seconds": round(max(differences or [0.0]), 6),
             "median_absolute_difference_seconds": round(float(np.median(differences or [0.0])), 6),
             "warnings": sorted(set(warnings)),
+            "passed_predicates": sorted([name for name,passed in {
+                "preview_path_monotonic":path_valid,"controls_present":bool(controls),
+                "proposal_monotonic":monotonic,"measure_stretch_within_limits":not (min_stretch < cfg.minimum_measure_stretch or max_stretch > cfg.maximum_measure_stretch)
+            }.items() if passed]),
+            "failed_predicates": sorted([name for name,passed in {
+                "preview_path_monotonic":path_valid,"controls_present":bool(controls),
+                "proposal_monotonic":monotonic,"measure_stretch_within_limits":not (min_stretch < cfg.minimum_measure_stretch or max_stretch > cfg.maximum_measure_stretch)
+            }.items() if not passed]),
+            "validation_snapshot":{"control_count":len(controls),"minimum_controls":1,
+                "monotonic":monotonic,"minimum_measure_stretch":round(min_stretch,8),
+                "maximum_measure_stretch":round(max_stretch,8),
+                "allowed_minimum_measure_stretch":cfg.minimum_measure_stretch,
+                "allowed_maximum_measure_stretch":cfg.maximum_measure_stretch,
+                "manual_anchor_compatible":not any("manual" in w for w in warnings)},
             "fallback_used": not timing_changes_applied and bool(apply),
         },
         "ending_behavior": (

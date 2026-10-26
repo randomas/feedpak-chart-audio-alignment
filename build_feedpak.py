@@ -41,6 +41,7 @@ import feedpak_common as fc
 import process_gp_alignment as pga
 import project_config as pc
 import alphatab_score as ats
+import variant_materialization as vm
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_EXTENSIONS = (".ogg", ".wav", ".flac")
@@ -349,7 +350,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
                   gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False):
+                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -362,6 +363,9 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
     if full_path: cmd += ["--full-audio",full_path]
     if allow_severe_alignment: cmd.append("--allow-severe-alignment")
     if force_continuous_anchor_warp: cmd.append("--force-continuous-anchor-warp")
+    if force_midi_authority: cmd.append("--force-midi-authority")
+    if structural_second_pass: cmd.append("--structural-second-pass")
+    if transcription_investigator: cmd.append("--transcription-investigator")
     if anchors_path: cmd += ["--anchors",anchors_path]
     cmd += ["--padding-added",str(padding_added),"--auto-chunk-measures",str(auto_chunk_measures),
             "--alignment-mode",alignment_mode,
@@ -813,8 +817,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
           gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,
-          package_name_suffix=""):
+          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,
+          package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_steps=7
@@ -923,6 +927,14 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     arrangements = []
     drum_tab_file=keys_file=song_timeline_file=None
     alignment_report=None
+    beatmap=None
+    beatmap_report=None
+    beatmap_evidence_report=None
+    instrument_evidence_report=None
+    regional_source_fusion_report=None
+    alignment_proposals_report=None
+    structural_search_report=None
+    transcription_investigator_report=None
     expression_report=None
     if gp_path and (drums_path or bass_path or piano_path or guitar_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
@@ -936,7 +948,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None,
                       gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable,
                       piano_duration_quantize_ms=piano_duration_quantize_ms,
-                      force_continuous_anchor_warp=force_continuous_anchor_warp)
+                      force_continuous_anchor_warp=force_continuous_anchor_warp,
+                      structural_second_pass=structural_second_pass,transcription_investigator=transcription_investigator,force_midi_authority=force_midi_authority)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         if gp_vocal_production:
@@ -953,6 +966,14 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         song_timeline_file=write_song_timeline(gp_data,work_dir)
         embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,arrangements)
         alignment_report=gp_data.get("alignment_report")
+        beatmap=gp_data.get("beatmap")
+        beatmap_report=gp_data.get("beatmap_report")
+        beatmap_evidence_report=gp_data.get("beatmap_evidence_report")
+        instrument_evidence_report=gp_data.get("instrument_evidence_report")
+        regional_source_fusion_report=gp_data.get("regional_source_fusion_report")
+        alignment_proposals_report=gp_data.get("alignment_proposals_report")
+        structural_search_report=gp_data.get("structural_search_report")
+        transcription_investigator_report=gp_data.get("transcription_investigator_report")
         expression_report=gp_data.get("expression_report")
         fc.log(f"Wrote {len(arrangements)} arrangement entr(y/ies), "
                f"drum_tab={'yes' if drum_tab_file else 'no'}, "
@@ -991,6 +1012,10 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     safe_name = f"{manifest['artist']} - {manifest['title']}{package_name_suffix}.feedpak".replace("/", "_")
     output_path = os.path.join(output_folder, safe_name)
     package_feedpak(work_dir,manifest,output_path)
+    if phase3d_variants and alignment_proposals_report:
+        import phase3d_materialization as p3d
+        fc.log("Materializing Phase 3D variants from the completed analysis pass")
+        p3d.materialize_from_work_dir(work_dir,manifest,output_path,alignment_proposals_report,structural_search_report,package_feedpak,phase3d_safe_candidates,phase3d_structural_candidates)
     if alignment_report:
         report_path=output_path+".alignment_report.json"
         fc.write_json(report_path,alignment_report)
@@ -998,6 +1023,50 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.log(f"Wrote alignment report: {report_path}",indent=1)
     else:
         fc.log("No alignment report returned by process_gp_alignment.py",indent=1)
+    if beatmap:
+        beatmap_path=output_path+".beatmap.json"
+        fc.write_json(beatmap_path,beatmap)
+        if not os.path.isfile(beatmap_path): raise RuntimeError(f"Beatmap write failed: {beatmap_path}")
+        fc.log(f"Wrote beatmap: {beatmap_path}",indent=1)
+    if beatmap_report:
+        beatmap_report_path=output_path+".beatmap_report.json"
+        fc.write_json(beatmap_report_path,beatmap_report)
+        if not os.path.isfile(beatmap_report_path): raise RuntimeError(f"Beatmap report write failed: {beatmap_report_path}")
+        fc.log(f"Wrote beatmap report: {beatmap_report_path}",indent=1)
+    if beatmap_evidence_report:
+        evidence_path=output_path+".beatmap_evidence_report.json"
+        fc.write_json(evidence_path,beatmap_evidence_report)
+        if not os.path.isfile(evidence_path): raise RuntimeError(f"Beatmap evidence report write failed: {evidence_path}")
+        fc.log(f"Wrote beatmap evidence report: {evidence_path}",indent=1)
+    if instrument_evidence_report:
+        instrument_evidence_path=output_path+".instrument_evidence_report.json"
+        fc.write_json(instrument_evidence_path,instrument_evidence_report)
+        if not os.path.isfile(instrument_evidence_path):
+            raise RuntimeError(f"Instrument evidence report write failed: {instrument_evidence_path}")
+        fc.log(f"Wrote instrument evidence report: {instrument_evidence_path}",indent=1)
+    if regional_source_fusion_report:
+        fusion_path=output_path+".regional_source_fusion_report.json"
+        fc.write_json(fusion_path,regional_source_fusion_report)
+        if not os.path.isfile(fusion_path):
+            raise RuntimeError(f"Regional source fusion report write failed: {fusion_path}")
+        fc.log(f"Wrote regional source fusion report: {fusion_path}",indent=1)
+    if alignment_proposals_report:
+        proposals_path=output_path+".alignment_proposals.json"
+        fc.write_json(proposals_path,alignment_proposals_report)
+        if not os.path.isfile(proposals_path):
+            raise RuntimeError(f"Alignment proposals report write failed: {proposals_path}")
+        fc.log(f"Wrote alignment proposals: {proposals_path}",indent=1)
+    if transcription_investigator_report:
+        transcription_path=output_path+".transcription_investigator.json"
+        fc.write_json(transcription_path,transcription_investigator_report)
+        fc.log(f"Wrote transcription investigator report: {transcription_path}",indent=1)
+
+    if structural_search_report:
+        structural_path=output_path+".structural_search_report.json"
+        fc.write_json(structural_path,structural_search_report)
+        if not os.path.isfile(structural_path):
+            raise RuntimeError(f"Structural search report write failed: {structural_path}")
+        fc.log(f"Wrote structural search report: {structural_path}",indent=1)
     if expression_report:
         expression_report_path=output_path+".expression_report.json"
         fc.write_json(expression_report_path,expression_report)
@@ -1050,7 +1119,16 @@ def main():
     parser.add_argument("--allow-severe-alignment",action="store_true",default=bool(defaults.get("allow_severe_alignment",False)))
     parser.add_argument("--build-unsafe-continuous-comparison",action="store_true",
                         help="Build the safe package plus an explicitly labelled unsafe continuous-anchor comparison")
-    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw"),
+    parser.add_argument("--phase3d-variants",action="store_true")
+    parser.add_argument("--force-midi-authority",action="store_true",help="Force a finite monotonic performance-MIDI path as production baseline")
+    parser.add_argument("--transcription-investigator",action="store_true",help="Read prepared MuScriptor MIDI evidence (not available for nominal, offset, linear, or unguarded dtw)")
+    parser.add_argument("--structural-second-pass",action="store_true",
+                        help="Enable drift-adjusted second pass only for continuous-anchor-structural")
+    parser.add_argument("--strict-variant-builds",action="store_true",
+                        help="Treat optional diagnostic variant failures as fatal")
+    parser.add_argument("--phase3d-safe-candidates",type=int,default=2)
+    parser.add_argument("--phase3d-structural-candidates",type=int,default=1)
+    parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural","bar-landmark-regularized"),
                         default=defaults.get("alignment_mode") or "dtw")
     parser.add_argument("--anchors",default=defaults.get("anchors"))
     parser.add_argument("--auto-chunk-measures",type=int,default=defaults.get("auto_chunk_measures") or 16)
@@ -1073,9 +1151,11 @@ def main():
     if anchors and not os.path.isabs(anchors): anchors=os.path.join(args.song_folder,anchors)
     cache=args.vocals_cache
     if cache and not os.path.isabs(cache): cache=os.path.join(args.song_folder,cache)
-    build(args.song_folder,args.output_folder,vocals_stem_name=args.vocals_stem,
+    if args.structural_second_pass and args.alignment_mode != "continuous-anchor-structural":
+        parser.error("--structural-second-pass requires --alignment-mode continuous-anchor-structural")
+    safe_output_path = build(args.song_folder,args.output_folder,vocals_stem_name=args.vocals_stem,
           drums_stem_name=args.drums_stem,device=args.device,hf_token=args.hf_token,
-          skip_vocals=args.skip_vocals,skip_gp=args.skip_gp,keep_work_dir=args.keep_work_dir,
+          skip_vocals=args.skip_vocals,skip_gp=args.skip_gp,keep_work_dir=(args.keep_work_dir or args.build_unsafe_continuous_comparison),
           vocal_layout=args.vocal_layout,timeline_mode=args.timeline_mode,
           allow_severe_alignment=args.allow_severe_alignment,reuse_vocals=args.reuse_vocals,
           vocals_cache=cache,vocal_batch_size=args.vocal_batch_size,
@@ -1087,29 +1167,50 @@ def main():
           bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
           guitar_alignment_stem=args.guitar_alignment_stem,gp_parser=args.gp_parser,score_json_path=args.score_json,
           alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
-          piano_duration_quantize_ms=args.piano_duration_quantize_ms)
+          piano_duration_quantize_ms=args.piano_duration_quantize_ms,phase3d_variants=args.phase3d_variants,
+          phase3d_safe_candidates=args.phase3d_safe_candidates,phase3d_structural_candidates=args.phase3d_structural_candidates,
+          structural_second_pass=args.structural_second_pass,transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority)
+
+    if args.force_midi_authority and not args.transcription_investigator:
+        parser.error("--force-midi-authority requires --transcription-investigator")
+    if args.force_midi_authority and not args.structural_second_pass:
+        parser.error("--force-midi-authority requires --structural-second-pass")
+    if args.transcription_investigator and args.alignment_mode not in (
+            "dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective",
+            "continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural",
+            "bar-landmark-regularized"):
+        parser.error("--transcription-investigator is unavailable for nominal, offset, linear, and unguarded dtw")
 
     if args.build_unsafe_continuous_comparison:
         if args.alignment_mode not in ("continuous-anchor-linear", "continuous-anchor-dtw"):
             parser.error("--build-unsafe-continuous-comparison requires a continuous-anchor alignment mode")
-        fc.log("Building separately labelled UNSAFE continuous-anchor comparison package")
-        build(args.song_folder,args.output_folder,vocals_stem_name=args.vocals_stem,
-          drums_stem_name=args.drums_stem,device=args.device,hf_token=args.hf_token,
-          skip_vocals=args.skip_vocals,skip_gp=args.skip_gp,keep_work_dir=args.keep_work_dir,
-          vocal_layout=args.vocal_layout,timeline_mode=args.timeline_mode,
-          allow_severe_alignment=args.allow_severe_alignment,reuse_vocals=args.reuse_vocals,
-          vocals_cache=cache,vocal_batch_size=args.vocal_batch_size,
-          vocal_compute_type=args.vocal_compute_type,vocal_language=args.vocal_language,
-          anchors_path=anchors,auto_chunk_measures=args.auto_chunk_measures,
-          alignment_mode=args.alignment_mode,
-          checkpoint_measures=args.checkpoint_measures,
-          checkpoint_search_radius=args.checkpoint_search_radius,song_json_path=(args.song_json if not args.song_json or os.path.isabs(args.song_json) else os.path.join(args.song_folder,args.song_json)),
-          bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
-          guitar_alignment_stem=args.guitar_alignment_stem,gp_parser=args.gp_parser,score_json_path=args.score_json,
-          alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
-              piano_duration_quantize_ms=args.piano_duration_quantize_ms,
-              force_continuous_anchor_warp=True,
-              package_name_suffix=".UNSAFE-CONTINUOUS")
+        report_path=safe_output_path+".alignment_report.json"
+        if not os.path.isfile(report_path):
+            raise RuntimeError("safe alignment report is required for single-pass variant materialization")
+        with open(report_path,"r",encoding="utf-8") as handle:
+            safe_report=json.load(handle)
+        work_dir=os.path.join(args.song_folder,"_feedpak_build")
+        if not os.path.isdir(work_dir):
+            raise RuntimeError("comparison materialization requires the safe work directory")
+        fc.log("Materializing UNSAFE continuous variant from the completed analysis pass")
+        try:
+            variant=vm.materialize_continuous_variant(
+                work_dir,safe_output_path,safe_report,package_feedpak,label="UNSAFE-CONTINUOUS")
+            fc.log(f"Wrote single-pass timing variant: {variant}",indent=1)
+        except Exception as exc:
+            failure={"status":"optional_variant_failure","variant":"UNSAFE-CONTINUOUS",
+                     "error_type":type(exc).__name__,"error":str(exc),
+                     "overall_status":"FAIL" if args.strict_variant_builds else "PASS_WITH_OPTIONAL_VARIANT_FAILURE"}
+            failure_path=safe_output_path+".variant_failure.json"
+            fc.write_json(failure_path,failure)
+            fc.log(f"Optional variant failed: {type(exc).__name__}: {exc}",indent=1)
+            if args.strict_variant_builds:
+                raise
+            fc.log("Production package remains successful (PASS_WITH_OPTIONAL_VARIANT_FAILURE)",indent=1)
+        if not args.keep_work_dir:
+            import shutil
+            shutil.rmtree(work_dir,ignore_errors=True)
+
 
 
 if __name__ == "__main__":
