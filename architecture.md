@@ -271,3 +271,10 @@ MuScriptor remains optional external preparation. Its setup is not a FeedPak run
 Region length affects only isolated edges belonging to accepted catch-up episodes. Ordinary edges keep the fixed mode stretch limits. After 16 unique supported playback measures, the episode delta ceiling grows slowly and is capped: conservative `120 ms + 3 ms/measure` up to 250 ms with hard stretch 0.80–1.20; permissive `250 ms + 5 ms/measure` up to 500 ms with hard stretch 0.70–1.30; diagnostic-unsafe `500 ms + 8 ms/measure` up to 800 ms with hard stretch 0.50–1.50.
 
 This prevents one bounded local defect from invalidating a long corroborated region without allowing region length to justify arbitrary geometry. Non-episode outliers, non-positive durations, reversals, crossings, excessive episode density, and global non-monotonicity remain invalid.
+
+
+### Phase 2A exact execution layer
+
+The candidate report may be persisted at `.feedpak_cache/midi_section_candidates.json`. Reuse requires an exact schema and SHA-256 fingerprint match over playback measures, chart events, prepared MIDI events, search configuration, and all search-baseline samples at measure boundaries. Cache writes are atomic. A changed chart, transcription, padding consequence, baseline, or search parameter rebuilds evidence; a materialization-policy-only change can reuse the exact candidate report.
+
+The DP recurrence uses rolling score rows and compact byte operation codes for backtrace while preserving the original option order and first-equal tie behavior. Transform rejection occurs before landmark dictionaries and candidate objects are allocated. These are execution changes only and must remain parity-tested against the reference output.

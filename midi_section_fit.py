@@ -10,8 +10,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from bisect import bisect_left, bisect_right
+import hashlib
+import json
 import math
+import os
 import statistics
+import tempfile
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -267,39 +271,36 @@ def _similarity_matrix(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str,
 
 
 def _align_ordered_groups(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str, Any]], cfg: SectionFitConfig):
-    n, m = len(chart), len(midi)
-    similarities=_similarity_matrix(chart,midi,cfg)
-    neg = -1e12
-    dp = [[neg] * (m + 1) for _ in range(n + 1)]
-    back = [[None] * (m + 1) for _ in range(n + 1)]
-    dp[0][0] = 0.0
-    for i in range(1, n + 1):
-        dp[i][0] = dp[i - 1][0] - cfg.missing_chart_penalty
-        back[i][0] = (i - 1, 0, "skip_chart")
-    for j in range(1, m + 1):
-        dp[0][j] = dp[0][j - 1] - cfg.extra_midi_penalty
-        back[0][j] = (0, j - 1, "skip_midi")
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            sim = similarities[i-1][j-1]
-            options = [
-                (dp[i - 1][j] - cfg.missing_chart_penalty, i - 1, j, "skip_chart"),
-                (dp[i][j - 1] - cfg.extra_midi_penalty, i, j - 1, "skip_midi"),
-            ]
-            if sim > 0:
-                options.append((dp[i - 1][j - 1] + sim, i - 1, j - 1, "match"))
-            dp[i][j], pi, pj, op = max(options, key=lambda x: x[0])
-            back[i][j] = (pi, pj, op)
-    pairs = []
-    i, j = n, m
+    """Exact ordered DP using rolling score rows and compact byte backtrace."""
+    n,m=len(chart),len(midi); similarities=_similarity_matrix(chart,midi,cfg); width=m+1
+    SKIP_CHART,SKIP_MIDI,MATCH=0,1,2
+    back=bytearray((n+1)*width)
+    previous=[0.0]+[-cfg.extra_midi_penalty*j for j in range(1,m+1)]
+    for j in range(1,m+1):back[j]=SKIP_MIDI
+    neg=-1e12
+    for i in range(1,n+1):
+        current=[neg]*width;current[0]=-cfg.missing_chart_penalty*i;back[i*width]=SKIP_CHART
+        sims=similarities[i-1]
+        for j in range(1,m+1):
+            # Match the reference max() option ordering exactly: chart skip,
+            # MIDI skip, then match. Python max keeps the first equal value.
+            best=previous[j]-cfg.missing_chart_penalty;op=SKIP_CHART
+            value=current[j-1]-cfg.extra_midi_penalty
+            if value>best:best=value;op=SKIP_MIDI
+            sim=sims[j-1]
+            if sim>0:
+                value=previous[j-1]+sim
+                if value>best:best=value;op=MATCH
+            current[j]=best;back[i*width+j]=op
+        previous=current
+    pairs=[];i=n;j=m
     while i or j:
-        pi, pj, op = back[i][j]
-        if op == "match":
-            pairs.append((i - 1, j - 1, similarities[i-1][j-1]))
-        i, j = pi, pj
+        op=back[i*width+j]
+        if op==MATCH:pairs.append((i-1,j-1,similarities[i-1][j-1]));i-=1;j-=1
+        elif op==SKIP_MIDI:j-=1
+        else:i-=1
     pairs.reverse()
-    scale=max(1,n)
-    return dp[n][m]/scale,pairs
+    return previous[m]/max(1,n),pairs
 
 
 def _context_fingerprint(groups: Sequence[dict[str, Any]]) -> tuple[tuple[int, ...], tuple[float, ...]]:
@@ -347,19 +348,20 @@ def _evaluate_transform(window: MeasureWindow, prepared_midi: Mapping[str,Any], 
         if counters is not None:counters["alignment_cache_hits"]+=1
     sequence_score,pairs,context_score=cached
     if len(pairs)<cfg.minimum_matched_groups:return None
-    landmarks=[];residuals=[]
+    matched_times=[];residuals=[]
     for ci,mi,similarity in pairs:
         ct=float(window.groups[ci]["time"]);mt=float(local[mi]["time"])
-        predicted=translation+stretch*ct
-        residuals.append(abs(mt-predicted))
-        landmarks.append({"chart_time":ct,"midi_time":mt,"similarity":float(similarity)})
+        residuals.append(abs(mt-(translation+stretch*ct)))
+        matched_times.append((ct,mt,float(similarity)))
     coverage=len({x[0] for x in pairs})/max(1,len(window.groups))
     median=statistics.median(residuals);maximum=max(residuals)
     combined=0.58*sequence_score+0.20*coverage+0.10*math.exp(-median/0.12)+cfg.context_weight*context_score
-    reasons=[]
-    if coverage<cfg.minimum_chart_coverage:reasons.append("insufficient_chart_coverage")
-    if median>cfg.maximum_median_residual_seconds:reasons.append("median_residual_too_large")
-    if maximum>cfg.maximum_residual_seconds:reasons.append("maximum_residual_too_large")
+    if (coverage<cfg.minimum_chart_coverage or median>cfg.maximum_median_residual_seconds or
+            maximum>cfg.maximum_residual_seconds):
+        if counters is not None:counters["rejected_before_object_construction"]=counters.get("rejected_before_object_construction",0)+1
+        return None
+    landmarks=[{"chart_time":ct,"midi_time":mt,"similarity":similarity}
+               for ct,mt,similarity in matched_times]
     return SectionCandidate(window_id=window.window_id,role=window.role,
         chart_start=window.nominal_start,chart_end=window.nominal_end,
         midi_start=expected_start,midi_end=expected_end,chart_stretch=float(stretch),
@@ -367,8 +369,7 @@ def _evaluate_transform(window: MeasureWindow, prepared_midi: Mapping[str,Any], 
         chart_group_count=len(window.groups),midi_group_count=len(local),chart_coverage=coverage,
         median_residual_seconds=median,maximum_residual_seconds=maximum,
         sequence_score=sequence_score,context_score=context_score,combined_score=combined,
-        matched_landmarks=landmarks,status="valid" if not reasons else "rejected",
-        rejection_reasons=reasons,search_hypothesis=search_hypothesis)
+        matched_landmarks=landmarks,status="valid",rejection_reasons=[],search_hypothesis=search_hypothesis)
 
 
 def search_section_candidates(window: MeasureWindow, midi_events, baseline=None,
@@ -401,6 +402,51 @@ def search_section_candidates(window: MeasureWindow, midi_events, baseline=None,
     return distinct
 
 
+CANDIDATE_CACHE_SCHEMA="midi-section-candidates-v16.3-phase2a-1"
+
+
+def _jsonable(value):
+    if isinstance(value,Mapping):return {str(k):_jsonable(v) for k,v in sorted(value.items(),key=lambda x:str(x[0]))}
+    if isinstance(value,(set,frozenset)):return sorted(_jsonable(x) for x in value)
+    if isinstance(value,(list,tuple)):return [_jsonable(x) for x in value]
+    if isinstance(value,float):return value
+    return value
+
+
+def _candidate_cache_fingerprint(playback_measures,chart_events_by_role,midi_events_by_role,cfg,hypotheses):
+    sample_times=sorted({float(x.get("start_time",x.get("start",0.0))) for x in playback_measures} |
+                        {float(x.get("end_time",x.get("end",0.0))) for x in playback_measures})
+    baseline_samples={name:[float(fn(t)) for t in sample_times] for name,fn in hypotheses.items()}
+    payload={"schema":CANDIDATE_CACHE_SCHEMA,"measures":playback_measures,
+        "chart":chart_events_by_role,"midi":midi_events_by_role,"config":asdict(cfg),
+        "sample_times":sample_times,"baseline_samples":baseline_samples}
+    encoded=json.dumps(_jsonable(payload),sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_candidate_cache(path,fingerprint):
+    if not path or not os.path.isfile(path):return None,"cache_file_missing"
+    try:
+        data=json.load(open(path,encoding="utf-8"))
+    except Exception as exc:return None,f"cache_unreadable:{type(exc).__name__}"
+    if data.get("schema")!=CANDIDATE_CACHE_SCHEMA:return None,"schema_changed"
+    if data.get("fingerprint")!=fingerprint:return None,"input_fingerprint_changed"
+    return data.get("candidate_report"),"exact_cache_hit"
+
+
+def _write_candidate_cache(path,fingerprint,report):
+    if not path:return
+    directory=os.path.dirname(os.path.abspath(path));os.makedirs(directory,exist_ok=True)
+    fd,temp_path=tempfile.mkstemp(prefix="midi-section-",suffix=".tmp",dir=directory)
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as handle:
+            json.dump({"schema":CANDIDATE_CACHE_SCHEMA,"fingerprint":fingerprint,
+                       "candidate_report":report},handle,allow_nan=False,separators=(",",":"))
+        os.replace(temp_path,path)
+    finally:
+        if os.path.exists(temp_path):os.unlink(temp_path)
+
+
 def build_section_candidate_report(
     playback_measures: Sequence[Mapping[str, Any]],
     chart_events_by_role: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -420,10 +466,12 @@ def build_section_candidate_report(
     grouping_seconds=time.perf_counter()-prep_started
     role_reports={};totals={"window_count":0,"observable_window_count":0,"candidate_count":0}
     global_perf={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0,
+                 "rejected_before_object_construction":0,
                  "unique_midi_slices":0,"midi_grouping_seconds":grouping_seconds}
     for role,role_windows in windows.items():
         role_started=time.perf_counter();rows=[];prepared=prepared_by_role[role]
-        counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0}
+        counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0,
+                  "rejected_before_object_construction":0}
         for window in role_windows:
             pooled=[];alignment_cache={}
             for hypothesis_name,hypothesis_baseline in hypotheses.items():
@@ -446,7 +494,8 @@ def build_section_candidate_report(
         role_perf={**counters,"elapsed_seconds":time.perf_counter()-role_started,
                    "prepared_midi_group_count":len(prepared["groups"]),
                    "window_count":len(role_windows)}
-        for key in ("transform_trials","midi_slice_lookups","dp_evaluations","alignment_cache_hits"):
+        for key in ("transform_trials","midi_slice_lookups","dp_evaluations","alignment_cache_hits",
+                    "rejected_before_object_construction"):
             global_perf[key]+=counters[key]
         role_reports[role]={"window_count":len(role_windows),"windows":rows,"performance":role_perf}
     global_perf["candidate_search_seconds"]=time.perf_counter()-started
@@ -1412,13 +1461,28 @@ def build_section_fusion_report(
     path_config: SectionPathConfig | None = None,
     fusion_config: SectionFusionConfig | None = None,
     baseline_hypotheses: Mapping[str, Callable[[float], float]] | None = None,
+    candidate_cache_path: str | None = None,
+    candidate_cache_rebuild: bool = False,
+    candidate_cache_disabled: bool = False,
 ) -> dict[str, Any]:
     """Run Steps 1-3 without modifying timing, with stage instrumentation."""
     total_started=time.perf_counter()
-    candidate_started=time.perf_counter()
-    candidate_report = build_section_candidate_report(
-        playback_measures, chart_events_by_role, midi_events_by_role,
-        baseline=baseline, cfg=candidate_config, baseline_hypotheses=baseline_hypotheses)
+    candidate_started=time.perf_counter();candidate_config=candidate_config or SectionFitConfig()
+    hypotheses=dict(baseline_hypotheses or {})
+    if not hypotheses:hypotheses["requested_method_baseline"]=baseline or (lambda t:float(t))
+    hypotheses.setdefault("prepared_chart_clock",lambda t:float(t))
+    fingerprint=_candidate_cache_fingerprint(playback_measures,chart_events_by_role,midi_events_by_role,
+                                             candidate_config,hypotheses)
+    candidate_report=None;cache_reason="cache_disabled" if candidate_cache_disabled else "cache_rebuild_requested" if candidate_cache_rebuild else None
+    cache_load_started=time.perf_counter()
+    if not candidate_cache_disabled and not candidate_cache_rebuild:
+        candidate_report,cache_reason=_load_candidate_cache(candidate_cache_path,fingerprint)
+    cache_load_seconds=time.perf_counter()-cache_load_started
+    cache_hit=candidate_report is not None
+    if not cache_hit:
+        candidate_report=build_section_candidate_report(playback_measures,chart_events_by_role,midi_events_by_role,
+            baseline=baseline,cfg=candidate_config,baseline_hypotheses=hypotheses)
+        if not candidate_cache_disabled:_write_candidate_cache(candidate_cache_path,fingerprint,candidate_report)
     candidate_seconds=time.perf_counter()-candidate_started
     path_started=time.perf_counter()
     path_report = select_monotonic_section_paths(candidate_report, path_config)
@@ -1436,6 +1500,8 @@ def build_section_fusion_report(
         region["catch_up_episodes"]=_catch_up_episodes(region.get("catch_up_events") or [])
     fusion_seconds=time.perf_counter()-fusion_started
     performance={"candidate_generation_seconds":candidate_seconds,
+        "candidate_cache":{"enabled":not candidate_cache_disabled,"hit":cache_hit,"reason":cache_reason,
+            "path":candidate_cache_path,"fingerprint":fingerprint,"load_seconds":cache_load_seconds},
         "path_selection_seconds":path_seconds,"fusion_seconds":fusion_seconds,
         "total_section_fit_seconds":time.perf_counter()-total_started,
         "candidate_counters":candidate_report.get("performance") or {}}

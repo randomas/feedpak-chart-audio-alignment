@@ -49,6 +49,7 @@ output_folder/
 Gemini_mess/
 Diagnostics_light/
 run_*/
+.feedpak_cache/
 _feedpak_build/
 **/_feedpak_build/
 *.feedpak

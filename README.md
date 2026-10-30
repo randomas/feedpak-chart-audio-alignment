@@ -31,6 +31,21 @@ diagnostic-unsafe: min(800 ms, 500 ms + 8 ms × max(0, measures - 16)); hard str
 
 The exception requires a monotonic Tier-A/B-quality region, an episode count within the length-normalized allowance, positive edge durations, and an outlier edge identified as part of that episode. Long regions therefore survive isolated bounded defects, while unrelated outliers and catastrophic geometry remain rejected.
 
+
+### Phase 2A exact execution optimization
+
+Phase 2A adds an on-disk, content-addressed cache for the exact MIDI-section candidate report. The default song-local cache is `.feedpak_cache/midi_section_candidates.json`. Its SHA-256 fingerprint covers playback measures, chart evidence, prepared performance MIDI, candidate configuration, schema version, and sampled values from both baseline hypotheses at every measure boundary. Any mismatch rebuilds the exhaustive search.
+
+```text
+--no-midi-section-cache
+--rebuild-midi-section-cache
+--midi-section-cache PATH
+```
+
+Policy-only reruns can therefore reuse the exact candidate inventory and rerun the inexpensive path, fusion, and materialization stages. Cache writes are atomic and diagnostics state the hit or miss reason.
+
+The Python DP reference semantics are retained with rolling score rows and compact byte backtrace storage. Invalid transforms are rejected before landmark dictionaries and candidate objects are allocated. Search density, similarity scoring, tie order, candidates, and timing remain unchanged.
+
 ### Input responsibility and external preparation
 
 FeedPak consumes prepared assets. The future wizard will validate and use them, but it will not install or run stem separation or MIDI transcription tools.
