@@ -49,3 +49,10 @@ intermediate_arrangements.json
 intermediate_vocals.json
 gp5_inspection.json
 feedpak-project.v*.yaml
+# One-off patch and acquisition scripts
+apply_bar_landmark_alignment_patch.py
+apply_phase3b_patch.py
+download_atib_feedforge.py
+download_atib_songsterr_timing.py
+download_songsterr_timing_v2.py
+songsterr.py
