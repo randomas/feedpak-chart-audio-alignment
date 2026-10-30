@@ -1,10 +1,51 @@
+# 1. Ignore everything in the repository root by default
+*
+
+# 2. Track essential root source files
+!*.py
+!README.md
+!.gitignore
+
+# Track maintained root documentation and project inventory
+!MIDI_*.md
+!ACTIVE_PROJECT_FILES.txt
+
+# Track the maintained PowerShell test-material runner
+!run_all_test_materials.ps1
+
+# 3. Re-include the tests directory and Python tests inside it
+!tests/
+!tests/**/*.py
+
+# 4. Explicit safety exclusions
+Tokens And APIs.txt
 env/
-.venv/
 __pycache__/
-.pytest_cache/
+**/__pycache__/
 *.py[cod]
-node_modules/
+.pytest_cache/
+
+# Temporary patch, checkpoint, and backup scripts
+apply_checkpoint_*.py
+*_before_checkpoints.py
+*_checkpoint_v*.py
+*.before_*
+fix_checkpoint_*.py
+
+# One-off local diagnostic scripts
+check_midi.py
+
+# 5. Local song data and generated output
+my_test_song/
+my_test_song_2/
+output/
+output_folder/
+Gemini_mess/
 _feedpak_build/
+**/_feedpak_build/
 *.feedpak
-*.alignment_report.json
-intermediate_*.json
+*.feedpak.alignment_report.json
+intermediate_arrangements.json
+intermediate_vocals.json
+gp5_inspection.json
+feedpak-project.v*.yaml
