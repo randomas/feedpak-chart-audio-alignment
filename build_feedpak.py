@@ -350,7 +350,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
                   gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False):
+                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -364,8 +364,14 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
     if allow_severe_alignment: cmd.append("--allow-severe-alignment")
     if force_continuous_anchor_warp: cmd.append("--force-continuous-anchor-warp")
     if force_midi_authority: cmd.append("--force-midi-authority")
+    if force_monotonic_chain: cmd.append("--force-monotonic-chain")
+    if allow_wide_monotonic_warp: cmd.append("--allow-wide-monotonic-warp")
+    if allow_compatible_audio_refinement: cmd.append("--allow-compatible-audio-refinement")
     if structural_second_pass: cmd.append("--structural-second-pass")
     if transcription_investigator: cmd.append("--transcription-investigator")
+    if midi_section_fit: cmd.append("--midi-section-fit")
+    if force_midi_section_fit: cmd.append("--force-midi-section-fit")
+    if midi_section_fit_materialization: cmd.extend(("--midi-section-fit-materialization",midi_section_fit_materialization))
     if anchors_path: cmd += ["--anchors",anchors_path]
     cmd += ["--padding-added",str(padding_added),"--auto-chunk-measures",str(auto_chunk_measures),
             "--alignment-mode",alignment_mode,
@@ -817,7 +823,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
           gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,
+          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,
           package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
@@ -935,6 +941,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     alignment_proposals_report=None
     structural_search_report=None
     transcription_investigator_report=None
+    midi_section_fit_report=None
     expression_report=None
     if gp_path and (drums_path or bass_path or piano_path or guitar_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
@@ -949,7 +956,12 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable,
                       piano_duration_quantize_ms=piano_duration_quantize_ms,
                       force_continuous_anchor_warp=force_continuous_anchor_warp,
-                      structural_second_pass=structural_second_pass,transcription_investigator=transcription_investigator,force_midi_authority=force_midi_authority)
+                      structural_second_pass=structural_second_pass,transcription_investigator=transcription_investigator,force_midi_authority=force_midi_authority,force_monotonic_chain=force_monotonic_chain,
+                      allow_wide_monotonic_warp=allow_wide_monotonic_warp,
+                      allow_compatible_audio_refinement=allow_compatible_audio_refinement,
+                      midi_section_fit=midi_section_fit,
+                      force_midi_section_fit=force_midi_section_fit,
+                      midi_section_fit_materialization=midi_section_fit_materialization)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         if gp_vocal_production:
@@ -974,6 +986,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         alignment_proposals_report=gp_data.get("alignment_proposals_report")
         structural_search_report=gp_data.get("structural_search_report")
         transcription_investigator_report=gp_data.get("transcription_investigator_report")
+        midi_section_fit_report=gp_data.get("midi_section_fit_report")
         expression_report=gp_data.get("expression_report")
         fc.log(f"Wrote {len(arrangements)} arrangement entr(y/ies), "
                f"drum_tab={'yes' if drum_tab_file else 'no'}, "
@@ -1060,6 +1073,10 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         transcription_path=output_path+".transcription_investigator.json"
         fc.write_json(transcription_path,transcription_investigator_report)
         fc.log(f"Wrote transcription investigator report: {transcription_path}",indent=1)
+    if midi_section_fit_report:
+        section_path=output_path+".midi_section_fit.json"
+        fc.write_json(section_path,midi_section_fit_report)
+        fc.log(f"Wrote MIDI section-fit report: {section_path}",indent=1)
 
     if structural_search_report:
         structural_path=output_path+".structural_search_report.json"
@@ -1120,8 +1137,15 @@ def main():
     parser.add_argument("--build-unsafe-continuous-comparison",action="store_true",
                         help="Build the safe package plus an explicitly labelled unsafe continuous-anchor comparison")
     parser.add_argument("--phase3d-variants",action="store_true")
-    parser.add_argument("--force-midi-authority",action="store_true",help="Force a finite monotonic performance-MIDI path as production baseline")
+    parser.add_argument("--force-midi-authority",action="store_true",help="Force the legacy finite monotonic performance-MIDI path as production baseline")
+    parser.add_argument("--force-monotonic-chain",action="store_true",help="DIAGNOSTIC ONLY: build the selected role-specific monotonic chain even when normal incipit authority rejects it")
+    parser.add_argument("--allow-wide-monotonic-warp",action="store_true",help="DIAGNOSTIC ONLY: allow 0.70-1.30 chart stretch in forced monotonic-chain comparisons")
+    parser.add_argument("--allow-compatible-audio-refinement",action="store_true",help="Allow compatible audio refinement after a forced monotonic chain; disabled by default")
     parser.add_argument("--transcription-investigator",action="store_true",help="Read prepared MuScriptor MIDI evidence (not available for nominal, offset, linear, or unguarded dtw)")
+    parser.add_argument("--midi-section-fit",action="store_true",help="DIAGNOSTIC ONLY: write overlapping measure-section MIDI candidate/path/fusion report")
+    parser.add_argument("--force-midi-section-fit",action="store_true",help="DEPRECATED alias for permissive MIDI section materialization")
+    parser.add_argument("--midi-section-fit-materialization",choices=("conservative","permissive","diagnostic-unsafe"),default=None,
+                        help="Materialize MIDI sections with the selected evidence and transition policy")
     parser.add_argument("--structural-second-pass",action="store_true",
                         help="Enable drift-adjusted second pass only for continuous-anchor-structural")
     parser.add_argument("--strict-variant-builds",action="store_true",
@@ -1153,6 +1177,35 @@ def main():
     if cache and not os.path.isabs(cache): cache=os.path.join(args.song_folder,cache)
     if args.structural_second_pass and args.alignment_mode != "continuous-anchor-structural":
         parser.error("--structural-second-pass requires --alignment-mode continuous-anchor-structural")
+    if args.allow_wide_monotonic_warp and not args.force_monotonic_chain:
+        parser.error("--allow-wide-monotonic-warp requires --force-monotonic-chain")
+    if args.allow_compatible_audio_refinement and not args.force_monotonic_chain:
+        parser.error("--allow-compatible-audio-refinement requires --force-monotonic-chain")
+    if args.force_monotonic_chain and not args.transcription_investigator:
+        parser.error("--force-monotonic-chain requires --transcription-investigator")
+    if args.force_monotonic_chain and not args.structural_second_pass:
+        parser.error("--force-monotonic-chain requires --structural-second-pass")
+    if args.force_monotonic_chain and args.force_midi_authority:
+        parser.error("--force-monotonic-chain and --force-midi-authority are mutually exclusive")
+    if args.force_midi_authority and not args.transcription_investigator:
+        parser.error("--force-midi-authority requires --transcription-investigator")
+    if args.force_midi_authority and not args.structural_second_pass:
+        parser.error("--force-midi-authority requires --structural-second-pass")
+    if args.transcription_investigator and args.alignment_mode not in (
+            "dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective",
+            "continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural",
+            "bar-landmark-regularized"):
+        parser.error("--transcription-investigator is unavailable for nominal, offset, linear, and unguarded dtw")
+    if args.force_midi_section_fit and args.midi_section_fit_materialization is None:
+        args.midi_section_fit_materialization="permissive"
+    if args.midi_section_fit_materialization and not args.midi_section_fit:
+        parser.error("--midi-section-fit-materialization requires --midi-section-fit")
+    if args.midi_section_fit and args.alignment_mode not in (
+            "dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective",
+            "continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural",
+            "bar-landmark-regularized"):
+        parser.error("--midi-section-fit is unavailable for nominal, offset, linear, and unguarded dtw")
+
     safe_output_path = build(args.song_folder,args.output_folder,vocals_stem_name=args.vocals_stem,
           drums_stem_name=args.drums_stem,device=args.device,hf_token=args.hf_token,
           skip_vocals=args.skip_vocals,skip_gp=args.skip_gp,keep_work_dir=(args.keep_work_dir or args.build_unsafe_continuous_comparison),
@@ -1169,17 +1222,12 @@ def main():
           alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
           piano_duration_quantize_ms=args.piano_duration_quantize_ms,phase3d_variants=args.phase3d_variants,
           phase3d_safe_candidates=args.phase3d_safe_candidates,phase3d_structural_candidates=args.phase3d_structural_candidates,
-          structural_second_pass=args.structural_second_pass,transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority)
-
-    if args.force_midi_authority and not args.transcription_investigator:
-        parser.error("--force-midi-authority requires --transcription-investigator")
-    if args.force_midi_authority and not args.structural_second_pass:
-        parser.error("--force-midi-authority requires --structural-second-pass")
-    if args.transcription_investigator and args.alignment_mode not in (
-            "dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective",
-            "continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural",
-            "bar-landmark-regularized"):
-        parser.error("--transcription-investigator is unavailable for nominal, offset, linear, and unguarded dtw")
+          structural_second_pass=args.structural_second_pass,transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority,force_monotonic_chain=args.force_monotonic_chain,
+          allow_wide_monotonic_warp=args.allow_wide_monotonic_warp,
+          allow_compatible_audio_refinement=args.allow_compatible_audio_refinement,
+          midi_section_fit=args.midi_section_fit,
+          force_midi_section_fit=args.force_midi_section_fit,
+          midi_section_fit_materialization=args.midi_section_fit_materialization)
 
     if args.build_unsafe_continuous_comparison:
         if args.alignment_mode not in ("continuous-anchor-linear", "continuous-anchor-dtw"):

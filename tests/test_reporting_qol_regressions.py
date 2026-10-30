@@ -93,3 +93,14 @@ def test_test_runner_exposes_light_diagnostics_folder():
     assert '[switch]$LightDiagnostics' in source
     assert '"Diagnostics_light"' in source
     assert '$collectorArguments += "--light"' in source
+
+
+def test_wide_monotonic_warp_switch_is_explicit_and_audio_refinement_is_opt_in():
+    builder=(ROOT/'build_feedpak.py').read_text()
+    runner=(ROOT/'run_all_test_materials.ps1').read_text(encoding='utf-8-sig')
+    process=(ROOT/'process_gp_alignment.py').read_text()
+    assert '--allow-wide-monotonic-warp' in builder
+    assert '[switch]$AllowWideMonotonicWarp' in runner
+    assert '[switch]$AllowCompatibleAudioRefinement' in runner
+    assert 'force_monotonic_chain and not allow_compatible_audio_refinement' in process
+    assert 'forced-wide-monotonic-chain' in process

@@ -75,6 +75,13 @@ class InvestigatorConfig:
     streak_fit_max_median_residual_seconds: float = 0.12
     streak_fit_max_residual_seconds: float = 0.35
     streak_fit_outlier_mad_multiplier: float = 3.5
+    landmark_score_tolerance_seconds: float = 0.035
+    landmark_midi_cluster_seconds: float = 0.10
+    landmark_chain_stretch_min: float = 0.88
+    landmark_chain_stretch_max: float = 1.12
+    landmark_chain_start_tolerance_seconds: float = 0.35
+    incipit_chain_root_tolerance_seconds: float = 2.0
+    wide_monotonic_warp_enabled: bool = False
     version: str = "prepared-muscriptor-sequence-authority-v3"
 
 
@@ -670,16 +677,94 @@ def _tracking_candidate(phrase,audio_groups,role,predictions,radius,cfg,label):
 
 
 
+
+def select_monotonic_landmark_chain(landmarks,cfg):
+    """Select one sequential chart->MIDI occurrence before affine fitting.
+
+    Overlapping phrase windows may assign one chart onset to several MIDI
+    onsets.  This groups those alternatives and uses dynamic programming to
+    select one monotonic, locally safe chain rooted at the acquired incipit.
+    """
+    raw=[]
+    for item in landmarks:
+        try:x=float(item["score_time"]);y=float(item["midi_time"])
+        except (KeyError,TypeError,ValueError):continue
+        if math.isfinite(x) and math.isfinite(y):
+            raw.append({"score_time":x,"midi_time":y,"similarity":float(item.get("similarity",1.0)),
+                        "phrase_index":int(item.get("phrase_index",0)),
+                        "acquisition":bool(item.get("acquisition",False))})
+    if not raw:return {"status":"no_landmarks","selected":[],"alternatives":[],"raw_count":0}
+    raw.sort(key=lambda r:(r["score_time"],r["midi_time"]))
+    # Group near-identical chart onsets, then cluster their competing MIDI times.
+    score_groups=[];tol=_cfg(cfg,"landmark_score_tolerance_seconds",.035)
+    for row in raw:
+        if not score_groups or row["score_time"]-score_groups[-1][-1]["score_time"]>tol:score_groups.append([row])
+        else:score_groups[-1].append(row)
+    nodes=[];alternatives=[];midi_tol=_cfg(cfg,"landmark_midi_cluster_seconds",.10)
+    for gi,group in enumerate(score_groups):
+        clusters=[]
+        for row in sorted(group,key=lambda r:r["midi_time"]):
+            if not clusters or row["midi_time"]-clusters[-1][-1]["midi_time"]>midi_tol:clusters.append([row])
+            else:clusters[-1].append(row)
+        for ci,cluster in enumerate(clusters):
+            weights=[max(.05,r["similarity"]) for r in cluster];total=sum(weights)
+            x=sum(r["score_time"]*w for r,w in zip(cluster,weights))/total
+            y=sum(r["midi_time"]*w for r,w in zip(cluster,weights))/total
+            node={"score_time":x,"midi_time":y,"similarity":max(r["similarity"] for r in cluster),
+                  "support":len(cluster),"score_group":gi,"midi_cluster":ci,
+                  "acquisition_support":sum(r["acquisition"] for r in cluster),
+                  "first_phrase_index":min(r["phrase_index"] for r in cluster),
+                  "last_phrase_index":max(r["phrase_index"] for r in cluster)}
+            nodes.append(node)
+            if len(clusters)>1:alternatives.append(node)
+    nodes.sort(key=lambda r:(r["score_time"],r["midi_time"]))
+    if not nodes:return {"status":"no_clustered_landmarks","selected":[],"alternatives":alternatives,"raw_count":len(raw)}
+    first_score=min(r["score_time"] for r in nodes if r["acquisition_support"]>0) if any(r["acquisition_support"]>0 for r in nodes) else nodes[0]["score_time"]
+    start_tol=_cfg(cfg,"landmark_chain_start_tolerance_seconds",.35)
+    acquisition_nodes=[r for r in nodes if r["acquisition_support"]>0 and r["score_time"]<=first_score+start_tol]
+    if not acquisition_nodes:acquisition_nodes=[r for r in nodes if r["score_time"]<=nodes[0]["score_time"]+start_tol]
+    # The median acquisition translation is only a soft start preference.
+    acquisition_offset=statistics.median([r["midi_time"]-r["score_time"] for r in acquisition_nodes])
+    n=len(nodes);neg=-1e18;dp=[neg]*n;prev=[None]*n;length=[0]*n
+    min_edge=_cfg(cfg,"landmark_chain_stretch_min",.88);max_edge=_cfg(cfg,"landmark_chain_stretch_max",1.12)
+    acquisition_keys={(r["score_group"],r["midi_cluster"]) for r in acquisition_nodes}
+    for i,node in enumerate(nodes):
+        if (node["score_group"],node["midi_cluster"]) in acquisition_keys:
+            start_error=abs((node["midi_time"]-node["score_time"])-acquisition_offset)
+            dp[i]=2.0+node["similarity"]+.15*math.log1p(node["support"])-start_error
+            length[i]=1
+        for j in range(i):
+            a=nodes[j]
+            if node["score_group"]<=a["score_group"]:continue
+            ds=node["score_time"]-a["score_time"];da=node["midi_time"]-a["midi_time"]
+            if ds<=0 or da<=0:continue
+            edge=da/ds
+            if not min_edge<=edge<=max_edge:continue
+            phrase_backtrack=max(0,a["first_phrase_index"]-node["last_phrase_index"])
+            value=dp[j]+1.0+node["similarity"]+.12*math.log1p(node["support"])-.8*abs(edge-1.0)-.2*phrase_backtrack
+            if value>dp[i]:dp[i]=value;prev[i]=j;length[i]=length[j]+1
+    valid=[i for i in range(n) if dp[i]>neg/2]
+    if not valid:return {"status":"no_monotonic_safe_chain","selected":[],"alternatives":alternatives,
+                         "raw_count":len(raw),"node_count":len(nodes)}
+    end=max(valid,key=lambda i:(length[i],dp[i],nodes[i]["score_time"]-first_score))
+    idxs=[];cur=end
+    while cur is not None:idxs.append(cur);cur=prev[cur]
+    idxs.reverse();selected=[nodes[i] for i in idxs]
+    selected_keys={(r["score_group"],r["midi_cluster"]) for r in selected}
+    rejected=[r for r in nodes if (r["score_group"],r["midi_cluster"]) not in selected_keys]
+    return {"status":"available","selected":selected,"alternatives":rejected,
+            "raw_count":len(raw),"node_count":len(nodes),"selected_count":len(selected),
+            "competing_node_count":len(rejected),"acquisition_offset_seconds":round(acquisition_offset,6),
+            "edge_stretch_range":[min_edge,max_edge]}
+
 def fit_chart_to_midi_streak(landmarks,cfg):
     """Robustly fit the chart clock onto fixed performance-MIDI timestamps."""
-    rows=[];seen=set()
-    for raw in landmarks:
-        x=float(raw["score_time"]);y=float(raw["midi_time"])
-        key=(round(x,6),round(y,6))
-        if key not in seen and math.isfinite(x) and math.isfinite(y):
-            rows.append({"score_time":x,"midi_time":y,"similarity":float(raw.get("similarity",1.0))});seen.add(key)
-    rows.sort(key=lambda r:(r["score_time"],r["midi_time"]))
-    if len(rows)<2:return {"valid":False,"reason":"insufficient_landmarks","landmark_count":len(rows)}
+    chain=select_monotonic_landmark_chain(landmarks,cfg)
+    rows=[{"score_time":float(r["score_time"]),"midi_time":float(r["midi_time"]),
+           "similarity":float(r.get("similarity",1.0)),"support":int(r.get("support",1))}
+          for r in chain.get("selected",[])]
+    if len(rows)<2:return {"valid":False,"reason":"unsafe_or_incoherent_chart_to_midi_fit",
+                           "landmark_count":len(landmarks),"chain_summary":{k:v for k,v in chain.items() if k not in ('selected','alternatives')}}
     active=rows[:]
     for _ in range(3):
         fit=_robust_affine_fit([{"time":r["score_time"]} for r in active],
@@ -703,11 +788,18 @@ def fit_chart_to_midi_streak(landmarks,cfg):
            cfg.local_stretch_min<=fit["stretch"]<=cfg.local_stretch_max and
            median<=_cfg(cfg,"streak_fit_max_median_residual_seconds",.12) and
            maximum<=_cfg(cfg,"streak_fit_max_residual_seconds",.35))
+    timing_classification=("normal_timing_fit" if cfg.local_stretch_min>=.9 and cfg.local_stretch_max<=1.1 else
+        "probable_chart_timing_discrepancy" if .75<=fit["stretch"]<=1.25 else
+        "extreme_chart_timing_discrepancy")
     return {"valid":valid,"reason":None if valid else "unsafe_or_incoherent_chart_to_midi_fit",
+            "timing_classification":timing_classification,
+            "wide_warp_enabled":bool(_cfg(cfg,"wide_monotonic_warp_enabled",False)),
             "timeline_model":"chart_to_performance_midi","fixed_timeline":"prepared_midi_audio_clock",
             "transformed_timeline":"chart_clock","offset":round(fit["offset"],6),
-            "chart_stretch":round(fit["stretch"],8),"landmark_count":len(rows),
-            "inlier_count":len(active),"rejected_landmark_count":len(rows)-len(active),
+            "chart_stretch":round(fit["stretch"],8),"landmark_count":len(landmarks),
+            "chain_landmark_count":len(rows),"inlier_count":len(active),
+            "rejected_landmark_count":len(landmarks)-len(active),
+            "chain_summary":{k:v for k,v in chain.items() if k not in ("selected","alternatives")},
             "chart_start":active[0]["score_time"] if active else None,
             "chart_end":active[-1]["score_time"] if active else None,
             "midi_start":active[0]["midi_time"] if active else None,
@@ -792,8 +884,9 @@ def track_incipit_role(score_events, providers, nominal_prior, observed_incipit_
         if valid:
             candidate=dict(candidate);candidate["authority_tier"]="opening_role_streak"
             candidate["sequence_authority_eligible"]=True;accepted.append(candidate);streak.append(candidate)
-            current_offset=float(candidate["audio_time"])-float(candidate["score_time"])
-            current_stretch=float(candidate.get("local_stretch") or current_stretch)
+            deltas=[float(x["midi_time"])-float(x["score_time"]) for x in (candidate.get("matched_landmarks") or [])]
+            if deltas:current_offset=statistics.median(deltas)
+            current_stretch=1.0
             misses=0;contradictions=0
             if report["state"]=="REACQUIRING":
                 reacquired=True;report["events"].append({"event":"tracking_lock_reacquired","role":role,
@@ -821,38 +914,53 @@ def track_incipit_role(score_events, providers, nominal_prior, observed_incipit_
             "action":"release_to_baseline","timing_controls_created_in_gap":False});break
     minimum=_cfg(cfg,"incipit_tracking_min_confirmed_phrases",3)
     landmarks=[]
-    for item in accepted:landmarks.extend(item.get("matched_landmarks") or [])
+    for phrase_index,item in enumerate(accepted):
+        for raw in item.get("matched_landmarks") or []:
+            landmark=dict(raw);landmark["phrase_index"]=phrase_index;landmark["acquisition"]=(phrase_index==0)
+            landmark["phrase_confidence"]=item.get("local_phrase_confidence")
+            landmarks.append(landmark)
     streak_fit=fit_chart_to_midi_streak(landmarks,cfg)
-    confirmed=len(accepted)>=minimum and bool(streak_fit.get("valid"))
-    controls=[];incipit_control=None
-    if confirmed:
+    geometry_valid=len(accepted)>=minimum and bool(streak_fit.get("valid"))
+    opening_start=float(opening.get("song_opening_score_time",first_score))
+    chain_start=streak_fit.get("chart_start")
+    root_distance=None if chain_start is None else float(chain_start)-opening_start
+    root_tolerance=_cfg(cfg,"incipit_chain_root_tolerance_seconds",2.0)
+    root_valid=bool(geometry_valid and root_distance is not None and -0.05<=root_distance<=root_tolerance)
+    classification=("incipit_role_streak" if root_valid else "regional_role_streak" if geometry_valid else "rejected_geometry")
+    controls=[];diagnostic_controls=[];incipit_control=None
+    if geometry_valid:
         offset=float(streak_fit["offset"]);stretch=float(streak_fit["chart_stretch"])
         first_chart=float(streak_fit["chart_start"]);last_chart=float(streak_fit["chart_end"])
-        incipit_control={"score_time":first_chart,"audio_time":offset+stretch*first_chart,
-            "kind":"incipit_acquisition_onset","authority":"incipit_role_streak","source":role,
-            "chart_stretch":stretch,"immutable":False}
         sample_times=[first_chart]
         for item in accepted:
             t=float(item["score_time"])
-            if first_chart<t<last_chart and (not sample_times or t-sample_times[-1]>=4.0):sample_times.append(t)
+            if first_chart<t<last_chart and t-sample_times[-1]>=4.0:sample_times.append(t)
         if last_chart>sample_times[-1]:sample_times.append(last_chart)
         for t in sample_times:
-            controls.append({"score_time":t,"audio_time":offset+stretch*t,
-                "kind":"incipit_acquisition_onset" if t==first_chart else "chart_to_midi_streak_fit",
-                "authority":"incipit_role_streak","source":role,"chart_stretch":stretch,
+            diagnostic_controls.append({"score_time":t,"audio_time":offset+stretch*t,
+                "kind":"incipit_acquisition_onset" if root_valid and t==first_chart else "regional_monotonic_chain_fit",
+                "authority":classification,"source":role,"chart_stretch":stretch,
                 "streak_median_residual_seconds":streak_fit["median_residual_seconds"]})
+        if root_valid:
+            controls=list(diagnostic_controls);incipit_control=dict(controls[0])
+    confirmed=root_valid
+    streak_fit["root_validation"]={"opening_score_time":round(opening_start,6),
+        "selected_chain_start":None if chain_start is None else round(float(chain_start),6),
+        "root_distance_seconds":None if root_distance is None else round(root_distance,6),
+        "maximum_root_distance_seconds":root_tolerance,"passed":root_valid,"classification":classification}
     if accepted:
-        report["streaks"].append({"streak_id":role+"-opening-1","role":role,
-            "status":"confirmed" if confirmed else "rejected_geometry",
+        report["streaks"].append({"streak_id":role+"-opening-1","role":role,"status":"confirmed" if confirmed else classification,
             "chart_start":streak_fit.get("chart_start"),"chart_end":streak_fit.get("chart_end"),
             "midi_start":streak_fit.get("midi_start"),"midi_end":streak_fit.get("midi_end"),
             "accepted_phrases":len(accepted),"representative_control_count":len(controls),
-            "chart_to_midi_fit":streak_fit})
-    report.update({"status":"confirmed" if confirmed else "insufficient_streak",
-        "state":report["state"],"accepted_phrase_count":len(accepted),
-        "timeline_model":"chart_to_performance_midi","streak_fit":streak_fit,
-        "incipit_control":incipit_control,"representative_controls":controls,
-        "release_reason":None if confirmed else (streak_fit.get("reason") or "fewer_than_minimum_confirmed_phrases")})
+            "diagnostic_control_count":len(diagnostic_controls),"chart_to_midi_fit":streak_fit})
+    release_reason=(None if confirmed else "selected_chain_not_rooted_at_incipit" if geometry_valid else
+                    streak_fit.get("reason") or "fewer_than_minimum_confirmed_phrases")
+    report.update({"status":"confirmed" if confirmed else classification,"state":report["state"],
+        "accepted_phrase_count":len(accepted),"timeline_model":"chart_to_performance_midi",
+        "chain_classification":classification,"streak_fit":streak_fit,"incipit_control":incipit_control,
+        "representative_controls":controls,"monotonic_chain_diagnostic_controls":diagnostic_controls,
+        "release_reason":release_reason})
     return report
 
 def build_incipit_consensus(candidates, nominal_prior, observed_incipit_prior,
@@ -1118,10 +1226,24 @@ def assess_midi_authority(report, minimum_controls=4, minimum_coverage=.35,
         "roles":roles,"role_count":len(roles),**hierarchy}
 
 
-def build_midi_authority_prior(report,fallback,force=False):
+def build_midi_authority_prior(report,fallback,force=False,force_monotonic_chain=False):
     available,authority=assess_midi_authority(report)
+    tracker=(report or {}).get("incipit_role_tracking") or {}
     controls=authority["representative_controls"]
-    if force and not available:
+    if force_monotonic_chain:
+        raw=tracker.get("monotonic_chain_diagnostic_controls") or []
+        finite=sorted([x for x in raw if math.isfinite(float(x.get("score_time",math.nan))) and math.isfinite(float(x.get("audio_time",math.nan)))],key=lambda x:float(x["score_time"]))
+        monotonic=len(finite)>=2 and all(float(b["score_time"])>float(a["score_time"]) and float(b["audio_time"])>float(a["audio_time"]) for a,b in zip(finite,finite[1:]))
+        if not monotonic:
+            authority.update({"status":"force_blocked","authority":"force_monotonic_chain_blocked",
+                "force_monotonic_chain_requested":True,"force_blocked_reason":"no_finite_monotonic_chain_controls"})
+            return fallback,authority
+        controls=finite;available=True
+        authority.update({"status":"available","authority":"forced_monotonic_chain","force_requested":False,
+            "force_monotonic_chain_requested":True,"normal_gate_passed":False,
+            "chain_classification":tracker.get("chain_classification"),"diagnostic_unsafe_timing":True,
+            "representative_controls":controls,"trusted_control_count":len(controls),"force_blocked_reason":None})
+    elif force and not available:
         selected=sorted((((report or {}).get("final_global_monotonic_path_preview") or
                           (report or {}).get("global_monotonic_path_preview") or {}).get("selected") or []),
                         key=lambda x:float(x["score_time"]))
@@ -1146,7 +1268,7 @@ def build_midi_authority_prior(report,fallback,force=False):
     controls=sorted(controls,key=lambda x:x["score_time"]);xs=[x["score_time"] for x in controls];ys=[x["audio_time"] for x in controls]
     def prior(t):
         t=float(t)
-        tracker_limited=authority.get("authority")=="incipit_role_streak"
+        tracker_limited=authority.get("authority") in {"incipit_role_streak","forced_monotonic_chain"}
         if t<xs[0]:return float(fallback(t)) if tracker_limited else float(fallback(t))+(ys[0]-float(fallback(xs[0])))
         if t>xs[-1]:return float(fallback(t)) if tracker_limited else float(fallback(t))+(ys[-1]-float(fallback(xs[-1])))
         for i in range(1,len(xs)):

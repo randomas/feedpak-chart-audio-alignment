@@ -36,6 +36,7 @@ import structural_search as structural_search_module
 import manual_anchors as ma
 import continuous_anchors as ca
 import transcription_investigator as ti
+import midi_section_fit as msf
 import continuous_anchors_legacy as ca_legacy
 
 try:
@@ -949,10 +950,13 @@ def finalize_production_timing(decision, requested_method):
     base_changed=bool(decision.get("base_timing_changed") or decision.get("global_timing",{}).get("timing_changes_applied") or
                       abs(scale-1.0)>1e-9 or opening_changed)
     sanitization=bool(decision.get("sanitization",{}).get("timing_changes_applied") or decision.get("sanitization_applied"))
-    any_changed=bool(base_changed or checkpoint_changed or continuous_changed or local_changed or bar_changed)
+    section_changed=bool((decision.get("midi_section_fit_application") or {}).get("timing_changes_applied"))
+    any_changed=bool(base_changed or checkpoint_changed or continuous_changed or local_changed or bar_changed or section_changed)
     fallback=bool("fallback" in output or (requested_method=="checkpoint-dtw-selective" and not local_changed))
     if requested_method=="checkpoint-dtw-selective" and not local_changed:
         selected="checkpoint-linear" if checkpoint_changed or "checkpoint" in output else output.replace("-v1","")
+    elif section_changed:
+        selected="midi-section-fit"
     elif any_changed:
         selected=requested_method
     else:
@@ -996,6 +1000,28 @@ def shift_nominal_times(entries, offset, time_key="t_gp"):
 # --------------------------------------------------------------------------
 # Fretted-track parsing (guitar / bass)
 # --------------------------------------------------------------------------
+
+def compute_anchors(notes, default_width=4):
+    """Build ordered Rock-Band-style fret hand-position anchors.
+
+    The legacy GP5 parser historically called this helper, but the definition
+    was lost during parser refactoring. Keep the compact existing output shape:
+    {time, fret, width}.
+    """
+    playable=sorted((x for x in notes if x.get("f") is not None and int(x.get("f",0))>=0),
+                    key=lambda x:(float(x.get("t_gp",0.0)),int(x.get("f",0))))
+    if not playable:return []
+    groups={}
+    for note in playable:groups.setdefault(round(float(note["t_gp"]),6),[]).append(int(note["f"]))
+    anchors=[];position=None
+    for time,frets in sorted(groups.items()):
+        fretted=[x for x in frets if x>0]
+        target=max(1,min(fretted) if fretted else 1)
+        if position is None or target<position or max(fretted or [target])>position+default_width-1:
+            position=max(1,target)
+            anchors.append({"time":float(time),"fret":int(position),"width":int(default_width)})
+    return anchors
+
 
 def parse_fretted_track(track, tempo_events, first_tick):
     string_count=len(track.strings); pending=[]
@@ -2011,9 +2037,15 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False):
+            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
+    if midi_section_fit:
+        msf.validate_alignment_method(alignment_mode)
+    if force_midi_section_fit and midi_section_fit_materialization is None:
+        midi_section_fit_materialization="permissive"
+    if midi_section_fit_materialization and not midi_section_fit:
+        raise ValueError("midi_section_fit_materialization requires midi_section_fit")
     if gp_parser == "alphatab":
         fc.log(f"Processing modern GP through alphaTab: {gp_path}")
         json_path = score_json_path or ats.ensure_json(gp_path, extractor=alphatab_extractor, node=node_executable)
@@ -2334,6 +2366,42 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "piano":piano_audio_path,
         "full":full_audio_path,
     }
+    midi_section_fit_report=None
+    if midi_section_fit:
+        section_measures=[]
+        downbeats=sorted(song_timeline_gp.get("beats") or [],key=lambda x:float(x["t_gp"]))
+        for index,row in enumerate(downbeats):
+            start=float(row["t_gp"])
+            if index+1<len(downbeats):end=float(downbeats[index+1]["t_gp"])
+            elif index:
+                end=start+max(.25,start-float(downbeats[index-1]["t_gp"]))
+            else:end=start+2.0
+            section_measures.append({"playback_index":index,
+                "playback_measure_number":int(row.get("measure",index+1)),
+                "written_measure_number":int(row.get("source_bar",row.get("measure",index+1))),
+                "start_time":start,"end_time":end})
+        section_midi={}
+        for role,path in ti.discover_prepared_files(os.path.dirname(os.path.abspath(gp_path))).items():
+            provider=({"status":"not_prepared","events":[]} if path is None else
+                      ti.parse_muscriptor_midi(path,role,padding_added))
+            section_midi[role]=provider.get("events") or []
+        midi_section_fit_report=msf.build_section_fusion_report(
+            section_measures,continuous_score_events,section_midi,
+            baseline_hypotheses={
+                "requested_method_baseline":warp_fn,
+                "prepared_chart_clock":lambda t:float(t),
+            })
+        midi_section_fit_report["integration"]={"switch":"--midi-section-fit",
+            "playback_measure_count":len(section_measures),
+            "prepared_roles":sorted(role for role,events in section_midi.items() if events),
+            "requested_alignment_method":alignment_mode,
+            "search_baselines":["requested_method_baseline","prepared_chart_clock"],
+            "timing_changes_applied":False}
+        decision["midi_section_fit"]={"status":"complete","diagnostic_only":True,
+            "timing_changes_applied":False,
+            "summary":(midi_section_fit_report.get("fusion_report") or {}).get("summary",{})}
+        sf=(midi_section_fit_report.get("fusion_report") or {}).get("summary",{})
+        fc.log(f"MIDI section fit: regions={sf.get('region_count',0)}; controls={sf.get('control_count',0)}; conflicts={sf.get('role_conflict_count',0)}; timing changes=0",indent=1)
     transcription_report=None
     if transcription_investigator:
         ti.validate_method(alignment_mode)
@@ -2360,13 +2428,17 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         _midi_boundaries=[]
         # Do not make the offset incipit an immutable boundary.  Recognizable
         # note sequences must first confirm that it is the correct musical event.
+        investigator_config=(ti.InvestigatorConfig(
+            local_stretch_min=.70,local_stretch_max=1.30,
+            landmark_chain_stretch_min=.70,landmark_chain_stretch_max=1.30,
+            wide_monotonic_warp_enabled=True) if allow_wide_monotonic_warp else None)
         transcription_report=ti.investigate(
             continuous_score_events,os.path.dirname(os.path.abspath(gp_path)),warp_fn,
             padding_added=padding_added,alignment_mode=alignment_mode,
             nominal_prior=nominal_midi_prior,nominal_prior_report=nominal_midi_prior_report,
             observed_incipit_prior=observed_incipit_prior,
             observed_incipit_report=observed_incipit_report,
-            boundary_controls=_midi_boundaries,pass_label="dual_origin_sequence_search")
+            boundary_controls=_midi_boundaries,pass_label="dual_origin_sequence_search",config=investigator_config)
         decision["transcription_investigator"]=transcription_report
         ts=transcription_report.get("summary",{})
         fc.log(f"MuScriptor evidence: prepared roles={ts.get('prepared_role_count',0)}/{ts.get('expected_role_count',0)}; "
@@ -2439,6 +2511,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     )
     decision["continuous_anchor_path_preview"]=anchor_path_preview
     midi_timing_trace={"midi_available":transcription_report is not None,"force_requested":bool(force_midi_authority),
+                       "force_monotonic_chain_requested":bool(force_monotonic_chain),
         "authority_gate_passed":False,"authority":None,"selected_as_production_baseline":False,
         "final_output_contains_midi_warp":False,"rejection_reason":"transcription_unavailable" if transcription_report is None else None}
     decision["midi_timing_decision"]=midi_timing_trace
@@ -2448,7 +2521,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         # phrases may centre structural Pass 2 searches. They never become
         # production controls directly.
         if transcription_report is not None:
-            midi_prior,midi_prior_report=ti.build_midi_authority_prior(transcription_report,nominal_midi_prior,force=force_midi_authority)
+            midi_prior,midi_prior_report=ti.build_midi_authority_prior(transcription_report,nominal_midi_prior,force=force_midi_authority,force_monotonic_chain=force_monotonic_chain)
             decision["transcription_structural_second_pass_prior"]=midi_prior_report
             transcription_report["midi_authority"]=midi_prior_report
             if force_midi_authority and midi_prior_report.get("status")=="force_blocked":
@@ -2470,7 +2543,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 prior_report={"status":"available","source":midi_prior_report.get("authority","trusted_midi_primary"),
                               "authority":"trusted_midi_primary",
                               "control_count":midi_prior_report.get("trusted_control_count",0),
-                              "diagnostic_only":False,"forced":bool(force_midi_authority),
+                              "diagnostic_only":bool(force_monotonic_chain),"forced":bool(force_midi_authority or force_monotonic_chain),
                               "controls":midi_prior_report.get("representative_controls",[])}
         decision["continuous_structural_second_pass_prior"]=prior_report
         if prior_report.get("source")=="trusted_midi_primary":
@@ -2515,7 +2588,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             padding_added=padding_added,alignment_mode=alignment_mode,
             nominal_prior=nominal_midi_prior,nominal_prior_report=nominal_midi_prior_report,
             boundary_controls=_midi_boundaries+manual_controls,recovery_prior=recovery_prior,
-            pass_label="post_structural_recovery")
+            pass_label="post_structural_recovery",config=investigator_config)
         transcription_report["second_pass"]=second_transcription_report
         transcription_report["final_global_monotonic_path_preview"]=second_transcription_report.get("global_monotonic_path_preview")
         transcription_report["summary"]["second_pass_selected_monotonic_candidates"]=(second_transcription_report.get("summary") or {}).get("selected_monotonic_candidates",0)
@@ -2529,6 +2602,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "(diagnostic only)",indent=1,
     )
     apply_continuous_linear = alignment_mode in ("continuous-anchor-linear", "continuous-anchor-dtw", "continuous-anchor-structural")
+    if force_monotonic_chain and not allow_compatible_audio_refinement:
+        apply_continuous_linear=False
     decision["dense_production_enabled"] = False
     decision["dense_joint_matcher_status"] = "diagnostic_only_until_corpus_validation"
     continuous_warp_kwargs = {
@@ -2642,11 +2717,15 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         refined=bool(continuous_linear_report.get("timing_changes_applied"))
         midi_timing_trace.update({"final_output_contains_midi_warp":True,
             "audio_refinement_applied":refined,
-            "final_output":("forced-midi-plus-compatible-audio" if force_midi_authority and refined else
+            "final_output":("forced-wide-monotonic-chain-plus-compatible-audio" if force_monotonic_chain and allow_wide_monotonic_warp and refined else
+                            "forced-wide-monotonic-chain" if force_monotonic_chain and allow_wide_monotonic_warp else
+                            "forced-monotonic-chain-plus-compatible-audio" if force_monotonic_chain and refined else
+                            "forced-monotonic-chain" if force_monotonic_chain else
+                            "forced-midi-plus-compatible-audio" if force_midi_authority and refined else
                             "forced-midi-baseline" if force_midi_authority else
                             "trusted-midi-plus-compatible-audio" if refined else "trusted-midi-baseline")})
         decision["timing_output"]=midi_timing_trace["final_output"]
-        fc.log(f"MIDI TIMING TRACE: authority={midi_timing_trace.get('authority')}; forced={force_midi_authority}; baseline_applied=True; audio_refinement={refined}; output={midi_timing_trace['final_output']}",indent=1)
+        fc.log(f"MIDI TIMING TRACE: authority={('forced_monotonic_chain' if force_monotonic_chain else midi_timing_trace.get('authority'))}; forced={force_midi_authority}; baseline_applied=True; audio_refinement={refined}; output={midi_timing_trace['final_output']}",indent=1)
     elif transcription_report is not None and midi_timing_trace.get("rejection_reason") is None:
         meta=decision.get("transcription_structural_second_pass_prior") or {}
         midi_timing_trace["rejection_reason"]=meta.get("status","not_selected_by_final_output_router")
@@ -2683,6 +2762,21 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         fc.log(f"{c['source']}: p={c.get('probability',0):.3f}, median={c.get('median_residual_ms',0):.1f}ms, coverage={c.get('coverage',0):.2f}",indent=2)
     for pair in decision.get("agreement",[]):
         fc.log(f"Agreement {pair['sources']}: median={pair['median_ms']:.1f}ms, p95={pair['p95_ms']:.1f}ms",indent=2)
+
+    if midi_section_fit_materialization:
+        fusion=(midi_section_fit_report or {}).get("fusion_report") or {}
+        baseline_before_section_fit=warp_fn
+        warp_fn,section_application=msf.build_section_materialized_warp(
+            fusion,baseline_before_section_fit,midi_section_fit_materialization)
+        midi_section_fit_report["application_report"]=section_application
+        decision["midi_section_fit_application"]=section_application
+        if section_application.get("timing_changes_applied"):
+            decision["timing_output"]=f"midi-section-fit-{midi_section_fit_materialization}"
+            decision["mode"]=f"midi-section-fit-{midi_section_fit_materialization}"
+            # No later audio refinement occurs: this is the final routing layer.
+            fc.log(f"MIDI SECTION MATERIALIZATION ({midi_section_fit_materialization}): applied={len(section_application.get('applied_regions') or [])}; rejected={len(section_application.get('rejected_regions') or [])}; gaps use baseline shape with offset propagation",indent=1)
+        else:
+            fc.log(f"FORCED MIDI SECTION FIT unavailable: {section_application.get('status')}",indent=1)
 
     drum_hits = apply_warp(drum_hits_gp, warp_fn)
     key_events = apply_warp(key_events_gp, warp_fn)
@@ -2819,6 +2913,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "alignment_proposals_report": alignment_proposals_report,
         "structural_search_report": structural_search_report,
         "transcription_investigator_report": transcription_report,
+        "midi_section_fit_report": midi_section_fit_report,
         "expression_report": {
             track_id: arrangement.get("expression_diagnostics", {"encoded": ee.count_fields(arrangement.get("notes", []))})
             for track_id, arrangement in arrangements_out.items()
@@ -2856,13 +2951,22 @@ def main():
     parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural","bar-landmark-regularized"),default="dtw")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
                         help="A/B test output: dense tempos only, explicit beats only, or both")
-    parser.add_argument("--force-midi-authority", action="store_true", help="Force a finite monotonic MIDI path to be the production baseline")
+    parser.add_argument("--force-midi-authority", action="store_true", help="Force the legacy finite monotonic MIDI path to be the production baseline")
+    parser.add_argument("--force-monotonic-chain", action="store_true", help="DIAGNOSTIC ONLY: materialize the selected role-specific monotonic chain even when it is not rooted at the incipit")
+    parser.add_argument("--allow-wide-monotonic-warp", action="store_true", help="DIAGNOSTIC ONLY: allow 0.70-1.30 chart stretch while finding/fitting the forced monotonic chain")
+    parser.add_argument("--allow-compatible-audio-refinement", action="store_true", help="Allow compatible audio refinement after a forced monotonic-chain baseline; disabled by default")
     parser.add_argument("--force-continuous-anchor-warp", action="store_true",
                         help="DIAGNOSTIC ONLY: apply an invalid continuous-anchor proposal for A/B listening")
     parser.add_argument("--structural-second-pass", action="store_true",
                         help="Enable dual-centre drift-adjusted anchor recovery for continuous-anchor-structural")
     parser.add_argument("--transcription-investigator", action="store_true",
                         help="Read prepared *.muscriptor.mid evidence diagnostically for guarded/checkpoint/continuous methods")
+    parser.add_argument("--midi-section-fit", action="store_true",
+                        help="DIAGNOSTIC ONLY: build overlapping measure-section MIDI candidate, monotonic path, and fusion reports")
+    parser.add_argument("--force-midi-section-fit", action="store_true",
+                        help="DEPRECATED alias for --midi-section-fit-materialization permissive")
+    parser.add_argument("--midi-section-fit-materialization",choices=("conservative","permissive","diagnostic-unsafe"),default=None,
+                        help="Materialize MIDI section regions by evidence tier and transition-warp policy")
     parser.add_argument("--allow-severe-alignment", action="store_true",
                         help="Package even if severe structural timing errors remain after repair")
     parser.add_argument("--anchors", default=None)
@@ -2894,7 +2998,12 @@ def main():
                    piano_duration_quantize_ms=args.piano_duration_quantize_ms,
                    force_continuous_anchor_warp=args.force_continuous_anchor_warp,
                    structural_second_pass=args.structural_second_pass,
-                   transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority)
+                   transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority,force_monotonic_chain=args.force_monotonic_chain,
+                   allow_wide_monotonic_warp=args.allow_wide_monotonic_warp,
+                   allow_compatible_audio_refinement=args.allow_compatible_audio_refinement,
+                   midi_section_fit=args.midi_section_fit,
+                   force_midi_section_fit=args.force_midi_section_fit,
+                   midi_section_fit_materialization=args.midi_section_fit_materialization)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

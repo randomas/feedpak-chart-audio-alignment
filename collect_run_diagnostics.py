@@ -89,24 +89,57 @@ def skeleton_transcription(data):
         'incipit_role_tracking':{'status':tracking.get('status'),'state':tracking.get('state'),
             'opening_role':tracking.get('opening_role'),'release_reason':tracking.get('release_reason'),
             'accepted_phrase_count':tracking.get('accepted_phrase_count'),'events':tracking.get('events') or [],
-            'timeline_model':tracking.get('timeline_model'),'incipit_control':tracking.get('incipit_control'),
+            'timeline_model':tracking.get('timeline_model'),'chain_classification':tracking.get('chain_classification'),
+            'incipit_control':tracking.get('incipit_control'),
             'streak_fit':_pick(tracking.get('streak_fit') or {},('valid','reason','timeline_model','fixed_timeline',
-                'transformed_timeline','offset','chart_stretch','landmark_count','inlier_count','rejected_landmark_count',
-                'chart_start','chart_end','midi_start','midi_end','median_residual_seconds','maximum_residual_seconds')),
-            'streaks':tracking.get('streaks') or []},
+                'transformed_timeline','offset','chart_stretch','landmark_count','chain_landmark_count','inlier_count',
+                'rejected_landmark_count','chart_start','chart_end','midi_start','midi_end',
+                'median_residual_seconds','maximum_residual_seconds','chain_summary','root_validation')),
+            'streaks':[_pick(x,('streak_id','role','status','chart_start','chart_end','midi_start','midi_end',
+                'accepted_phrases','representative_control_count')) for x in (tracking.get('streaks') or [])]},
         'global_path':{'status':path.get('status'),'selected_count':path.get('selected_count'),
             'edge_stretch_range':path.get('edge_stretch_range'),'unsupported_gaps':path.get('unsupported_gaps') or []},
         'role_paths':roles,'midi_authority':_pick(authority,('status','authority','predicates','path_coverage',
-            'largest_score_gap_seconds','roles','role_count','trusted_control_count','force_requested','normal_gate_passed','force_blocked_reason')),
+            'largest_score_gap_seconds','roles','role_count','trusted_control_count','force_requested','force_monotonic_chain_requested',
+            'normal_gate_passed','force_blocked_reason','chain_classification','diagnostic_unsafe_timing')),
         'representative_controls':compact_controls}
 
 
+
+def skeleton_midi_section_fit(data):
+    paths=data.get("path_report") or {}; fusion=data.get("fusion_report") or {}
+    roles={}
+    for role,row in (paths.get("roles") or {}).items():
+        roles[role]={"status":row.get("status"),"streak_count":row.get("streak_count"),
+            "selected_candidate_count":row.get("selected_candidate_count"),
+            "unsupported_window_count":len(row.get("unsupported_windows") or []),
+            "monotonicity_validated":row.get("monotonicity_validated"),
+            "streaks":[_pick(x,("streak_id","chart_start","chart_end","midi_start","midi_end",
+                "score","start_window_index","end_window_index","largest_overlap_disagreement_seconds","monotonic"))
+                for x in (row.get("streaks") or [])]}
+    return {"diagnostic_profile":"light","version":data.get("version"),"method":data.get("method"),
+        "diagnostic_only":data.get("diagnostic_only"),"timing_changes_applied":data.get("timing_changes_applied"),
+        "integration":data.get("integration"),
+        "candidate_summary":((data.get("candidate_report") or {}).get("summary") or {}),
+        "path_summary":paths.get("summary") or {},"roles":roles,
+        "fusion_summary":fusion.get("summary") or {},
+        "normal_production_limits":fusion.get("normal_production_limits"),
+        "monotonicity_certificate":fusion.get("monotonicity_certificate"),
+        "regions":[_pick(x,("region_id","chart_start","chart_end","midi_start","midi_end","control_count",
+            "minimum_edge_stretch","maximum_edge_stretch","strong_control_count","catch_up_events","monotonic"))
+            for x in (fusion.get("regions") or [])],
+        "role_conflict_count":len(fusion.get("role_conflicts") or []),
+        "rejected_blocks":fusion.get("rejected_blocks") or [],
+        "application_report":data.get("application_report")}
+
 def skeleton_alignment(data):
-    decision=data.get('decision') or data
-    keep=('mode','timing_output','production_timing','timing_origin','opening_anchor','scale','midi_timing_decision',
+    decision=data.get('decision') or {}
+    decision_keep=('mode','timing_output','timing_origin','opening_anchor','scale','midi_timing_decision',
           'continuous_structural_second_pass_prior','continuous_structural_second_pass','manual_anchor_quality',
           'manual_anchor_status','guitar_coverage_diagnostic','alignment_quality')
-    return {'diagnostic_profile':'light','decision':_pick(decision,keep)}
+    root_keep=('version','severity','production_timing','summary','maximum_timing_change_seconds',
+               'minimum_measure_stretch','maximum_measure_stretch','warnings','errors')
+    return {'diagnostic_profile':'light',**_pick(data,root_keep),'decision':_pick(decision,decision_keep)}
 
 
 def write_light_json(source, destination):
@@ -115,7 +148,8 @@ def write_light_json(source, destination):
         destination.write_text(json.dumps({'diagnostic_profile':'light','source':str(source),
             'parse_error':f'{type(exc).__name__}: {exc}'},indent=2),encoding='utf-8');return
     name=source.name.lower()
-    if 'transcription_investigator' in name:out=skeleton_transcription(data)
+    if 'midi_section_fit' in name:out=skeleton_midi_section_fit(data)
+    elif 'transcription_investigator' in name:out=skeleton_transcription(data)
     elif 'alignment_report' in name:out=skeleton_alignment(data)
     else:out={'diagnostic_profile':'light','source':source.name,'keys':sorted(data) if isinstance(data,dict) else [],
               'summary':data.get('summary') if isinstance(data,dict) else None}
@@ -138,7 +172,7 @@ def main():
     if args.light:
         wanted=[]
         for root in (output_dir,song_dir):
-            for pattern in ('*transcription_investigator.json','*alignment_report.json'):
+            for pattern in ('*transcription_investigator.json','*midi_section_fit.json','*alignment_report.json'):
                 wanted.extend(root.rglob(pattern))
         for source in sorted({x.resolve() for x in wanted if x.is_file()}):
             destination=song_root/'skeleton'/(source.name.replace('.json','.light.json'))

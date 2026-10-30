@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Position = 0)]
     [string]$MaterialsRoot = "",
@@ -44,7 +44,13 @@ param(
     [switch]$Force,
     [switch]$StructuralSecondPass,
     [switch]$TranscriptionInvestigator,
+    [switch]$MidiSectionFit,
+    [switch]$ForceMidiSectionFit,
+    [ValidateSet("conservative","permissive","diagnostic-unsafe")] [string]$MidiSectionFitMaterialization,
     [switch]$ForceMidiAuthority,
+    [switch]$ForceMonotonicChain,
+    [switch]$AllowWideMonotonicWarp,
+    [switch]$AllowCompatibleAudioRefinement,
     [switch]$LightDiagnostics,
 
     [string[]]$Only = @()
@@ -78,9 +84,19 @@ $transcriptionMethods = @(
     "bar-landmark-regularized"
 )
 if ($ForceMidiAuthority -and -not $TranscriptionInvestigator) { throw "-ForceMidiAuthority requires -TranscriptionInvestigator" }
+if ($ForceMonotonicChain -and -not $TranscriptionInvestigator) { throw "-ForceMonotonicChain requires -TranscriptionInvestigator" }
+if ($ForceMonotonicChain -and -not $StructuralSecondPass) { throw "-ForceMonotonicChain requires -StructuralSecondPass" }
+if ($ForceMonotonicChain -and $ForceMidiAuthority) { throw "-ForceMonotonicChain and -ForceMidiAuthority are mutually exclusive" }
+if ($AllowWideMonotonicWarp -and -not $ForceMonotonicChain) { throw "-AllowWideMonotonicWarp requires -ForceMonotonicChain" }
+if ($AllowCompatibleAudioRefinement -and -not $ForceMonotonicChain) { throw "-AllowCompatibleAudioRefinement requires -ForceMonotonicChain" }
 if ($ForceMidiAuthority -and -not $StructuralSecondPass) { throw "-ForceMidiAuthority requires -StructuralSecondPass" }
 if ($TranscriptionInvestigator -and $transcriptionMethods -notcontains $AlignmentMode) {
     throw "-TranscriptionInvestigator is not available for alignment mode '$AlignmentMode'. Supported methods: $($transcriptionMethods -join ', ')"
+}
+if ($ForceMidiSectionFit -and [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization)) { $MidiSectionFitMaterialization="permissive" }
+if (-not [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization) -and -not $MidiSectionFit) { throw "-MidiSectionFitMaterialization requires -MidiSectionFit" }
+if ($MidiSectionFit -and $transcriptionMethods -notcontains $AlignmentMode) {
+    throw "-MidiSectionFit is not available for alignment mode '$AlignmentMode'. Supported methods: $($transcriptionMethods -join ', ')"
 }
 
 if ([string]::IsNullOrWhiteSpace($MaterialsRoot)) {
@@ -307,7 +323,13 @@ foreach ($Material in $Materials) {
     if ($Phase3DVariants) { $arguments += @("--phase3d-variants","--phase3d-safe-candidates",$Phase3DSafeCandidates.ToString(),"--phase3d-structural-candidates",$Phase3DStructuralCandidates.ToString()) }
     if ($StructuralSecondPass) { $arguments += "--structural-second-pass" }
     if ($TranscriptionInvestigator) { $arguments += "--transcription-investigator" }
+    if ($MidiSectionFit) { $arguments += "--midi-section-fit" }
+    if ($ForceMidiSectionFit) { $arguments += "--force-midi-section-fit" }
+    if (-not [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization)) { $arguments += @("--midi-section-fit-materialization",$MidiSectionFitMaterialization) }
     if ($ForceMidiAuthority) { $arguments += "--force-midi-authority" }
+    if ($ForceMonotonicChain) { $arguments += "--force-monotonic-chain" }
+    if ($AllowWideMonotonicWarp) { $arguments += "--allow-wide-monotonic-warp" }
+    if ($AllowCompatibleAudioRefinement) { $arguments += "--allow-compatible-audio-refinement" }
 
     if ($parser -eq "alphatab") {
         $arguments += @("--gp-parser", "alphatab")

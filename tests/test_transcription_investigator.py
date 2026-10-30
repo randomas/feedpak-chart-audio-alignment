@@ -239,3 +239,85 @@ def test_streak_authority_uses_true_first_landmark_control():
     assert prior(2.)==pytest.approx(2.25)
     assert prior(0.)==pytest.approx(0.)
     assert prior(20.)==pytest.approx(20.)
+
+
+def test_landmark_chain_selects_one_monotonic_occurrence():
+    cfg=ti.InvestigatorConfig()
+    rows=[]
+    for i in range(16):
+        rows.append({"score_time":float(i),"midi_time":.3+1.01*i,
+                     "similarity":1.0,"phrase_index":i//3,"acquisition":i<3})
+        if i>=4:
+            rows.append({"score_time":float(i),"midi_time":8.0+.7*i,
+                         "similarity":1.0,"phrase_index":i//3,"acquisition":False})
+    chain=ti.select_monotonic_landmark_chain(rows,cfg)
+    assert chain["status"]=="available"
+    assert chain["selected_count"]>=14
+    selected=chain["selected"]
+    assert all(.88 <= (b["midi_time"]-a["midi_time"])/(b["score_time"]-a["score_time"]) <= 1.12
+               for a,b in zip(selected,selected[1:]))
+    assert selected[-1]["midi_time"]==pytest.approx(.3+1.01*15,abs=.1)
+
+
+def test_chart_fit_uses_monotonic_chain_not_competing_landmarks():
+    cfg=ti.InvestigatorConfig()
+    rows=[]
+    for i in range(14):
+        rows.append({"score_time":float(i),"midi_time":.2+1.02*i,
+                     "similarity":1.0,"phrase_index":i//2,"acquisition":i<2})
+        if i>3:
+            rows.append({"score_time":float(i),"midi_time":20+.5*i,
+                         "similarity":1.0,"phrase_index":i//2})
+    fit=ti.fit_chart_to_midi_streak(rows,cfg)
+    assert fit["valid"] is True
+    assert fit["chart_stretch"]==pytest.approx(1.02,abs=.01)
+    assert fit["offset"]==pytest.approx(.2,abs=.1)
+    assert fit["chain_landmark_count"]>=12
+    assert fit["rejected_landmark_count"]>=8
+
+
+def test_forced_monotonic_chain_materializes_regional_controls_only_inside_span():
+    report={"incipit_role_tracking":{"status":"regional_role_streak",
+        "chain_classification":"regional_role_streak","representative_controls":[],
+        "monotonic_chain_diagnostic_controls":[
+            {"score_time":30.0,"audio_time":29.5,"source":"piano"},
+            {"score_time":40.0,"audio_time":39.4,"source":"piano"},
+            {"score_time":50.0,"audio_time":49.3,"source":"piano"}]},
+        "global_monotonic_path_preview":{"selected":[]}}
+    prior,meta=ti.build_midi_authority_prior(report,lambda t:t,force_monotonic_chain=True)
+    assert meta["authority"]=="forced_monotonic_chain"
+    assert meta["diagnostic_unsafe_timing"] is True
+    assert prior(10.0)==pytest.approx(10.0)
+    assert prior(40.0)==pytest.approx(39.4)
+    assert prior(60.0)==pytest.approx(60.0)
+
+
+def test_forced_monotonic_chain_blocks_without_two_monotonic_controls():
+    report={"incipit_role_tracking":{"status":"regional_role_streak",
+        "monotonic_chain_diagnostic_controls":[{"score_time":30.0,"audio_time":29.5}]},
+        "global_monotonic_path_preview":{"selected":[]}}
+    prior,meta=ti.build_midi_authority_prior(report,lambda t:t,force_monotonic_chain=True)
+    assert meta["status"]=="force_blocked"
+    assert meta["force_blocked_reason"]=="no_finite_monotonic_chain_controls"
+    assert prior(12.0)==pytest.approx(12.0)
+
+
+def test_wide_chart_to_midi_fit_accepts_extreme_diagnostic_stretch():
+    cfg=ti.InvestigatorConfig(local_stretch_min=.70,local_stretch_max=1.30,
+        landmark_chain_stretch_min=.70,landmark_chain_stretch_max=1.30,
+        wide_monotonic_warp_enabled=True)
+    rows=[{"score_time":float(i),"midi_time":.4+.72*i,
+           "similarity":1.0,"phrase_index":i//2,"acquisition":i<2} for i in range(14)]
+    fit=ti.fit_chart_to_midi_streak(rows,cfg)
+    assert fit["valid"] is True
+    assert fit["chart_stretch"]==pytest.approx(.72,abs=.01)
+    assert fit["wide_warp_enabled"] is True
+    assert fit["timing_classification"]=="extreme_chart_timing_discrepancy"
+
+
+def test_normal_fit_rejects_same_extreme_stretch():
+    cfg=ti.InvestigatorConfig()
+    rows=[{"score_time":float(i),"midi_time":.4+.72*i,
+           "similarity":1.0,"phrase_index":i//2,"acquisition":i<2} for i in range(14)]
+    fit=ti.fit_chart_to_midi_streak(rows,cfg)
+    assert fit["valid"] is False

@@ -1,80 +1,34 @@
-# FeedPak / Smart Looper active project manifest
-# Updated: 2026-10-26
-# Purpose: source, tests, fixtures, runners, and current documentation only.
-# Private song material, generated outputs, archives, backups, secrets, and inventories are intentionally excluded.
-
-# Repository metadata and primary documentation
+ACTIVE_PROJECT_FILES.txt
 .gitignore
 LICENSE
 README.md
 architecture.md
-README_TIER1.md
-ACTIVE_PROJECT_FILES.txt
 MANUAL_ANCHOR_INTEGRATION.md
-ALL_METHOD_COMPARISON.md
-BAR_LANDMARK_ALIGNMENT_README.md
-DIAGNOSTICS_LAYOUT.md
-PHASE3D_README.md
-PATCH_FIXES_1_THROUGH_6.md
-MIDI_SEQUENCE_AUTHORITY_V6.md
-INCIPIT_ROLE_TRACKING_V7.md
-LIGHT_DIAGNOSTICS_V8.md
-CHART_TO_PERFORMANCE_MIDI_V9.md
-
-
-# Dependency manifests
 requirements.txt
-requirements-working-py313.txt
-packages-working-py313.json
+
+alphatab_score.py
+bar_landmark_alignment.py
+build_feedpak.py
+checkpoint_dtw.py
+continuous_anchors.py
+diagnose_score_clock.py
+expression_encoding.py
+feedpak_common.py
+manual_anchors.py
+process_gp_alignment.py
+process_vocals.py
+project_config.py
+
+alphatab-extractor/extract-score.mjs
 alphatab-extractor/package.json
 alphatab-extractor/package-lock.json
 
-# Core build and parsing
-build_feedpak.py
-process_gp_alignment.py
-alphatab_score.py
-feedpak_common.py
-project_config.py
-expression_encoding.py
-process_vocals.py
-diagnose_score_clock.py
-alphatab-extractor/extract-score.mjs
-
-# Alignment engines and evidence
-checkpoint_dtw.py
-continuous_anchors.py
-continuous_anchors_legacy.py
-bar_landmark_alignment.py
-manual_anchors.py
-transcription_investigator.py
-alignment_proposals.py
-structural_search.py
-regional_source_fusion.py
-instrument_evidence.py
-beatmap.py
-beatmap_evidence.py
-
-# Materialization and variants
-phase3d_materialization.py
-variant_materialization.py
-
-# Runners, diagnostics, and maintenance
 run_all_test_materials.ps1
-run_all_alignment_methods.ps1
-collect_run_diagnostics.py
-archive_active_project.ps1
-Dump_Active_Project.ps1
-project_archiver.ps1
-check_midi.py
 
-# Pytest configuration
 conftest.py
+README_TIER1.md
+
 tests/conftest.py
-
-# Regression fixture
-tests/fixtures/supremacy_continuous_dtw_golden.json
-
-# Tests: established pipeline
 tests/test_adaptive_radius.py
 tests/test_alphatab_roles.py
 tests/test_bar_landmark_alignment.py
@@ -83,7 +37,6 @@ tests/test_checkpoint_7_5_fixes.py
 tests/test_checkpoint_dtw.py
 tests/test_checkpoint_dtw_production.py
 tests/test_continuous_anchors.py
-tests/test_continuous_runtime_wiring.py
 tests/test_expression_encoding.py
 tests/test_expression_tier2.py
 tests/test_fretted_note_durations.py
@@ -108,20 +61,38 @@ tests/test_trusted_anchor_dtw.py
 tests/test_tuning_translation.py
 tests/test_vocal_safety.py
 
-# Tests: newer alignment architecture and reporting
+alignment_proposals.py
+beatmap.py
+beatmap_evidence.py
+instrument_evidence.py
+regional_source_fusion.py
+structural_search.py
 tests/test_alignment_proposals.py
-tests/test_alignment_proposals_phase3c3.py
-tests/test_all_method_runner_wiring.py
 tests/test_beatmap.py
 tests/test_beatmap_evidence.py
-tests/test_beatmap_evidence_phase31.py
 tests/test_instrument_evidence.py
-tests/test_instrument_evidence_phase3b1.py
-tests/test_merged_variant_wiring.py
 tests/test_regional_source_fusion.py
-tests/test_reporting_qol_regressions.py
 tests/test_structural_search.py
-tests/test_structural_search_c42.py
-tests/test_structural_search_refinement.py
-tests/test_transcription_investigator.py
-tests/test_variant_materialization.py
+continuous_anchors_legacy.py
+phase3d_materialization.py
+run_all_alignment_methods.ps1
+ALL_METHOD_COMPARISON.md
+tests/test_all_method_runner_wiring.py
+collect_run_diagnostics.py
+DIAGNOSTICS_LAYOUT.md
+tests/fixtures/supremacy_continuous_dtw_golden.json
+tests/test_reporting_qol_regressions.py
+midi_section_fit.py
+tests/test_midi_section_fit.py
+MIDI_SECTION_FIT_STEP1.md
+MIDI_SECTION_FIT_STEP2.md
+MIDI_SECTION_FIT_STEP3.md
+
+MIDI_SECTION_FIT_INTEGRATION.md
+tests/test_midi_section_fit_integration.py
+MIDI_METHOD_COMPATIBILITY_V13_1.md
+tests/test_midi_method_compatibility.py
+MIDI_SECTION_FIT_LOCKDOWN_V14.md
+tests/test_midi_section_lockdown.py
+MIDI_SECTION_MATERIALIZATION_V15.md
+tests/test_midi_section_materialization_modes.py
