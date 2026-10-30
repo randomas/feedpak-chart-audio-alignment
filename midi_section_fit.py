@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from bisect import bisect_left, bisect_right
+import math
+import statistics
+import time
 import hashlib
 import json
-import math
 import os
-import statistics
 import tempfile
-import time
+import solo_role_authority as sra
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
@@ -271,36 +272,39 @@ def _similarity_matrix(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str,
 
 
 def _align_ordered_groups(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str, Any]], cfg: SectionFitConfig):
-    """Exact ordered DP using rolling score rows and compact byte backtrace."""
-    n,m=len(chart),len(midi); similarities=_similarity_matrix(chart,midi,cfg); width=m+1
-    SKIP_CHART,SKIP_MIDI,MATCH=0,1,2
-    back=bytearray((n+1)*width)
-    previous=[0.0]+[-cfg.extra_midi_penalty*j for j in range(1,m+1)]
-    for j in range(1,m+1):back[j]=SKIP_MIDI
-    neg=-1e12
-    for i in range(1,n+1):
-        current=[neg]*width;current[0]=-cfg.missing_chart_penalty*i;back[i*width]=SKIP_CHART
-        sims=similarities[i-1]
-        for j in range(1,m+1):
-            # Match the reference max() option ordering exactly: chart skip,
-            # MIDI skip, then match. Python max keeps the first equal value.
-            best=previous[j]-cfg.missing_chart_penalty;op=SKIP_CHART
-            value=current[j-1]-cfg.extra_midi_penalty
-            if value>best:best=value;op=SKIP_MIDI
-            sim=sims[j-1]
-            if sim>0:
-                value=previous[j-1]+sim
-                if value>best:best=value;op=MATCH
-            current[j]=best;back[i*width+j]=op
-        previous=current
-    pairs=[];i=n;j=m
+    n, m = len(chart), len(midi)
+    similarities=_similarity_matrix(chart,midi,cfg)
+    neg = -1e12
+    dp = [[neg] * (m + 1) for _ in range(n + 1)]
+    back = [[None] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] - cfg.missing_chart_penalty
+        back[i][0] = (i - 1, 0, "skip_chart")
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] - cfg.extra_midi_penalty
+        back[0][j] = (0, j - 1, "skip_midi")
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            sim = similarities[i-1][j-1]
+            options = [
+                (dp[i - 1][j] - cfg.missing_chart_penalty, i - 1, j, "skip_chart"),
+                (dp[i][j - 1] - cfg.extra_midi_penalty, i, j - 1, "skip_midi"),
+            ]
+            if sim > 0:
+                options.append((dp[i - 1][j - 1] + sim, i - 1, j - 1, "match"))
+            dp[i][j], pi, pj, op = max(options, key=lambda x: x[0])
+            back[i][j] = (pi, pj, op)
+    pairs = []
+    i, j = n, m
     while i or j:
-        op=back[i*width+j]
-        if op==MATCH:pairs.append((i-1,j-1,similarities[i-1][j-1]));i-=1;j-=1
-        elif op==SKIP_MIDI:j-=1
-        else:i-=1
+        pi, pj, op = back[i][j]
+        if op == "match":
+            pairs.append((i - 1, j - 1, similarities[i-1][j-1]))
+        i, j = pi, pj
     pairs.reverse()
-    return previous[m]/max(1,n),pairs
+    scale=max(1,n)
+    return dp[n][m]/scale,pairs
 
 
 def _context_fingerprint(groups: Sequence[dict[str, Any]]) -> tuple[tuple[int, ...], tuple[float, ...]]:
@@ -348,20 +352,19 @@ def _evaluate_transform(window: MeasureWindow, prepared_midi: Mapping[str,Any], 
         if counters is not None:counters["alignment_cache_hits"]+=1
     sequence_score,pairs,context_score=cached
     if len(pairs)<cfg.minimum_matched_groups:return None
-    matched_times=[];residuals=[]
+    landmarks=[];residuals=[]
     for ci,mi,similarity in pairs:
         ct=float(window.groups[ci]["time"]);mt=float(local[mi]["time"])
-        residuals.append(abs(mt-(translation+stretch*ct)))
-        matched_times.append((ct,mt,float(similarity)))
+        predicted=translation+stretch*ct
+        residuals.append(abs(mt-predicted))
+        landmarks.append({"chart_time":ct,"midi_time":mt,"similarity":float(similarity)})
     coverage=len({x[0] for x in pairs})/max(1,len(window.groups))
     median=statistics.median(residuals);maximum=max(residuals)
     combined=0.58*sequence_score+0.20*coverage+0.10*math.exp(-median/0.12)+cfg.context_weight*context_score
-    if (coverage<cfg.minimum_chart_coverage or median>cfg.maximum_median_residual_seconds or
-            maximum>cfg.maximum_residual_seconds):
-        if counters is not None:counters["rejected_before_object_construction"]=counters.get("rejected_before_object_construction",0)+1
-        return None
-    landmarks=[{"chart_time":ct,"midi_time":mt,"similarity":similarity}
-               for ct,mt,similarity in matched_times]
+    reasons=[]
+    if coverage<cfg.minimum_chart_coverage:reasons.append("insufficient_chart_coverage")
+    if median>cfg.maximum_median_residual_seconds:reasons.append("median_residual_too_large")
+    if maximum>cfg.maximum_residual_seconds:reasons.append("maximum_residual_too_large")
     return SectionCandidate(window_id=window.window_id,role=window.role,
         chart_start=window.nominal_start,chart_end=window.nominal_end,
         midi_start=expected_start,midi_end=expected_end,chart_stretch=float(stretch),
@@ -369,7 +372,8 @@ def _evaluate_transform(window: MeasureWindow, prepared_midi: Mapping[str,Any], 
         chart_group_count=len(window.groups),midi_group_count=len(local),chart_coverage=coverage,
         median_residual_seconds=median,maximum_residual_seconds=maximum,
         sequence_score=sequence_score,context_score=context_score,combined_score=combined,
-        matched_landmarks=landmarks,status="valid",rejection_reasons=[],search_hypothesis=search_hypothesis)
+        matched_landmarks=landmarks,status="valid" if not reasons else "rejected",
+        rejection_reasons=reasons,search_hypothesis=search_hypothesis)
 
 
 def search_section_candidates(window: MeasureWindow, midi_events, baseline=None,
@@ -402,51 +406,6 @@ def search_section_candidates(window: MeasureWindow, midi_events, baseline=None,
     return distinct
 
 
-CANDIDATE_CACHE_SCHEMA="midi-section-candidates-v16.3-phase2a-1"
-
-
-def _jsonable(value):
-    if isinstance(value,Mapping):return {str(k):_jsonable(v) for k,v in sorted(value.items(),key=lambda x:str(x[0]))}
-    if isinstance(value,(set,frozenset)):return sorted(_jsonable(x) for x in value)
-    if isinstance(value,(list,tuple)):return [_jsonable(x) for x in value]
-    if isinstance(value,float):return value
-    return value
-
-
-def _candidate_cache_fingerprint(playback_measures,chart_events_by_role,midi_events_by_role,cfg,hypotheses):
-    sample_times=sorted({float(x.get("start_time",x.get("start",0.0))) for x in playback_measures} |
-                        {float(x.get("end_time",x.get("end",0.0))) for x in playback_measures})
-    baseline_samples={name:[float(fn(t)) for t in sample_times] for name,fn in hypotheses.items()}
-    payload={"schema":CANDIDATE_CACHE_SCHEMA,"measures":playback_measures,
-        "chart":chart_events_by_role,"midi":midi_events_by_role,"config":asdict(cfg),
-        "sample_times":sample_times,"baseline_samples":baseline_samples}
-    encoded=json.dumps(_jsonable(payload),sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _load_candidate_cache(path,fingerprint):
-    if not path or not os.path.isfile(path):return None,"cache_file_missing"
-    try:
-        data=json.load(open(path,encoding="utf-8"))
-    except Exception as exc:return None,f"cache_unreadable:{type(exc).__name__}"
-    if data.get("schema")!=CANDIDATE_CACHE_SCHEMA:return None,"schema_changed"
-    if data.get("fingerprint")!=fingerprint:return None,"input_fingerprint_changed"
-    return data.get("candidate_report"),"exact_cache_hit"
-
-
-def _write_candidate_cache(path,fingerprint,report):
-    if not path:return
-    directory=os.path.dirname(os.path.abspath(path));os.makedirs(directory,exist_ok=True)
-    fd,temp_path=tempfile.mkstemp(prefix="midi-section-",suffix=".tmp",dir=directory)
-    try:
-        with os.fdopen(fd,"w",encoding="utf-8") as handle:
-            json.dump({"schema":CANDIDATE_CACHE_SCHEMA,"fingerprint":fingerprint,
-                       "candidate_report":report},handle,allow_nan=False,separators=(",",":"))
-        os.replace(temp_path,path)
-    finally:
-        if os.path.exists(temp_path):os.unlink(temp_path)
-
-
 def build_section_candidate_report(
     playback_measures: Sequence[Mapping[str, Any]],
     chart_events_by_role: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -466,12 +425,10 @@ def build_section_candidate_report(
     grouping_seconds=time.perf_counter()-prep_started
     role_reports={};totals={"window_count":0,"observable_window_count":0,"candidate_count":0}
     global_perf={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0,
-                 "rejected_before_object_construction":0,
                  "unique_midi_slices":0,"midi_grouping_seconds":grouping_seconds}
     for role,role_windows in windows.items():
         role_started=time.perf_counter();rows=[];prepared=prepared_by_role[role]
-        counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0,
-                  "rejected_before_object_construction":0}
+        counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0}
         for window in role_windows:
             pooled=[];alignment_cache={}
             for hypothesis_name,hypothesis_baseline in hypotheses.items():
@@ -494,8 +451,7 @@ def build_section_candidate_report(
         role_perf={**counters,"elapsed_seconds":time.perf_counter()-role_started,
                    "prepared_midi_group_count":len(prepared["groups"]),
                    "window_count":len(role_windows)}
-        for key in ("transform_trials","midi_slice_lookups","dp_evaluations","alignment_cache_hits",
-                    "rejected_before_object_construction"):
+        for key in ("transform_trials","midi_slice_lookups","dp_evaluations","alignment_cache_hits"):
             global_perf[key]+=counters[key]
         role_reports[role]={"window_count":len(role_windows),"windows":rows,"performance":role_perf}
     global_perf["candidate_search_seconds"]=time.perf_counter()-started
@@ -1189,93 +1145,45 @@ def fuse_monotonic_role_paths(path_report: Mapping[str, Any],
 
 MATERIALIZATION_MODES={
     "conservative":{"tiers":{"A"},"transition_min":.90,"transition_max":1.10,
-        "short_delta_seconds":.12,"short_duration_seconds":6.0,
-        "catch_up_episode_interval_measures":24,"episode_growth_start_measures":16,
-        "episode_delta_growth_per_measure":.003,"episode_delta_max_seconds":.25,
+        "short_delta_seconds":.12,"short_duration_seconds":6.0,"catch_up_episode_interval_measures":24,
+        "episode_growth_start_measures":24,"episode_delta_growth_per_measure":.0025,"episode_delta_max_seconds":.25,
         "episode_stretch_min":.80,"episode_stretch_max":1.20},
     "permissive":{"tiers":{"A","B"},"transition_min":.85,"transition_max":1.15,
-        "short_delta_seconds":.25,"short_duration_seconds":10.0,
-        "catch_up_episode_interval_measures":16,"episode_growth_start_measures":16,
-        "episode_delta_growth_per_measure":.005,"episode_delta_max_seconds":.50,
+        "short_delta_seconds":.25,"short_duration_seconds":10.0,"catch_up_episode_interval_measures":16,
+        "episode_growth_start_measures":16,"episode_delta_growth_per_measure":.005,"episode_delta_max_seconds":.50,
         "episode_stretch_min":.70,"episode_stretch_max":1.30},
     "diagnostic-unsafe":{"tiers":{"A","B","C"},"transition_min":.70,"transition_max":1.30,
-        "short_delta_seconds":.50,"short_duration_seconds":16.0,
-        "catch_up_episode_interval_measures":8,"episode_growth_start_measures":16,
-        "episode_delta_growth_per_measure":.008,"episode_delta_max_seconds":.80,
+        "short_delta_seconds":.50,"short_duration_seconds":16.0,"catch_up_episode_interval_measures":8,
+        "episode_growth_start_measures":8,"episode_delta_growth_per_measure":.01,"episode_delta_max_seconds":.75,
         "episode_stretch_min":.50,"episode_stretch_max":1.50},
 }
 
 
-def _catch_up_episodes(events: Sequence[Mapping[str,Any]]):
-    """Collapse overlapping adjacent-pair warnings into local correction episodes."""
-    ordered=sorted((dict(x) for x in (events or [])),
-                   key=lambda x:(int(x.get("first_edge_index",-1)),int(x.get("second_edge_index",-1))))
+def _catch_up_episodes(events):
+    ordered=sorted((dict(x) for x in (events or [])),key=lambda x:(int(x.get("first_edge_index",-1)),int(x.get("second_edge_index",-1))))
     episodes=[]
     for event in ordered:
         first=int(event.get("first_edge_index",-1));second=int(event.get("second_edge_index",first+1))
         if episodes and first<=episodes[-1]["last_edge_index"]:
-            episode=episodes[-1]
-            episode["last_edge_index"]=max(episode["last_edge_index"],second)
-            episode["pair_count"]+=1;episode["events"].append(event)
-        else:
-            episodes.append({"episode_index":len(episodes),"first_edge_index":first,
-                "last_edge_index":second,"pair_count":1,"events":[event],
-                "kind":"local_correction_episode"})
+            episodes[-1]["last_edge_index"]=max(episodes[-1]["last_edge_index"],second)
+            episodes[-1]["pair_count"]+=1;episodes[-1]["events"].append(event)
+        else:episodes.append({"episode_index":len(episodes),"first_edge_index":first,"last_edge_index":second,"pair_count":1,"events":[event],"kind":"local_correction_episode"})
     return episodes
 
 
-def _region_evidence_tier(region: Mapping[str,Any], policy: Mapping[str,Any] | None=None):
+def _region_evidence_tier(region,policy=None):
     controls=region.get("controls") or [];count=len(controls)
-    strong=int(region.get("strong_control_count") or
-               sum(x.get("classification")!="single_role_provisional" for x in controls))
-    ratio=strong/max(1,count);events=region.get("catch_up_events") or []
-    episodes=_catch_up_episodes(events)
-    measures=max(1,int(region.get("supported_playback_measure_count") or
-                       region.get("playback_measure_count") or 1))
-    interval=max(1,int((policy or {}).get("catch_up_episode_interval_measures",16)))
-    allowed=max(1,measures//interval)
+    strong=int(region.get("strong_control_count") or sum(x.get("classification")!="single_role_provisional" for x in controls))
+    ratio=strong/max(1,count);events=region.get("catch_up_events") or [];episodes=_catch_up_episodes(events)
+    measures=max(1,int(region.get("supported_playback_measure_count") or region.get("playback_measure_count") or 1))
+    interval=max(1,int((policy or {}).get("catch_up_episode_interval_measures",16)));allowed=max(1,measures//interval)
     roles=set(role for item in controls for role in (item.get("roles") or []))
     base="A" if count>=3 and strong>=3 and ratio>=.75 else "B" if count>=3 and strong>=2 and ratio>=.40 else "C"
-    if base=="C" or len(episodes)>allowed:tier="C"
-    elif base=="A" and episodes:tier="B"
-    else:tier=base
+    tier="C" if base=="C" or len(episodes)>allowed else "B" if base=="A" and episodes else base
     return tier,{"control_count":count,"strong_control_count":strong,"strong_ratio":ratio,
-        "catch_up_event_count":len(events),"catch_up_episode_count":len(episodes),
-        "catch_up_episodes":episodes,"supported_playback_measure_count":measures,
-        "catch_up_episode_interval_measures":interval,"allowed_catch_up_episode_count":allowed,
-        "catch_up_density_per_measure":len(episodes)/measures,"roles":sorted(roles)}
-
-
-def _episode_delta_allowance(measures: int, policy: Mapping[str,Any]) -> float:
-    extra=max(0,int(measures)-int(policy["episode_growth_start_measures"]))
-    return min(float(policy["episode_delta_max_seconds"]),
-               float(policy["short_delta_seconds"])+extra*float(policy["episode_delta_growth_per_measure"]))
-
-
-def _episode_edge_indices(episodes: Sequence[Mapping[str,Any]]) -> set[int]:
-    indices=set()
-    for episode in episodes or []:
-        first=int(episode.get("first_edge_index",-1));last=int(episode.get("last_edge_index",first))
-        indices.update(range(first,last+1))
-    return indices
-
-
-def _apply_episode_exception(assessment: dict[str,Any], edge_index: int, quality: Mapping[str,Any],
-                             policy: Mapping[str,Any]) -> dict[str,Any]:
-    if assessment.get("accepted") or edge_index not in _episode_edge_indices(quality.get("catch_up_episodes") or []):
-        return assessment
-    measures=int(quality["supported_playback_measure_count"])
-    allowance=_episode_delta_allowance(measures,policy)
-    stretch=assessment.get("stretch");correction=assessment.get("absolute_correction_seconds")
-    accepted=(stretch is not None and correction is not None and
-              float(policy["episode_stretch_min"])<=stretch<=float(policy["episode_stretch_max"]) and
-              correction<=allowance)
-    return {**assessment,"accepted":accepted,
-        "acceptance_basis":"length_adjusted_episode_delta_exception" if accepted else assessment["acceptance_basis"],
-        "edge_belongs_to_catch_up_episode":True,"episode_delta_allowance_seconds":allowance,
-        "region_supported_playback_measure_count":measures,
-        "episode_stretch_min":policy["episode_stretch_min"],
-        "episode_stretch_max":policy["episode_stretch_max"]}
+        "catch_up_event_count":len(events),"catch_up_episode_count":len(episodes),"catch_up_episodes":episodes,
+        "supported_playback_measure_count":measures,"catch_up_episode_interval_measures":interval,
+        "allowed_catch_up_episode_count":allowed,"catch_up_density_per_measure":len(episodes)/measures,"roles":sorted(roles)}
 
 
 def _transition_stretches(baseline, start, end, start_offset, end_offset, samples=12):
@@ -1329,6 +1237,9 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
     if mode not in MATERIALIZATION_MODES:
         raise ValueError(f"invalid MIDI section materialization mode: {mode}")
     policy=MATERIALIZATION_MODES[mode]; eligible=[]; rejected=[]
+    baseline,baseline_sanity=sra.safe_materialization_baseline(fusion_report,baseline)
+    if not baseline_sanity.get("valid"):
+        return baseline,{"status":"materialization_blocked","mode":mode,"reason":baseline_sanity.get("blocked_reason"),"baseline_sanity":baseline_sanity,"applied_regions":[],"rejected_regions":[],"transitions":[],"timing_changes_applied":False,"global_monotonicity_validated":False,"materialization_seconds":time.perf_counter()-materialization_started}
     for region in sorted(fusion_report.get("regions") or [],key=lambda x:float(x.get("chart_start",0))):
         tier,quality=_region_evidence_tier(region,policy)
         controls=region.get("controls") or []
@@ -1345,9 +1256,21 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
             ds=float(b["score_time"])-float(a["score_time"])
             da=float(b["audio_time"])-float(a["audio_time"])
             assessment=_geometry_acceptance(ds,da,policy)
-            assessment=_apply_episode_exception(assessment,index,quality,policy)
-            assessment.update({"edge_index":index,"chart_start":float(a["score_time"]),
-                "chart_end":float(b["score_time"])})
+            episodes=quality.get("catch_up_episodes") or []
+            belongs=any(int(ep["first_edge_index"])<=index<=int(ep["last_edge_index"]) for ep in episodes)
+            measures=int(quality.get("supported_playback_measure_count") or 1)
+            allowance=min(float(policy["episode_delta_max_seconds"]),
+                float(policy["short_delta_seconds"])+max(0,measures-int(policy["episode_growth_start_measures"]))*float(policy["episode_delta_growth_per_measure"]))
+            episode_pass=(not assessment["accepted"] and belongs and ds<=policy["short_duration_seconds"] and
+                allowance>=float(assessment.get("absolute_correction_seconds") or 1e9) and
+                policy["episode_stretch_min"]<=float(assessment.get("stretch") or 0)<=policy["episode_stretch_max"])
+            if episode_pass:
+                assessment["accepted"]=True;assessment["acceptance_basis"]="length_adjusted_episode_delta_exception"
+            assessment.update({"edge_belongs_to_catch_up_episode":belongs,
+                "episode_delta_allowance_seconds":allowance,
+                "region_supported_playback_measure_count":measures,
+                "episode_stretch_min":policy["episode_stretch_min"],"episode_stretch_max":policy["episode_stretch_max"],
+                "edge_index":index,"chart_start":float(a["score_time"]),"chart_end":float(b["score_time"])})
             edge_assessments.append(assessment)
         catastrophic=next((x for x in edge_assessments if x["acceptance_basis"]=="catastrophic_non_positive_geometry"),None)
         if catastrophic:
@@ -1443,6 +1366,7 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
         "unsupported_gaps_midi_validated":False,"global_monotonicity_validated":True,
         "raw_endpoint_delta_used_as_rejection":False,
         "geometry_policy":{**dict(policy),"tiers":sorted(policy["tiers"])},
+        "baseline_sanity":baseline_sanity,
         "materialization_seconds":time.perf_counter()-materialization_started}
 
 
@@ -1450,6 +1374,91 @@ def build_forced_section_warp(fusion_report: Mapping[str,Any], baseline: Callabl
                               maximum_handoff_delta_seconds: float=.35):
     """Backward-compatible alias for permissive materialization."""
     return build_section_materialized_warp(fusion_report,baseline,"permissive")
+
+
+def _candidate_cache_json_safe(value):
+    if isinstance(value, Mapping):
+        return {str(k): _candidate_cache_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_candidate_cache_json_safe(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(_candidate_cache_json_safe(v) for v in value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _candidate_cache_payload(playback_measures, chart_events_by_role, midi_events_by_role,
+                             baseline, candidate_config, baseline_hypotheses):
+    points=set()
+    for index,row in enumerate(playback_measures):
+        measure=_normalise_measure(row,index)
+        points.add(float(measure["start"]));points.add(float(measure["end"]))
+    for events in chart_events_by_role.values():
+        for row in events:
+            for key in ("t_gp","time","score_time","start_time","t"):
+                if isinstance(row,Mapping) and row.get(key) is not None:
+                    points.add(float(row[key]));break
+    points=sorted(points)
+    hypotheses=dict(baseline_hypotheses or {})
+    if baseline is not None and "baseline" not in hypotheses:
+        hypotheses["baseline"]=baseline
+    samples={name:[[x,float(fn(x))] for x in points] for name,fn in sorted(hypotheses.items())}
+    return _candidate_cache_json_safe({
+        "schema_version":1,
+        "implementation_version":"midi-section-candidates-v16-phase1",
+        "playback_measures":playback_measures,
+        "chart_events_by_role":chart_events_by_role,
+        "midi_events_by_role":midi_events_by_role,
+        "candidate_config":asdict(candidate_config or SectionFitConfig()),
+        "baseline_samples":samples,
+    })
+
+
+def _candidate_cache_fingerprint(payload):
+    raw=json.dumps(payload,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_candidate_cache(path,fingerprint,disabled,rebuild):
+    report={"enabled":not disabled,"hit":False,"reason":"cache_disabled" if disabled else
+            "cache_rebuild_requested" if rebuild else "cache_file_missing",
+            "path":path,"fingerprint":fingerprint,"load_seconds":0.0}
+    if disabled or rebuild or not path:
+        return None,report
+    started=time.perf_counter()
+    if not os.path.isfile(path):
+        report["load_seconds"]=time.perf_counter()-started;return None,report
+    try:
+        with open(path,"r",encoding="utf-8") as f:data=json.load(f)
+    except Exception:
+        report.update(reason="cache_load_error",load_seconds=time.perf_counter()-started);return None,report
+    if int(data.get("schema_version",-1))!=1:
+        report.update(reason="cache_schema_changed",load_seconds=time.perf_counter()-started);return None,report
+    if data.get("fingerprint")!=fingerprint:
+        report.update(reason="input_fingerprint_changed",load_seconds=time.perf_counter()-started);return None,report
+    candidate_report=data.get("candidate_report")
+    if not isinstance(candidate_report,dict):
+        report.update(reason="cache_payload_invalid",load_seconds=time.perf_counter()-started);return None,report
+    report.update(hit=True,reason="exact_cache_hit",load_seconds=time.perf_counter()-started)
+    return candidate_report,report
+
+
+def _write_candidate_cache(path,fingerprint,payload,candidate_report):
+    if not path:return
+    parent=os.path.dirname(os.path.abspath(path));os.makedirs(parent,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix=".midi-section-cache-",suffix=".tmp",dir=parent)
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8",newline="\n") as f:
+            json.dump({"schema_version":1,"fingerprint":fingerprint,"payload":payload,
+                       "candidate_report":_candidate_cache_json_safe(candidate_report)},
+                      f,sort_keys=True,separators=(",",":"),allow_nan=False)
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.remove(tmp)
 
 
 def build_section_fusion_report(
@@ -1465,43 +1474,36 @@ def build_section_fusion_report(
     candidate_cache_rebuild: bool = False,
     candidate_cache_disabled: bool = False,
 ) -> dict[str, Any]:
-    """Run Steps 1-3 without modifying timing, with stage instrumentation."""
+    """Run Steps 1-3, optionally reusing only the exact candidate report."""
     total_started=time.perf_counter()
-    candidate_started=time.perf_counter();candidate_config=candidate_config or SectionFitConfig()
-    hypotheses=dict(baseline_hypotheses or {})
-    if not hypotheses:hypotheses["requested_method_baseline"]=baseline or (lambda t:float(t))
-    hypotheses.setdefault("prepared_chart_clock",lambda t:float(t))
-    fingerprint=_candidate_cache_fingerprint(playback_measures,chart_events_by_role,midi_events_by_role,
-                                             candidate_config,hypotheses)
-    candidate_report=None;cache_reason="cache_disabled" if candidate_cache_disabled else "cache_rebuild_requested" if candidate_cache_rebuild else None
-    cache_load_started=time.perf_counter()
-    if not candidate_cache_disabled and not candidate_cache_rebuild:
-        candidate_report,cache_reason=_load_candidate_cache(candidate_cache_path,fingerprint)
-    cache_load_seconds=time.perf_counter()-cache_load_started
-    cache_hit=candidate_report is not None
-    if not cache_hit:
-        candidate_report=build_section_candidate_report(playback_measures,chart_events_by_role,midi_events_by_role,
-            baseline=baseline,cfg=candidate_config,baseline_hypotheses=hypotheses)
-        if not candidate_cache_disabled:_write_candidate_cache(candidate_cache_path,fingerprint,candidate_report)
+    payload=_candidate_cache_payload(playback_measures,chart_events_by_role,midi_events_by_role,
+                                     baseline,candidate_config,baseline_hypotheses)
+    fingerprint=_candidate_cache_fingerprint(payload)
+    candidate_report,cache_report=_load_candidate_cache(
+        candidate_cache_path,fingerprint,bool(candidate_cache_disabled),bool(candidate_cache_rebuild))
+    candidate_started=time.perf_counter()
+    if candidate_report is None:
+        candidate_report = build_section_candidate_report(
+            playback_measures, chart_events_by_role, midi_events_by_role,
+            baseline=baseline, cfg=candidate_config, baseline_hypotheses=baseline_hypotheses)
+        if not candidate_cache_disabled and candidate_cache_path:
+            _write_candidate_cache(candidate_cache_path,fingerprint,payload,candidate_report)
     candidate_seconds=time.perf_counter()-candidate_started
     path_started=time.perf_counter()
     path_report = select_monotonic_section_paths(candidate_report, path_config)
     path_seconds=time.perf_counter()-path_started
     fusion_started=time.perf_counter()
     fusion_report = fuse_monotonic_role_paths(path_report, fusion_config)
+    sra.annotate_fusion_report(fusion_report,chart_events_by_role)
     normalised_measures=[_normalise_measure(x,i) for i,x in enumerate(playback_measures)]
     for region in fusion_report.get("regions") or []:
-        covered=[x for x in normalised_measures
-                 if float(x["start"])<float(region["chart_end"])+1e-9 and
-                    float(x["end"])>float(region["chart_start"])-1e-9]
+        covered=[x for x in normalised_measures if float(x["start"])<float(region["chart_end"])+1e-9 and float(x["end"])>float(region["chart_start"])-1e-9]
         numbers=sorted({int(x["playback_measure_number"]) for x in covered})
-        region["supported_playback_measure_count"]=len(numbers)
-        region["playback_measure_numbers"]=numbers
+        region["supported_playback_measure_count"]=len(numbers);region["playback_measure_numbers"]=numbers
         region["catch_up_episodes"]=_catch_up_episodes(region.get("catch_up_events") or [])
     fusion_seconds=time.perf_counter()-fusion_started
     performance={"candidate_generation_seconds":candidate_seconds,
-        "candidate_cache":{"enabled":not candidate_cache_disabled,"hit":cache_hit,"reason":cache_reason,
-            "path":candidate_cache_path,"fingerprint":fingerprint,"load_seconds":cache_load_seconds},
+        "candidate_cache":cache_report,
         "path_selection_seconds":path_seconds,"fusion_seconds":fusion_seconds,
         "total_section_fit_seconds":time.perf_counter()-total_started,
         "candidate_counters":candidate_report.get("performance") or {}}
@@ -1509,3 +1511,4 @@ def build_section_fusion_report(
             "diagnostic_only": True, "timing_changes_applied": False,
             "performance":performance,"candidate_report": candidate_report,
             "path_report": path_report,"fusion_report": fusion_report}
+

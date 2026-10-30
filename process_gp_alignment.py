@@ -19,6 +19,7 @@ import argparse
 import json
 import math
 import os
+import time
 import numpy as np
 
 import feedpak_common as fc
@@ -37,6 +38,7 @@ import manual_anchors as ma
 import continuous_anchors as ca
 import transcription_investigator as ti
 import midi_section_fit as msf
+import pipeline_cache as plc
 import continuous_anchors_legacy as ca_legacy
 
 try:
@@ -2037,8 +2039,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None,
-            midi_section_cache=None, no_midi_section_cache=False, rebuild_midi_section_cache=False):
+            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
     if midi_section_fit:
@@ -2047,10 +2048,29 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         midi_section_fit_materialization="permissive"
     if midi_section_fit_materialization and not midi_section_fit:
         raise ValueError("midi_section_fit_materialization requires midi_section_fit")
+    chart_cache_report={"status":"not_applicable","seconds":0.0}
     if gp_parser == "alphatab":
         fc.log(f"Processing modern GP through alphaTab: {gp_path}")
         json_path = score_json_path or ats.ensure_json(gp_path, extractor=alphatab_extractor, node=node_executable)
-        score_data=ats.load(json_path); ap=ats.products(score_data, project_config_path=project_config_path)
+        chart_cache_started=time.perf_counter()
+        score_identity=plc.file_identity(json_path)
+        config_identity=plc.file_identity(project_config_path) if project_config_path and os.path.isfile(project_config_path) else None
+        cache_payload={"cache_kind":"alphatab_products","implementation_version":1,
+            "score":score_identity,"project_config":config_identity,
+            "adapter":plc.file_identity(ats.__file__),"schema":ats.SUPPORTED_SCHEMA}
+        chart_fingerprint=plc.canonical_hash(cache_payload)
+        chart_cache_dir=os.path.join(os.path.dirname(os.path.abspath(gp_path)),"_feedpak_build","cache","chart")
+        chart_cache_path=os.path.join(chart_cache_dir,chart_fingerprint+".json")
+        cached,chart_cache_status=plc.cache_lookup(chart_cache_path,chart_fingerprint)
+        if cached:
+            ap=cached["products"]
+        else:
+            score_data=ats.load(json_path); ap=ats.products(score_data, project_config_path=project_config_path)
+            plc.atomic_write_json(chart_cache_path,{"schema_version":plc.CACHE_SCHEMA,
+                "fingerprint":chart_fingerprint,"payload":cache_payload,"products":ap})
+        chart_cache_report={"status":chart_cache_status,"fingerprint":chart_fingerprint,
+            "seconds":time.perf_counter()-chart_cache_started,"path":chart_cache_path}
+        fc.log(f"Parsed-chart cache: {chart_cache_status}",indent=1)
         tempo_events=ap["tempo_events"]; role_by_name=ap["role_by_name"]; fretted_tracks=ap["fretted_tracks"]
         drum_hits_gp=ap["drum_hits_gp"]; bass_alignment_events=ap["bass_alignment_events"]; piano_alignment_events=ap["piano_alignment_events"]
         guitar_alignment_events=ap["guitar_alignment_events"]; bass_pitch_events=ap["bass_pitch_events"]; guitar_pitch_events=ap["guitar_pitch_events"]
@@ -2386,18 +2406,16 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             provider=({"status":"not_prepared","events":[]} if path is None else
                       ti.parse_muscriptor_midi(path,role,padding_added))
             section_midi[role]=provider.get("events") or []
-        section_cache_path=(midi_section_cache or os.path.join(os.path.dirname(os.path.abspath(gp_path)),
-            ".feedpak_cache","midi_section_candidates.json"))
+        candidate_cache_path=os.path.join(os.path.dirname(os.path.abspath(gp_path)),
+            ".feedpak_cache","midi_section_candidates.json")
         midi_section_fit_report=msf.build_section_fusion_report(
             section_measures,continuous_score_events,section_midi,
             baseline_hypotheses={
                 "requested_method_baseline":warp_fn,
                 "prepared_chart_clock":lambda t:float(t),
-            },candidate_cache_path=section_cache_path,
-            candidate_cache_rebuild=rebuild_midi_section_cache,
-            candidate_cache_disabled=no_midi_section_cache)
-        cache_info=(midi_section_fit_report.get("performance") or {}).get("candidate_cache") or {}
-        fc.log(f"MIDI SECTION CACHE: hit={cache_info.get('hit')}; reason={cache_info.get('reason')}; path={cache_info.get('path')}",indent=1)
+            },candidate_cache_path=candidate_cache_path)
+        cache=(midi_section_fit_report.get("performance") or {}).get("candidate_cache") or {}
+        fc.log(f"MIDI SECTION CACHE: hit={cache.get('hit')}; reason={cache.get('reason')}; path={cache.get('path')}",indent=1)
         midi_section_fit_report["integration"]={"switch":"--midi-section-fit",
             "playback_measure_count":len(section_measures),
             "prepared_roles":sorted(role for role,events in section_midi.items() if events),
@@ -2921,6 +2939,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "structural_search_report": structural_search_report,
         "transcription_investigator_report": transcription_report,
         "midi_section_fit_report": midi_section_fit_report,
+        "parsed_chart_cache": chart_cache_report,
         "expression_report": {
             track_id: arrangement.get("expression_diagnostics", {"encoded": ee.count_fields(arrangement.get("notes", []))})
             for track_id, arrangement in arrangements_out.items()
@@ -2974,12 +2993,6 @@ def main():
                         help="DEPRECATED alias for --midi-section-fit-materialization permissive")
     parser.add_argument("--midi-section-fit-materialization",choices=("conservative","permissive","diagnostic-unsafe"),default=None,
                         help="Materialize MIDI section regions by evidence tier and transition-warp policy")
-    parser.add_argument("--midi-section-cache",default=None,
-                        help="Exact content-addressed candidate-report cache path (default: song _feedpak_build/cache)")
-    parser.add_argument("--no-midi-section-cache",action="store_true",
-                        help="Disable persistent exact MIDI-section candidate caching")
-    parser.add_argument("--rebuild-midi-section-cache",action="store_true",
-                        help="Ignore and replace any existing MIDI-section candidate cache")
     parser.add_argument("--allow-severe-alignment", action="store_true",
                         help="Package even if severe structural timing errors remain after repair")
     parser.add_argument("--anchors", default=None)
@@ -3016,10 +3029,7 @@ def main():
                    allow_compatible_audio_refinement=args.allow_compatible_audio_refinement,
                    midi_section_fit=args.midi_section_fit,
                    force_midi_section_fit=args.force_midi_section_fit,
-                   midi_section_fit_materialization=args.midi_section_fit_materialization,
-                   midi_section_cache=args.midi_section_cache,
-                   no_midi_section_cache=args.no_midi_section_cache,
-                   rebuild_midi_section_cache=args.rebuild_midi_section_cache)
+                   midi_section_fit_materialization=args.midi_section_fit_materialization)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

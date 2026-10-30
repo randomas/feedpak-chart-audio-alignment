@@ -266,15 +266,15 @@ The project still supports the established vocal workflow based on WhisperX and 
 MuScriptor remains optional external preparation. Its setup is not a FeedPak runtime dependency, and alternative audio-derived MIDI providers are valid if their output is placed on the original unpadded source-audio clock.
 
 
-### Length-adjusted episode geometry
+## Phase 2b cache boundary
 
-Region length affects only isolated edges belonging to accepted catch-up episodes. Ordinary edges keep the fixed mode stretch limits. After 16 unique supported playback measures, the episode delta ceiling grows slowly and is capped: conservative `120 ms + 3 ms/measure` up to 250 ms with hard stretch 0.80–1.20; permissive `250 ms + 5 ms/measure` up to 500 ms with hard stretch 0.70–1.30; diagnostic-unsafe `500 ms + 8 ms/measure` up to 800 ms with hard stretch 0.50–1.50.
+Phase 2b.1 instruments the full build, while Phase 2b.2 caches deterministic preparation artifacts. Cache fingerprints use canonical sorted JSON and SHA-256; file identities include content hashes, sizes, modification times, and basename diagnostics. Writes are atomic. Cache load errors, schema mismatches, fingerprint mismatches, and missing artifacts degrade to ordinary recomputation rather than build failure.
 
-This prevents one bounded local defect from invalidating a long corroborated region without allowing region length to justify arbitrary geometry. Non-episode outliers, non-positive durations, reversals, crossings, excessive episode density, and global non-monotonicity remain invalid.
+The prepared-stem cache owns only `_feedpak_build/stems` artifacts and never changes original audio. The parsed-chart cache owns normalized AlphaTab products and is invalidated by score, project configuration, adapter, or schema changes. The MIDI-section cache owns exact candidate/fusion evidence. Global baseline construction, materialization, final warping, report generation, and packaging remain active on every build.
+
+Cache behavior is observable through `cache_file_missing`, `exact_cache_hit`, `schema_mismatch`, `fingerprint_mismatch`, `cached_artifact_missing`, and `cache_load_error` states. The final pipeline report separates inspection, stem preparation, vocals, GP/audio alignment, manifest, packaging, report writing, and total runtime.
 
 
-### Phase 2A exact execution layer
+### Expected-role observability and cache ownership
 
-The candidate report may be persisted at `.feedpak_cache/midi_section_candidates.json`. Reuse requires an exact schema and SHA-256 fingerprint match over playback measures, chart events, prepared MIDI events, search configuration, and all search-baseline samples at measure boundaries. Cache writes are atomic. A changed chart, transcription, padding consequence, baseline, or search parameter rebuilds evidence; a materialization-policy-only change can reuse the exact candidate report.
-
-The DP recurrence uses rolling score rows and compact byte operation codes for backtrace while preserving the original option order and first-equal tie behavior. Transform rejection occurs before landmark dictionaries and candidate objects are allocated. These are execution changes only and must remain parity-tested against the reference output.
+Inactive chart roles are neutral rather than absent corroborators. A single locally expected role can supply complete support when its control confidence is strong. Candidate-cache ownership remains inside the MIDI-section module; downstream path selection, fusion, solo-role annotation, materialization, and packaging always rerun. Invalid baselines require a validated acquisition root or materialization is blocked.

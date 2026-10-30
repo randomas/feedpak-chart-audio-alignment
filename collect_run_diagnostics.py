@@ -124,11 +124,11 @@ def skeleton_midi_section_fit(data):
         "candidate_summary":((data.get("candidate_report") or {}).get("summary") or {}),
         "path_summary":paths.get("summary") or {},"roles":roles,
         "fusion_summary":fusion.get("summary") or {},
+        "solo_role_authority":fusion.get("solo_role_authority"),
         "normal_production_limits":fusion.get("normal_production_limits"),
         "monotonicity_certificate":fusion.get("monotonicity_certificate"),
         "regions":[_pick(x,("region_id","chart_start","chart_end","midi_start","midi_end","control_count",
-            "minimum_edge_stretch","maximum_edge_stretch","strong_control_count","catch_up_events","catch_up_episodes",
-            "supported_playback_measure_count","playback_measure_numbers","monotonic"))
+            "minimum_edge_stretch","maximum_edge_stretch","strong_control_count","catch_up_events","monotonic"))
             for x in (fusion.get("regions") or [])],
         "role_conflict_count":len(fusion.get("role_conflicts") or []),
         "rejected_blocks":fusion.get("rejected_blocks") or [],

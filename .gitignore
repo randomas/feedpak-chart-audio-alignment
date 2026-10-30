@@ -49,7 +49,6 @@ output_folder/
 Gemini_mess/
 Diagnostics_light/
 run_*/
-.feedpak_cache/
 _feedpak_build/
 **/_feedpak_build/
 *.feedpak
@@ -70,3 +69,5 @@ feedpak-project.v*.yaml
 
 # Local safety patches and inventories
 pre-v15-golden-tracked-changes.patch
+
+*.before-solo-role-authority

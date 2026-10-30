@@ -18,34 +18,6 @@ The current MIDI-section production interface is:
 
 Available materialization policies are `conservative`, `permissive`, and `diagnostic-unsafe`. Unsupported intervals retain the selected baseline's local shape with an explicitly non-MIDI-validated carried or interpolated offset. The v16 Phase-1 optimizer groups performance MIDI once per role, uses indexed MIDI slices, caches exact symbolic alignments by slice, reuses pitch similarity matrices, and emits performance counters. It does not use coarse-to-fine search, approximate pruning, multiprocessing, Numba, or GPU execution.
 
-
-### Length-adjusted correction-episode allowance
-
-Ordinary edges always retain the selected mode's fixed stretch range. Region length does not make every edge more permissive. Instead, only an edge that belongs to an allowed grouped catch-up episode may use a bounded absolute-correction allowance that grows after 16 supported playback measures.
-
-```text
-conservative:       min(250 ms, 120 ms + 3 ms × max(0, measures - 16)); hard stretch 0.80–1.20
-permissive:         min(500 ms, 250 ms + 5 ms × max(0, measures - 16)); hard stretch 0.70–1.30
-diagnostic-unsafe: min(800 ms, 500 ms + 8 ms × max(0, measures - 16)); hard stretch 0.50–1.50
-```
-
-The exception requires a monotonic Tier-A/B-quality region, an episode count within the length-normalized allowance, positive edge durations, and an outlier edge identified as part of that episode. Long regions therefore survive isolated bounded defects, while unrelated outliers and catastrophic geometry remain rejected.
-
-
-### Phase 2A exact execution optimization
-
-Phase 2A adds an on-disk, content-addressed cache for the exact MIDI-section candidate report. The default song-local cache is `.feedpak_cache/midi_section_candidates.json`. Its SHA-256 fingerprint covers playback measures, chart evidence, prepared performance MIDI, candidate configuration, schema version, and sampled values from both baseline hypotheses at every measure boundary. Any mismatch rebuilds the exhaustive search.
-
-```text
---no-midi-section-cache
---rebuild-midi-section-cache
---midi-section-cache PATH
-```
-
-Policy-only reruns can therefore reuse the exact candidate inventory and rerun the inexpensive path, fusion, and materialization stages. Cache writes are atomic and diagnostics state the hit or miss reason.
-
-The Python DP reference semantics are retained with rolling score rows and compact byte backtrace storage. Invalid transforms are rejected before landmark dictionaries and candidate objects are allocated. Search density, similarity scoring, tie order, candidates, and timing remain unchanged.
-
 ### Input responsibility and external preparation
 
 FeedPak consumes prepared assets. The future wizard will validate and use them, but it will not install or run stem separation or MIDI transcription tools.
@@ -69,6 +41,29 @@ percussion.mid
 ```
 
 Legacy `Piano.muscriptor.mid`, `Guitar.muscriptor.mid`, `Bass.muscriptor.mid`, and `Drums.muscriptor.mid` filenames remain supported. Explicit project configuration takes precedence over automatic discovery. Missing MIDI roles are neutral rather than fatal.
+
+
+## Phase 2b.1 and 2b.2: pipeline profiling and exact preparation caches
+
+Phase 2b extends optimization beyond MIDI-section candidate search without changing alignment decisions.
+
+### Pipeline-wide performance report
+
+Every completed build writes `<feedpak>.pipeline_performance.json` with timings for project inspection and stem discovery, prepared-stem processing, vocal processing, GP/audio alignment and arrangement generation, manifest construction, packaging, report writing, and total build time. Cache status, fingerprint, lookup time, and miss reason are included where applicable.
+
+### Prepared-stem cache
+
+With `--keep-work-dir`, padded or copied stems under `_feedpak_build/stems` are reused only when an exact SHA-256 fingerprint matches all source stem contents and preparation parameters. The fingerprint includes source identities, padding amount, audio-content start, count-in duration, BPM, output names, and preparation implementation version. A missing, corrupt, stale, or incomplete cache causes normal rebuilding. Original stems are never modified.
+
+### Parsed-chart cache
+
+AlphaTab products are cached under `_feedpak_build/cache/chart`. The fingerprint includes the extracted score JSON, project configuration, adapter implementation, and supported schema. On a miss, the chart is parsed normally and the normalized products are written atomically. GP5/PyGuitarPro parsing remains unchanged and reports `not_applicable` for this cache.
+
+### Persistent MIDI-section candidate cache
+
+The exact MIDI-section report cache is retained. Its fingerprint covers playback measures, chart events, prepared performance-MIDI events, sampled baseline clocks, alignment mode, and padding. A cache hit skips candidate generation but still performs downstream materialization and output generation.
+
+These caches do not reuse the final FeedPak, final warped arrangements, or final baseline decision. They reuse only deterministic preparation artifacts and exact candidate evidence. Delete `_feedpak_build/cache` to force a cold run.
 
 ## Current capabilities
 
@@ -1911,3 +1906,8 @@ candidate_count_applied: 0
 ```
 
 The build writes `<feedpak>.transcription_investigator.json` containing prepared-file provenance, source and padded clocks, normalized events, forward/backward scores, candidates, the monotonic path preview, and unsupported gaps.
+
+
+### v16.3 cache compatibility and solo-role authority
+
+The persistent MIDI-section candidate cache is owned by `midi_section_fit.py`; orchestration passes a cache path and does not add a second report cache. Corroboration is relative to chart roles active in the interval. Strong evidence from the only expected role may establish a solo-role acquisition root. Invalid negative or non-monotonic baselines are rooted safely when possible and otherwise block materialization.

@@ -10,6 +10,7 @@ LICENSE
 LIGHT_DIAGNOSTICS_V8.md
 MANUAL_ANCHOR_INTEGRATION.md
 MIDI_METHOD_COMPATIBILITY_V13_1.md
+MIDI_SECTION_CACHE_SOLO_AUTHORITY_COMPATIBILITY_V16_3.md
 MIDI_SECTION_EXACT_OPTIMIZATION_V16_PHASE1.md
 MIDI_SECTION_FIT_INTEGRATION.md
 MIDI_SECTION_FIT_LOCKDOWN_V14.md
@@ -17,11 +18,10 @@ MIDI_SECTION_FIT_STEP1.md
 MIDI_SECTION_FIT_STEP2.md
 MIDI_SECTION_FIT_STEP3.md
 MIDI_SECTION_HYBRID_GEOMETRY_V15_1.md
-MIDI_SECTION_LENGTH_ADJUSTED_EPISODES_V16_2.md
 MIDI_SECTION_MATERIALIZATION_V15.md
-MIDI_SECTION_PHASE2A_EXACT_OPTIMIZATION_V16_3.md
 MIDI_SEQUENCE_AUTHORITY_V6.md
 PATCH_FIXES_1_THROUGH_6.md
+PHASE2B1_2_EXACT_PREPARATION_CACHE.md
 PHASE3D_README.md
 README.md
 README_TIER1.md
@@ -52,6 +52,7 @@ midi_section_fit.py
 package-lock.json
 package.json
 phase3d_materialization.py
+pipeline_cache.py
 process_gp_alignment.py
 process_vocals.py
 project_config.py
@@ -60,6 +61,7 @@ requirements.txt
 run_all_alignment_methods.ps1
 run_all_test_materials.ps1
 script_collator.ps1
+solo_role_authority.py
 structural_search.py
 tests/conftest.py
 tests/fixtures/supremacy_continuous_dtw_golden.json
@@ -98,6 +100,7 @@ tests/test_midi_section_fit_integration.py
 tests/test_midi_section_lockdown.py
 tests/test_midi_section_materialization_modes.py
 tests/test_multipitch_lyrics.py
+tests/test_phase2b_cache_and_timers.py
 tests/test_piano_duration_quantization.py
 tests/test_piano_duration_regression.py
 tests/test_process_timing_origin_wiring.py
@@ -107,6 +110,7 @@ tests/test_regional_source_fusion.py
 tests/test_repeat_sustain_boundaries.py
 tests/test_reporting_qol_regressions.py
 tests/test_segment_alignment.py
+tests/test_solo_role_authority.py
 tests/test_stem_routing.py
 tests/test_structural_search.py
 tests/test_structural_search_c42.py
