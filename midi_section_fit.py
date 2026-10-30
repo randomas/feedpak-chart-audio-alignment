@@ -9,8 +9,10 @@ It never changes FeedPak timing.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from bisect import bisect_left, bisect_right
 import math
 import statistics
+import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
@@ -256,8 +258,17 @@ def _set_similarity(chart: set[int], midi: set[int], cfg: SectionFitConfig) -> f
     return sum(rewards) / len(rewards)
 
 
+def _similarity_matrix(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str, Any]],
+                       cfg: SectionFitConfig) -> list[list[float]]:
+    """Compute each symbolic group similarity once for DP and backtrace."""
+    chart_sets=[x["pitches"] if isinstance(x["pitches"],set) else set(x["pitches"]) for x in chart]
+    midi_sets=[x["pitches"] if isinstance(x["pitches"],set) else set(x["pitches"]) for x in midi]
+    return [[_set_similarity(c,m,cfg) for m in midi_sets] for c in chart_sets]
+
+
 def _align_ordered_groups(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str, Any]], cfg: SectionFitConfig):
     n, m = len(chart), len(midi)
+    similarities=_similarity_matrix(chart,midi,cfg)
     neg = -1e12
     dp = [[neg] * (m + 1) for _ in range(n + 1)]
     back = [[None] * (m + 1) for _ in range(n + 1)]
@@ -270,7 +281,7 @@ def _align_ordered_groups(chart: Sequence[dict[str, Any]], midi: Sequence[dict[s
         back[0][j] = (0, j - 1, "skip_midi")
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            sim = _set_similarity(set(chart[i - 1]["pitches"]), set(midi[j - 1]["pitches"]), cfg)
+            sim = similarities[i-1][j-1]
             options = [
                 (dp[i - 1][j] - cfg.missing_chart_penalty, i - 1, j, "skip_chart"),
                 (dp[i][j - 1] - cfg.extra_midi_penalty, i, j - 1, "skip_midi"),
@@ -284,11 +295,11 @@ def _align_ordered_groups(chart: Sequence[dict[str, Any]], midi: Sequence[dict[s
     while i or j:
         pi, pj, op = back[i][j]
         if op == "match":
-            sim = _set_similarity(set(chart[i - 1]["pitches"]), set(midi[j - 1]["pitches"]), cfg)
-            pairs.append((i - 1, j - 1, sim))
+            pairs.append((i - 1, j - 1, similarities[i-1][j-1]))
         i, j = pi, pj
     pairs.reverse()
-    return dp[n][m] / max(1, len(pairs)), pairs
+    scale=max(1,n)
+    return dp[n][m]/scale,pairs
 
 
 def _context_fingerprint(groups: Sequence[dict[str, Any]]) -> tuple[tuple[int, ...], tuple[float, ...]]:
@@ -307,89 +318,86 @@ def _context_similarity(chart: Sequence[dict[str, Any]], midi: Sequence[dict[str
     return sum(1.0 if ci[i] == mi[i] else 0.5 if ci[i] % 12 == mi[i] % 12 else 0.0 for i in range(count)) / count
 
 
-def _evaluate_transform(window: MeasureWindow, midi_groups: Sequence[dict[str, Any]], stretch: float, translation: float, cfg: SectionFitConfig,
-                        search_hypothesis: str = "requested_method_baseline"):
+def prepare_grouped_midi(events: Sequence[Mapping[str,Any]], cfg: SectionFitConfig):
+    groups=group_onsets(events,cfg.onset_group_tolerance_seconds)
+    return {"groups":groups,"times":[float(x["time"]) for x in groups]}
+
+
+def _evaluate_transform(window: MeasureWindow, prepared_midi: Mapping[str,Any], stretch: float,
+                        translation: float, cfg: SectionFitConfig,
+                        search_hypothesis: str="requested_method_baseline",
+                        alignment_cache: dict | None=None, counters: dict | None=None):
     expected_start = translation + stretch * window.nominal_start
     expected_end = translation + stretch * window.nominal_end
     margin = max(0.5, cfg.maximum_residual_seconds * 2)
-    local = [x for x in midi_groups if expected_start - margin <= x["time"] <= expected_end + margin]
-    if len(local) < cfg.minimum_midi_groups:
-        return None
-    sequence_score, pairs = _align_ordered_groups(window.groups, local, cfg)
-    if len(pairs) < cfg.minimum_matched_groups:
-        return None
-    landmarks = []
-    residuals = []
-    for ci, mi, similarity in pairs:
-        ct = float(window.groups[ci]["time"])
-        mt = float(local[mi]["time"])
-        predicted = translation + stretch * ct
-        residuals.append(abs(mt - predicted))
-        landmarks.append({"chart_time": ct, "midi_time": mt, "similarity": float(similarity)})
-    coverage = len({x[0] for x in pairs}) / max(1, len(window.groups))
-    median = statistics.median(residuals)
-    maximum = max(residuals)
-    context_score = _context_similarity(window.context_groups, local)
-    combined = 0.58 * sequence_score + 0.20 * coverage + 0.10 * math.exp(-median / 0.12) + cfg.context_weight * context_score
-    reasons = []
-    if coverage < cfg.minimum_chart_coverage:
-        reasons.append("insufficient_chart_coverage")
-    if median > cfg.maximum_median_residual_seconds:
-        reasons.append("median_residual_too_large")
-    if maximum > cfg.maximum_residual_seconds:
-        reasons.append("maximum_residual_too_large")
-    return SectionCandidate(
-        window_id=window.window_id, role=window.role,
-        chart_start=window.nominal_start, chart_end=window.nominal_end,
-        midi_start=translation + stretch * window.nominal_start,
-        midi_end=translation + stretch * window.nominal_end,
-        chart_stretch=stretch, translation_seconds=translation,
-        matched_chart_groups=len({x[0] for x in pairs}),
-        chart_group_count=len(window.groups), midi_group_count=len(local),
-        chart_coverage=coverage, median_residual_seconds=median,
-        maximum_residual_seconds=maximum, sequence_score=sequence_score,
-        context_score=context_score, combined_score=combined,
-        matched_landmarks=landmarks,
-        status="valid" if not reasons else "rejected",
-        rejection_reasons=reasons, search_hypothesis=search_hypothesis,
-    )
+    groups=prepared_midi["groups"];times=prepared_midi["times"]
+    left=bisect_left(times,expected_start-margin)
+    right=bisect_right(times,expected_end+margin)
+    if counters is not None:counters["midi_slice_lookups"]+=1
+    if right-left < cfg.minimum_midi_groups:return None
+    local=groups[left:right];key=(left,right)
+    cached=alignment_cache.get(key) if alignment_cache is not None else None
+    if cached is None:
+        sequence_score,pairs=_align_ordered_groups(window.groups,local,cfg)
+        context_score=_context_similarity(window.context_groups,local)
+        cached=(sequence_score,pairs,context_score)
+        if alignment_cache is not None:alignment_cache[key]=cached
+        if counters is not None:counters["dp_evaluations"]+=1
+    else:
+        if counters is not None:counters["alignment_cache_hits"]+=1
+    sequence_score,pairs,context_score=cached
+    if len(pairs)<cfg.minimum_matched_groups:return None
+    landmarks=[];residuals=[]
+    for ci,mi,similarity in pairs:
+        ct=float(window.groups[ci]["time"]);mt=float(local[mi]["time"])
+        predicted=translation+stretch*ct
+        residuals.append(abs(mt-predicted))
+        landmarks.append({"chart_time":ct,"midi_time":mt,"similarity":float(similarity)})
+    coverage=len({x[0] for x in pairs})/max(1,len(window.groups))
+    median=statistics.median(residuals);maximum=max(residuals)
+    combined=0.58*sequence_score+0.20*coverage+0.10*math.exp(-median/0.12)+cfg.context_weight*context_score
+    reasons=[]
+    if coverage<cfg.minimum_chart_coverage:reasons.append("insufficient_chart_coverage")
+    if median>cfg.maximum_median_residual_seconds:reasons.append("median_residual_too_large")
+    if maximum>cfg.maximum_residual_seconds:reasons.append("maximum_residual_too_large")
+    return SectionCandidate(window_id=window.window_id,role=window.role,
+        chart_start=window.nominal_start,chart_end=window.nominal_end,
+        midi_start=expected_start,midi_end=expected_end,chart_stretch=float(stretch),
+        translation_seconds=float(translation),matched_chart_groups=len(pairs),
+        chart_group_count=len(window.groups),midi_group_count=len(local),chart_coverage=coverage,
+        median_residual_seconds=median,maximum_residual_seconds=maximum,
+        sequence_score=sequence_score,context_score=context_score,combined_score=combined,
+        matched_landmarks=landmarks,status="valid" if not reasons else "rejected",
+        rejection_reasons=reasons,search_hypothesis=search_hypothesis)
 
 
-def search_section_candidates(
-    window: MeasureWindow,
-    midi_events: Sequence[Mapping[str, Any]],
-    baseline: Callable[[float], float] | None = None,
-    cfg: SectionFitConfig | None = None,
-    search_hypothesis: str = "requested_method_baseline",
-) -> list[SectionCandidate]:
-    """Search one chart window against fixed performance-MIDI timestamps."""
-    cfg = cfg or SectionFitConfig()
-    if window.observability != "observable":
-        return []
-    midi_groups = group_onsets(midi_events, cfg.onset_group_tolerance_seconds)
-    if len(midi_groups) < cfg.minimum_midi_groups:
-        return []
-    baseline = baseline or (lambda t: t)
-    expected = float(baseline(window.nominal_start))
-    candidates = []
-    stretch_steps = max(1, int(round((cfg.stretch_max - cfg.stretch_min) / cfg.stretch_step)))
-    translation_steps = max(1, int(round(2 * cfg.search_radius_seconds / cfg.translation_step_seconds)))
-    for si in range(stretch_steps + 1):
-        stretch = cfg.stretch_min + si * cfg.stretch_step
-        for ti in range(translation_steps + 1):
-            start_target = expected - cfg.search_radius_seconds + ti * cfg.translation_step_seconds
-            translation = start_target - stretch * window.nominal_start
-            candidate = _evaluate_transform(window, midi_groups, stretch, translation, cfg, search_hypothesis)
-            if candidate and candidate.status == "valid":
-                candidates.append(candidate)
-    candidates.sort(key=lambda x: (x.combined_score, x.chart_coverage, -x.median_residual_seconds), reverse=True)
-    distinct = []
+def search_section_candidates(window: MeasureWindow, midi_events, baseline=None,
+                              cfg: SectionFitConfig | None=None,
+                              search_hypothesis: str="requested_method_baseline",
+                              alignment_cache: dict | None=None,counters: dict | None=None):
+    """Exact exhaustive search with prepared MIDI, indexed slices, and DP caching."""
+    cfg=cfg or SectionFitConfig()
+    if window.observability!="observable":return []
+    prepared=midi_events if isinstance(midi_events,dict) and "groups" in midi_events else prepare_grouped_midi(midi_events,cfg)
+    if len(prepared["groups"])<cfg.minimum_midi_groups:return []
+    baseline=baseline or (lambda t:t);expected=float(baseline(window.nominal_start));candidates=[]
+    cache=alignment_cache if alignment_cache is not None else {}
+    stretch_steps=max(1,int(round((cfg.stretch_max-cfg.stretch_min)/cfg.stretch_step)))
+    translation_steps=max(1,int(round(2*cfg.search_radius_seconds/cfg.translation_step_seconds)))
+    for si in range(stretch_steps+1):
+        stretch=cfg.stretch_min+si*cfg.stretch_step
+        for ti in range(translation_steps+1):
+            if counters is not None:counters["transform_trials"]+=1
+            start_target=expected-cfg.search_radius_seconds+ti*cfg.translation_step_seconds
+            translation=start_target-stretch*window.nominal_start
+            candidate=_evaluate_transform(window,prepared,stretch,translation,cfg,search_hypothesis,cache,counters)
+            if candidate and candidate.status=="valid":candidates.append(candidate)
+    candidates.sort(key=lambda x:(x.combined_score,x.chart_coverage,-x.median_residual_seconds),reverse=True)
+    distinct=[]
     for candidate in candidates:
-        if any(abs(candidate.midi_start - other.midi_start) < cfg.distinct_occurrence_seconds for other in distinct):
-            continue
+        if any(abs(candidate.midi_start-other.midi_start)<cfg.distinct_occurrence_seconds for other in distinct):continue
         distinct.append(candidate)
-        if len(distinct) >= cfg.candidate_limit:
-            break
+        if len(distinct)>=cfg.candidate_limit:break
     return distinct
 
 
@@ -401,48 +409,53 @@ def build_section_candidate_report(
     cfg: SectionFitConfig | None = None,
     baseline_hypotheses: Mapping[str, Callable[[float], float]] | None = None,
 ) -> dict[str, Any]:
-    """Build Step-1 diagnostics using one or more explicit search centres."""
-    cfg = cfg or SectionFitConfig()
+    """Build exact Step-1 diagnostics with reusable MIDI preparation and caches."""
+    started=time.perf_counter();cfg=cfg or SectionFitConfig()
     hypotheses=dict(baseline_hypotheses or {})
-    if not hypotheses:
-        hypotheses["requested_method_baseline"]=baseline or (lambda t:float(t))
+    if not hypotheses:hypotheses["requested_method_baseline"]=baseline or (lambda t:float(t))
     hypotheses.setdefault("prepared_chart_clock",lambda t:float(t))
-    windows = build_measure_aligned_windows(playback_measures, chart_events_by_role, cfg)
-    role_reports = {}
-    totals = {"window_count": 0, "observable_window_count": 0, "candidate_count": 0}
-    for role, role_windows in windows.items():
-        rows = []
-        midi = midi_events_by_role.get(role) or []
+    windows=build_measure_aligned_windows(playback_measures,chart_events_by_role,cfg)
+    prep_started=time.perf_counter()
+    prepared_by_role={role:prepare_grouped_midi(midi_events_by_role.get(role) or [],cfg) for role in windows}
+    grouping_seconds=time.perf_counter()-prep_started
+    role_reports={};totals={"window_count":0,"observable_window_count":0,"candidate_count":0}
+    global_perf={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0,
+                 "unique_midi_slices":0,"midi_grouping_seconds":grouping_seconds}
+    for role,role_windows in windows.items():
+        role_started=time.perf_counter();rows=[];prepared=prepared_by_role[role]
+        counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0}
         for window in role_windows:
-            pooled=[]
+            pooled=[];alignment_cache={}
             for hypothesis_name,hypothesis_baseline in hypotheses.items():
-                pooled.extend(search_section_candidates(window,midi,hypothesis_baseline,cfg,hypothesis_name))
+                pooled.extend(search_section_candidates(window,prepared,hypothesis_baseline,cfg,hypothesis_name,
+                                                        alignment_cache,counters))
             pooled.sort(key=lambda x:(x.combined_score,x.chart_coverage,-x.median_residual_seconds),reverse=True)
             candidates=[]
             for item in pooled:
-                if any(abs(item.midi_start-other.midi_start)<cfg.distinct_occurrence_seconds for other in candidates):
-                    continue
+                if any(abs(item.midi_start-other.midi_start)<cfg.distinct_occurrence_seconds for other in candidates):continue
                 candidates.append(item)
                 if len(candidates)>=cfg.candidate_limit:break
-            totals["window_count"] += 1
-            totals["observable_window_count"] += int(window.observability == "observable")
-            totals["candidate_count"] += len(candidates)
-            window_data = asdict(window)
-            window_data["groups"] = [{"time": x["time"], "pitches": list(x["pitches"])} for x in window.groups]
-            window_data["context_groups"] = []  # keep Step-1 report compact
-            rows.append({"window": window_data, "candidates": [asdict(x) for x in candidates]})
-        role_reports[role] = {"window_count": len(role_windows), "windows": rows}
-    return {
-        "version": "1.0-step1",
-        "method": "midi-section-fit",
-        "diagnostic_only": True,
-        "timing_changes_applied": False,
-        "monotonic_path_selected": False,
-        "config": asdict(cfg),
-        "search_hypotheses":list(hypotheses),
-        "summary": totals,
-        "roles": role_reports,
-    }
+            totals["window_count"]+=1;totals["observable_window_count"]+=int(window.observability=="observable")
+            totals["candidate_count"]+=len(candidates)
+            window_data=asdict(window)
+            window_data["groups"]=[{"time":x["time"],"pitches":list(x["pitches"])} for x in window.groups]
+            window_data["context_groups"]=[]
+            rows.append({"window":window_data,"candidates":[asdict(x) for x in candidates],
+                         "performance":{"unique_midi_slices":len(alignment_cache)}})
+            global_perf["unique_midi_slices"]+=len(alignment_cache)
+        role_perf={**counters,"elapsed_seconds":time.perf_counter()-role_started,
+                   "prepared_midi_group_count":len(prepared["groups"]),
+                   "window_count":len(role_windows)}
+        for key in ("transform_trials","midi_slice_lookups","dp_evaluations","alignment_cache_hits"):
+            global_perf[key]+=counters[key]
+        role_reports[role]={"window_count":len(role_windows),"windows":rows,"performance":role_perf}
+    global_perf["candidate_search_seconds"]=time.perf_counter()-started
+    global_perf["cache_hit_rate"]=(global_perf["alignment_cache_hits"]/
+        max(1,global_perf["alignment_cache_hits"]+global_perf["dp_evaluations"]))
+    return {"version":"1.1-exact-optimized","method":"midi-section-fit","diagnostic_only":True,
+        "timing_changes_applied":False,"monotonic_path_selected":False,"config":asdict(cfg),
+        "search_hypotheses":list(hypotheses),"summary":totals,"performance":global_perf,"roles":role_reports}
+
 
 # ---------------------------------------------------------------------------
 # Step 2: globally monotonic overlapping per-role paths
@@ -931,8 +944,14 @@ def _fused_transition(previous: FusedControlCandidate,
     if midi_delta <= 0:
         return False, "midi_control_did_not_advance", None, -math.inf
     edge_stretch = midi_delta / chart_delta
-    if not cfg.edge_stretch_min <= edge_stretch <= cfg.edge_stretch_max:
-        return False, "unsafe_fused_edge_stretch", edge_stretch, -math.inf
+    absolute_correction=abs(midi_delta-chart_delta)
+    normal=cfg.edge_stretch_min<=edge_stretch<=cfg.edge_stretch_max
+    # Candidate fusion retains short bounded corrections for later mode-specific
+    # assessment. Materialization still applies conservative/permissive/unsafe
+    # policy and may reject them.
+    short_delta_exception=(chart_delta<=16.0 and absolute_correction<=.50)
+    if not (normal or short_delta_exception):
+        return False, "unsafe_fused_edge_geometry", edge_stretch, -math.inf
     adjustment = -cfg.edge_stretch_penalty * abs(edge_stretch - 1.0)
     return True, None, edge_stretch, adjustment
 
@@ -1120,25 +1139,94 @@ def fuse_monotonic_role_paths(path_report: Mapping[str, Any],
 
 
 MATERIALIZATION_MODES={
-    "conservative":{"tiers":{"A"},"transition_min":.90,"transition_max":1.10},
-    "permissive":{"tiers":{"A","B"},"transition_min":.85,"transition_max":1.15},
-    "diagnostic-unsafe":{"tiers":{"A","B","C"},"transition_min":.70,"transition_max":1.30},
+    "conservative":{"tiers":{"A"},"transition_min":.90,"transition_max":1.10,
+        "short_delta_seconds":.12,"short_duration_seconds":6.0,
+        "catch_up_episode_interval_measures":24,"episode_growth_start_measures":16,
+        "episode_delta_growth_per_measure":.003,"episode_delta_max_seconds":.25,
+        "episode_stretch_min":.80,"episode_stretch_max":1.20},
+    "permissive":{"tiers":{"A","B"},"transition_min":.85,"transition_max":1.15,
+        "short_delta_seconds":.25,"short_duration_seconds":10.0,
+        "catch_up_episode_interval_measures":16,"episode_growth_start_measures":16,
+        "episode_delta_growth_per_measure":.005,"episode_delta_max_seconds":.50,
+        "episode_stretch_min":.70,"episode_stretch_max":1.30},
+    "diagnostic-unsafe":{"tiers":{"A","B","C"},"transition_min":.70,"transition_max":1.30,
+        "short_delta_seconds":.50,"short_duration_seconds":16.0,
+        "catch_up_episode_interval_measures":8,"episode_growth_start_measures":16,
+        "episode_delta_growth_per_measure":.008,"episode_delta_max_seconds":.80,
+        "episode_stretch_min":.50,"episode_stretch_max":1.50},
 }
 
 
-def _region_evidence_tier(region: Mapping[str,Any]):
-    controls=region.get("controls") or []; count=len(controls)
+def _catch_up_episodes(events: Sequence[Mapping[str,Any]]):
+    """Collapse overlapping adjacent-pair warnings into local correction episodes."""
+    ordered=sorted((dict(x) for x in (events or [])),
+                   key=lambda x:(int(x.get("first_edge_index",-1)),int(x.get("second_edge_index",-1))))
+    episodes=[]
+    for event in ordered:
+        first=int(event.get("first_edge_index",-1));second=int(event.get("second_edge_index",first+1))
+        if episodes and first<=episodes[-1]["last_edge_index"]:
+            episode=episodes[-1]
+            episode["last_edge_index"]=max(episode["last_edge_index"],second)
+            episode["pair_count"]+=1;episode["events"].append(event)
+        else:
+            episodes.append({"episode_index":len(episodes),"first_edge_index":first,
+                "last_edge_index":second,"pair_count":1,"events":[event],
+                "kind":"local_correction_episode"})
+    return episodes
+
+
+def _region_evidence_tier(region: Mapping[str,Any], policy: Mapping[str,Any] | None=None):
+    controls=region.get("controls") or [];count=len(controls)
     strong=int(region.get("strong_control_count") or
                sum(x.get("classification")!="single_role_provisional" for x in controls))
-    ratio=strong/max(1,count); catchups=len(region.get("catch_up_events") or [])
+    ratio=strong/max(1,count);events=region.get("catch_up_events") or []
+    episodes=_catch_up_episodes(events)
+    measures=max(1,int(region.get("supported_playback_measure_count") or
+                       region.get("playback_measure_count") or 1))
+    interval=max(1,int((policy or {}).get("catch_up_episode_interval_measures",16)))
+    allowed=max(1,measures//interval)
     roles=set(role for item in controls for role in (item.get("roles") or []))
-    if count>=3 and strong>=3 and ratio>=.75 and catchups==0:
-        tier="A"
-    elif count>=3 and strong>=2 and ratio>=.40 and catchups<=1:
-        tier="B"
-    else:tier="C"
+    base="A" if count>=3 and strong>=3 and ratio>=.75 else "B" if count>=3 and strong>=2 and ratio>=.40 else "C"
+    if base=="C" or len(episodes)>allowed:tier="C"
+    elif base=="A" and episodes:tier="B"
+    else:tier=base
     return tier,{"control_count":count,"strong_control_count":strong,"strong_ratio":ratio,
-                 "catch_up_event_count":catchups,"roles":sorted(roles)}
+        "catch_up_event_count":len(events),"catch_up_episode_count":len(episodes),
+        "catch_up_episodes":episodes,"supported_playback_measure_count":measures,
+        "catch_up_episode_interval_measures":interval,"allowed_catch_up_episode_count":allowed,
+        "catch_up_density_per_measure":len(episodes)/measures,"roles":sorted(roles)}
+
+
+def _episode_delta_allowance(measures: int, policy: Mapping[str,Any]) -> float:
+    extra=max(0,int(measures)-int(policy["episode_growth_start_measures"]))
+    return min(float(policy["episode_delta_max_seconds"]),
+               float(policy["short_delta_seconds"])+extra*float(policy["episode_delta_growth_per_measure"]))
+
+
+def _episode_edge_indices(episodes: Sequence[Mapping[str,Any]]) -> set[int]:
+    indices=set()
+    for episode in episodes or []:
+        first=int(episode.get("first_edge_index",-1));last=int(episode.get("last_edge_index",first))
+        indices.update(range(first,last+1))
+    return indices
+
+
+def _apply_episode_exception(assessment: dict[str,Any], edge_index: int, quality: Mapping[str,Any],
+                             policy: Mapping[str,Any]) -> dict[str,Any]:
+    if assessment.get("accepted") or edge_index not in _episode_edge_indices(quality.get("catch_up_episodes") or []):
+        return assessment
+    measures=int(quality["supported_playback_measure_count"])
+    allowance=_episode_delta_allowance(measures,policy)
+    stretch=assessment.get("stretch");correction=assessment.get("absolute_correction_seconds")
+    accepted=(stretch is not None and correction is not None and
+              float(policy["episode_stretch_min"])<=stretch<=float(policy["episode_stretch_max"]) and
+              correction<=allowance)
+    return {**assessment,"accepted":accepted,
+        "acceptance_basis":"length_adjusted_episode_delta_exception" if accepted else assessment["acceptance_basis"],
+        "edge_belongs_to_catch_up_episode":True,"episode_delta_allowance_seconds":allowance,
+        "region_supported_playback_measure_count":measures,
+        "episode_stretch_min":policy["episode_stretch_min"],
+        "episode_stretch_max":policy["episode_stretch_max"]}
 
 
 def _transition_stretches(baseline, start, end, start_offset, end_offset, samples=12):
@@ -1151,6 +1239,34 @@ def _transition_stretches(baseline, start, end, start_offset, end_offset, sample
     return [(mapped[i+1]-mapped[i])/(points[i+1]-points[i]) for i in range(samples)]
 
 
+def _geometry_acceptance(chart_delta: float, audio_delta: float, policy: Mapping[str,Any]):
+    if chart_delta<=0 or audio_delta<=0:
+        return {"accepted":False,"acceptance_basis":"catastrophic_non_positive_geometry",
+            "stretch":None,"absolute_correction_seconds":None}
+    stretch=audio_delta/chart_delta
+    correction=abs(audio_delta-chart_delta)
+    normal=policy["transition_min"]<=stretch<=policy["transition_max"]
+    short=(chart_delta<=policy["short_duration_seconds"] and
+           correction<=policy["short_delta_seconds"])
+    basis=("normal_stretch_range" if normal else
+           "short_region_delta_exception" if short else
+           "geometry_out_of_policy")
+    return {"accepted":bool(normal or short),"acceptance_basis":basis,
+        "stretch":stretch,"absolute_correction_seconds":correction,
+        "duration_seconds":chart_delta,
+        "short_delta_limit_seconds":policy["short_delta_seconds"],
+        "short_duration_limit_seconds":policy["short_duration_seconds"]}
+
+
+def _classify_catch_up(first: Mapping[str,Any], second: Mapping[str,Any]):
+    if not first.get("accepted") or not second.get("accepted"):
+        return "probable_artificial_catch_up"
+    if (first.get("acceptance_basis")=="short_region_delta_exception" or
+        second.get("acceptance_basis")=="short_region_delta_exception"):
+        return "possible_local_chart_timing_defect"
+    return "baseline_return_catch_up"
+
+
 def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: Callable[[float],float],
                                     mode: str="conservative"):
     """Materialize MIDI regions by evidence tier and transition warp, never raw delta.
@@ -1160,11 +1276,12 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
     regions, displacement is interpolated only when the resulting transition
     stretch is permitted by the selected mode.
     """
+    materialization_started=time.perf_counter()
     if mode not in MATERIALIZATION_MODES:
         raise ValueError(f"invalid MIDI section materialization mode: {mode}")
     policy=MATERIALIZATION_MODES[mode]; eligible=[]; rejected=[]
     for region in sorted(fusion_report.get("regions") or [],key=lambda x:float(x.get("chart_start",0))):
-        tier,quality=_region_evidence_tier(region)
+        tier,quality=_region_evidence_tier(region,policy)
         controls=region.get("controls") or []
         chart_start=region.get("chart_start") if region.get("chart_start") is not None else (controls[0].get("score_time") if controls else None)
         chart_end=region.get("chart_end") if region.get("chart_end") is not None else (controls[-1].get("score_time") if controls else None)
@@ -1174,18 +1291,38 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
             rejected.append({**row,"reason":"evidence_tier_not_enabled","severity":"tier_1_close" if tier=="B" else "tier_2_high_risk"});continue
         if len(controls)<2 or not region.get("monotonic",False):
             rejected.append({**row,"reason":"structurally_invalid_region","severity":"catastrophic"});continue
-        local_stretches=[]
-        for a,b in zip(controls,controls[1:]):
-            ds=float(b["score_time"])-float(a["score_time"]); da=float(b["audio_time"])-float(a["audio_time"])
-            if ds<=0 or da<=0:
-                local_stretches=[];break
-            local_stretches.append(da/ds)
-        if not local_stretches:
-            rejected.append({**row,"reason":"non_monotonic_region_controls","severity":"catastrophic"});continue
+        edge_assessments=[]
+        for index,(a,b) in enumerate(zip(controls,controls[1:])):
+            ds=float(b["score_time"])-float(a["score_time"])
+            da=float(b["audio_time"])-float(a["audio_time"])
+            assessment=_geometry_acceptance(ds,da,policy)
+            assessment=_apply_episode_exception(assessment,index,quality,policy)
+            assessment.update({"edge_index":index,"chart_start":float(a["score_time"]),
+                "chart_end":float(b["score_time"])})
+            edge_assessments.append(assessment)
+        catastrophic=next((x for x in edge_assessments if x["acceptance_basis"]=="catastrophic_non_positive_geometry"),None)
+        if catastrophic:
+            rejected.append({**row,"reason":"non_monotonic_region_controls","severity":"catastrophic",
+                "failed_edge":catastrophic});continue
+        failed=[x for x in edge_assessments if not x["accepted"]]
+        if failed:
+            worst=max(failed,key=lambda x:x.get("absolute_correction_seconds") or 0)
+            rejected.append({**row,"reason":"region_edge_geometry_out_of_policy",
+                "severity":"tier_1_close" if tier=="A" else "tier_2_high_risk",
+                "failed_edge":worst,"edge_assessments":edge_assessments});continue
+        catch_up_classifications=[]
+        for first,second in zip(edge_assessments,edge_assessments[1:]):
+            x=(first["stretch"] or 1)-1;y=(second["stretch"] or 1)-1
+            if x*y<0 and abs(x)>=.06 and abs(y)>=.06:
+                catch_up_classifications.append({"first_edge_index":first["edge_index"],
+                    "second_edge_index":second["edge_index"],"kind":_classify_catch_up(first,second)})
+        local_stretches=[x["stretch"] for x in edge_assessments]
         eligible.append({**row,"controls":[dict(x) for x in controls],
             "entry_offset_seconds":float(controls[0]["audio_time"])-float(baseline(float(controls[0]["score_time"]))),
             "exit_offset_seconds":float(controls[-1]["audio_time"])-float(baseline(float(controls[-1]["score_time"]))),
-            "minimum_region_stretch":min(local_stretches),"maximum_region_stretch":max(local_stretches)})
+            "minimum_region_stretch":min(local_stretches),"maximum_region_stretch":max(local_stretches),
+            "edge_assessments":edge_assessments,
+            "catch_up_classifications":catch_up_classifications})
 
     applied=[];transitions=[]
     for region in eligible:
@@ -1198,13 +1335,16 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
         stretches=_transition_stretches(baseline,gap_start,gap_end,
             float(previous["exit_offset_seconds"]),float(region["entry_offset_seconds"]))
         minimum=min(stretches);maximum=max(stretches)
-        valid=minimum>=policy["transition_min"] and maximum<=policy["transition_max"]
+        start_audio=float(baseline(gap_start))+float(previous["exit_offset_seconds"])
+        end_audio=float(baseline(gap_end))+float(region["entry_offset_seconds"])
+        geometry=_geometry_acceptance(gap_end-gap_start,end_audio-start_audio,policy)
+        valid=geometry["accepted"]
         transition={"from_region":previous["region_id"],"to_region":region["region_id"],
             "chart_start":gap_start,"chart_end":gap_end,"duration_seconds":gap_end-gap_start,
             "start_offset_seconds":previous["exit_offset_seconds"],"end_offset_seconds":region["entry_offset_seconds"],
             "minimum_stretch":minimum,"maximum_stretch":maximum,"mode":mode,
             "classification":"baseline_shaped_offset_transition","midi_validated":False,
-            "accepted":valid}
+            "accepted":valid,**geometry}
         transitions.append(transition)
         if not valid:
             distance=max(policy["transition_min"]-minimum,maximum-policy["transition_max"],0)
@@ -1245,13 +1385,16 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
     if not globally_monotonic:
         return baseline,{"status":"materialization_blocked","mode":mode,"reason":"global_monotonicity_failure",
             "applied_regions":[],"rejected_regions":rejected,"transitions":transitions,
-            "timing_changes_applied":False,"global_monotonicity_validated":False}
+            "timing_changes_applied":False,"global_monotonicity_validated":False,
+            "materialization_seconds":time.perf_counter()-materialization_started}
     return warp,{"status":"available" if applied else "no_eligible_regions","mode":mode,
         "authority":"midi_section_fit_materialization","timing_changes_applied":bool(applied),
         "applied_regions":applied,"rejected_regions":rejected,"transitions":transitions,
         "unsupported_gap_policy":"baseline_shape_with_carried_or_interpolated_offset",
         "unsupported_gaps_midi_validated":False,"global_monotonicity_validated":True,
-        "raw_endpoint_delta_used_as_rejection":False}
+        "raw_endpoint_delta_used_as_rejection":False,
+        "geometry_policy":{**dict(policy),"tiers":sorted(policy["tiers"])},
+        "materialization_seconds":time.perf_counter()-materialization_started}
 
 
 def build_forced_section_warp(fusion_report: Mapping[str,Any], baseline: Callable[[float],float],
@@ -1270,13 +1413,33 @@ def build_section_fusion_report(
     fusion_config: SectionFusionConfig | None = None,
     baseline_hypotheses: Mapping[str, Callable[[float], float]] | None = None,
 ) -> dict[str, Any]:
-    """Run Steps 1-3 without modifying timing."""
+    """Run Steps 1-3 without modifying timing, with stage instrumentation."""
+    total_started=time.perf_counter()
+    candidate_started=time.perf_counter()
     candidate_report = build_section_candidate_report(
         playback_measures, chart_events_by_role, midi_events_by_role,
         baseline=baseline, cfg=candidate_config, baseline_hypotheses=baseline_hypotheses)
+    candidate_seconds=time.perf_counter()-candidate_started
+    path_started=time.perf_counter()
     path_report = select_monotonic_section_paths(candidate_report, path_config)
+    path_seconds=time.perf_counter()-path_started
+    fusion_started=time.perf_counter()
     fusion_report = fuse_monotonic_role_paths(path_report, fusion_config)
-    return {"version": "1.0-step3", "method": "midi-section-fit",
+    normalised_measures=[_normalise_measure(x,i) for i,x in enumerate(playback_measures)]
+    for region in fusion_report.get("regions") or []:
+        covered=[x for x in normalised_measures
+                 if float(x["start"])<float(region["chart_end"])+1e-9 and
+                    float(x["end"])>float(region["chart_start"])-1e-9]
+        numbers=sorted({int(x["playback_measure_number"]) for x in covered})
+        region["supported_playback_measure_count"]=len(numbers)
+        region["playback_measure_numbers"]=numbers
+        region["catch_up_episodes"]=_catch_up_episodes(region.get("catch_up_events") or [])
+    fusion_seconds=time.perf_counter()-fusion_started
+    performance={"candidate_generation_seconds":candidate_seconds,
+        "path_selection_seconds":path_seconds,"fusion_seconds":fusion_seconds,
+        "total_section_fit_seconds":time.perf_counter()-total_started,
+        "candidate_counters":candidate_report.get("performance") or {}}
+    return {"version": "1.1-step3-exact-optimized", "method": "midi-section-fit",
             "diagnostic_only": True, "timing_changes_applied": False,
-            "candidate_report": candidate_report, "path_report": path_report,
-            "fusion_report": fusion_report}
+            "performance":performance,"candidate_report": candidate_report,
+            "path_report": path_report,"fusion_report": fusion_report}

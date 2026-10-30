@@ -4,6 +4,57 @@ An automated Python pipeline for converting separated audio stems and a Guitar P
 
 The pipeline extracts playable arrangements, analyzes vocals, aligns Guitar Pro timing to the recorded performance, creates song-level timing data, writes Feedpak side files, and packages the result as a `.feedpak` ZIP archive.
 
+
+## Current development baseline
+
+The listening-validated reference is Git tag `v15.0-dsmn-perfect`. It produced a perfect alignment on *Don't Stop Me Now*, including the previously unstable piano material around 30 seconds. Current v16 development adds v15.1 hybrid stretch-or-delta geometry and exact Phase-1 search acceleration while preserving the exhaustive search grid and scoring.
+
+The current MIDI-section production interface is:
+
+```powershell
+-MidiSectionFit `
+-MidiSectionFitMaterialization permissive
+```
+
+Available materialization policies are `conservative`, `permissive`, and `diagnostic-unsafe`. Unsupported intervals retain the selected baseline's local shape with an explicitly non-MIDI-validated carried or interpolated offset. The v16 Phase-1 optimizer groups performance MIDI once per role, uses indexed MIDI slices, caches exact symbolic alignments by slice, reuses pitch similarity matrices, and emits performance counters. It does not use coarse-to-fine search, approximate pruning, multiprocessing, Numba, or GPU execution.
+
+
+### Length-adjusted correction-episode allowance
+
+Ordinary edges always retain the selected mode's fixed stretch range. Region length does not make every edge more permissive. Instead, only an edge that belongs to an allowed grouped catch-up episode may use a bounded absolute-correction allowance that grows after 16 supported playback measures.
+
+```text
+conservative:       min(250 ms, 120 ms + 3 ms × max(0, measures - 16)); hard stretch 0.80–1.20
+permissive:         min(500 ms, 250 ms + 5 ms × max(0, measures - 16)); hard stretch 0.70–1.30
+diagnostic-unsafe: min(800 ms, 500 ms + 8 ms × max(0, measures - 16)); hard stretch 0.50–1.50
+```
+
+The exception requires a monotonic Tier-A/B-quality region, an episode count within the length-normalized allowance, positive edge durations, and an outlier edge identified as part of that episode. Long regions therefore survive isolated bounded defects, while unrelated outliers and catastrophic geometry remain rejected.
+
+### Input responsibility and external preparation
+
+FeedPak consumes prepared assets. The future wizard will validate and use them, but it will not install or run stem separation or MIDI transcription tools.
+
+At minimum, provide the chart, song audio, and the stems needed by the selected alignment method. Stems may come from UVR, Moises, `audio-separator`, a DAW, or any other workflow. Optional role-specific performance MIDI may come from MuScriptor or another audio-to-MIDI system.
+
+Performance MIDI must be derived independently from the recording. MIDI exported from the Guitar Pro, MusicXML, Songsterr, or other chart being aligned is circular evidence and must not be used as chart-to-performance timing authority.
+
+Preferred tool-neutral filenames are discovered case-insensitively:
+
+```text
+piano.mid
+keys.mid
+keyboard.mid
+guitar.mid
+guitars.mid
+bass.mid
+drums.mid
+drum.mid
+percussion.mid
+```
+
+Legacy `Piano.muscriptor.mid`, `Guitar.muscriptor.mid`, `Bass.muscriptor.mid`, and `Drums.muscriptor.mid` filenames remain supported. Explicit project configuration takes precedence over automatic discovery. Missing MIDI roles are neutral rather than fatal.
+
 ## Current capabilities
 
 - Guitar Pro parsing for guitar, bass, drums, and piano/keys
@@ -1805,14 +1856,9 @@ The investigator writes `<feedpak>.transcription_investigator.json`. All candida
 
 ## Prepared MuScriptor transcription evidence
 
-MuScriptor is a material-preparation stage, not a project dependency. Run it externally and place any available canonical MIDI files in each song folder:
+MuScriptor is a material-preparation stage, not a project dependency. Run it externally, or use another audio-derived MIDI transcription tool. Tool-neutral filenames such as `piano.mid`, `keys.mid`, `guitar.mid`, `bass.mid`, and `drums.mid` are preferred; the legacy `.muscriptor.mid` names remain compatible.
 
-```text
-Piano.muscriptor.mid
-Guitar.muscriptor.mid
-Bass.muscriptor.mid
-Drums.muscriptor.mid
-```
+Do not use MIDI exported from the chart being aligned. That is circular evidence and contains no independent information about recorded-performance timing.
 
 Files are optional and discovered case-insensitively. Missing roles are reported as `not_prepared` and do not fail the build. The prepared MIDI clock must reference the original unpadded source stem. The investigator adds the build's canonical `padding_added` during ingestion without modifying the MIDI.
 

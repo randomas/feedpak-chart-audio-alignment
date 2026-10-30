@@ -9,9 +9,11 @@
 # Track maintained root documentation and project inventory
 !MIDI_*.md
 !ACTIVE_PROJECT_FILES.txt
+!architecture.md
 
-# Track the maintained PowerShell test-material runner
+# Track maintained PowerShell runners
 !run_all_test_materials.ps1
+!run_all_alignment_methods.ps1
 
 # 3. Re-include the tests directory and Python tests inside it
 !tests/
@@ -20,6 +22,8 @@
 # 4. Explicit safety exclusions
 Tokens And APIs.txt
 env/
+.venv/
+venv/
 __pycache__/
 **/__pycache__/
 *.py[cod]
@@ -38,21 +42,30 @@ check_midi.py
 # 5. Local song data and generated output
 my_test_song/
 my_test_song_2/
+my_test_song*/
+materials/private/
 output/
 output_folder/
 Gemini_mess/
+Diagnostics_light/
+run_*/
 _feedpak_build/
 **/_feedpak_build/
 *.feedpak
 *.feedpak.alignment_report.json
+*.alignment_report.json
 intermediate_arrangements.json
 intermediate_vocals.json
+intermediate_*.json
 gp5_inspection.json
 feedpak-project.v*.yaml
-# One-off patch and acquisition scripts
-apply_bar_landmark_alignment_patch.py
-apply_phase3b_patch.py
-download_atib_feedforge.py
-download_atib_songsterr_timing.py
-download_songsterr_timing_v2.py
-songsterr.py
+
+# Private audio and prepared evidence must remain inside ignored song/material folders.
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.muscriptor.mid
+
+# Local safety patches and inventories
+pre-v15-golden-tracked-changes.patch

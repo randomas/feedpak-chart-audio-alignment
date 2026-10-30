@@ -211,3 +211,63 @@ Any new method must preserve:
 Pitched dense candidates are now evaluated with synchronized rhythm and chroma fingerprints. Score rhythm uses onset occupancy; score chroma uses authored MIDI pitch classes across sounding intervals. Audio rhythm uses the onset-strength envelope, while audio chroma uses normalized harmonic CQT chroma. Candidate search is broad, but a Gaussian-mixture temporal prior decays with displacement from the trusted baseline. Independent rhythm and chroma thresholds, joint-identity threshold, and best-versus-runner-up ambiguity gates must all pass. Dense candidates are diagnostic-only by default.
 
 Content-addressed NPZ caches under `_alignment_cache/features` recycle decoded stem features across safe and unsafe comparison passes. Cache identity includes audio content, sample rate, hop length, and feature version.
+
+---
+
+## Current alignment architecture: v15 golden through v16 Phase 1
+
+### Stability boundary
+
+- `v15.0-dsmn-perfect` is the listening-validated golden tag.
+- v15.1 adds hybrid geometry: a short edge may pass on bounded absolute correction even when its stretch exceeds the normal mode range; long regions pass on reasonable stretch regardless of accumulated endpoint displacement.
+- v16 Phase 1 accelerates the same exhaustive candidate search without changing grid density, candidate limits, scoring, tie order, role-path selection, fusion, or materialization policy.
+
+### Asset boundary
+
+Source separation and audio-to-MIDI transcription are external preparation stages. FeedPak consumes stems and optional performance-derived MIDI, records provenance, and evaluates whether evidence supports the chart. The future wizard should validate available assets and explain missing capabilities, but should not install or execute UVR, Moises, `audio-separator`, MuScriptor, or equivalent tools.
+
+Chart-exported MIDI is never independent timing evidence. It may be used for parser or playback diagnostics, but it must not be assigned performance-clock authority.
+
+### Producer-neutral logical roles
+
+External filenames are normalized to logical roles:
+
+- `piano`: `piano.mid`, `keys.mid`, `keyboard.mid`, and legacy `.muscriptor.mid` aliases;
+- `guitar`: `guitar.mid`, `guitars.mid`, and legacy aliases;
+- `bass`: `bass.mid` and legacy aliases;
+- `drums`: `drums.mid`, `drum.mid`, `percussion.mid`, and legacy aliases.
+
+File labels are claims, not proof of instrument identity. Downstream diagnostics must remain tolerant of stem contamination, missing notes, extra transcription events, and inaccurate charts.
+
+### MIDI-section pipeline
+
+1. Expand the chart into playback order while preserving written and playback measure identities.
+2. Build overlapping duration-aware measure windows independently for piano, guitar, bass, and drums.
+3. Normalize chart and prepared MIDI events into ordered onset groups; drums use shared canonical families.
+4. Search the fixed performance-MIDI clock over the full stretch/translation grid.
+5. Select independent globally monotonic per-role streaks; unsupported windows split authority.
+6. Cluster compatible role predictions without averaging contradictory clusters.
+7. Recover multiple independent monotonic regions after unsafe edges or reversals.
+8. Materialize eligible regions by `conservative`, `permissive`, or `diagnostic-unsafe` policy.
+9. Keep unsupported spans explicitly non-MIDI-validated while preserving baseline shape and safe offset continuity.
+
+### Exact Phase-1 acceleration
+
+Performance MIDI is grouped once per role. Sorted onset times support inclusive binary-search slicing. Each chart window caches exact symbolic DP results by MIDI slice indices, and both baseline hypotheses share that cache. Pitch-group similarity matrices are calculated once per slice and reused during DP and backtrace.
+
+Diagnostics report transform trials, slice lookups, unique slices, DP evaluations, cache hits, cache-hit rate, per-role elapsed time, candidate generation time, path-selection time, fusion time, and materialization time.
+
+Multiprocessing, Numba, GPU batching, duplicate-grid merging, coarse-to-fine search, approximate prefilters, and early termination remain deferred until exact parity and real-run profiling justify them.
+
+### External analysis setup that must remain documented
+
+The project still supports the established vocal workflow based on WhisperX and CREPE/torchcrepe. Keep the installation, FFmpeg, CUDA/device, model-cache, Hugging Face token, vocal-layout, and troubleshooting instructions in `README.md` whenever architecture documentation is revised.
+
+MuScriptor remains optional external preparation. Its setup is not a FeedPak runtime dependency, and alternative audio-derived MIDI providers are valid if their output is placed on the original unpadded source-audio clock.
+
+
+### Length-adjusted episode geometry
+
+Region length affects only isolated edges belonging to accepted catch-up episodes. Ordinary edges keep the fixed mode stretch limits. After 16 unique supported playback measures, the episode delta ceiling grows slowly and is capped: conservative `120 ms + 3 ms/measure` up to 250 ms with hard stretch 0.80–1.20; permissive `250 ms + 5 ms/measure` up to 500 ms with hard stretch 0.70–1.30; diagnostic-unsafe `500 ms + 8 ms/measure` up to 800 ms with hard stretch 0.50–1.50.
+
+This prevents one bounded local defect from invalidating a long corroborated region without allowing region length to justify arbitrary geometry. Non-episode outliers, non-positive durations, reversals, crossings, excessive episode density, and global non-monotonicity remain invalid.
