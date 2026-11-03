@@ -8,3 +8,5 @@ PyGuitarPro
 jsonschema
 pytest
 # Optional vocal pipeline: whisperx, torchcrepe, and a matching PyTorch build
+
+mido>=1.3.0

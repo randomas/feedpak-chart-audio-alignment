@@ -426,15 +426,44 @@ def diagnose_segment_source_dtw(baseline, measure_downbeats, score_events, audio
                                 'warnings':[] if valid else ['beat_or_measure_stretch']}})
         segments.append(rec)
     states=[x['decision']['state'] for x in segments]
-    summary={'generated_segments':len(segments),'evaluated_segments':sum(bool(x.get('source_candidates')) for x in segments),
-             'eligible_segments':sum(s=='would_apply' for s in states),'boundary_assignments':0,
-             'boundary_activated_evaluated':0,'boundary_activated_skipped':0,
-             'skipped_baseline_accurate':0,
-             'skipped_insufficient_features':sum(s=='skipped_no_accepted_source' for s in states),
-             'would_apply':states.count('would_apply'),'rejected':sum(s.startswith('rejected_') for s in states),
-             'maximum_proposed_change_ms':round(max([x.get('path',{}).get('maximum_residual_excursion_ms',0) for x in segments] or [0]),3),
-             'timing_changes_applied':False,
-             'selected_sources':{name:sum(x.get('optimization_sources')==[name] for x in segments) for name in sources}}
+    source_candidates=[candidate for segment in segments for candidate in (segment.get('source_candidates') or [])]
+    candidate_states=[candidate.get('state') for candidate in source_candidates]
+    unavailable_reasons={}
+    for candidate in source_candidates:
+        if candidate.get('state')=='unavailable':
+            reason=candidate.get('reason') or 'unspecified'
+            unavailable_reasons[reason]=unavailable_reasons.get(reason,0)+1
+    source_state_counts={}
+    for candidate in source_candidates:
+        key=f"{candidate.get('source','unknown')}:{candidate.get('state','unknown')}"
+        source_state_counts[key]=source_state_counts.get(key,0)+1
+    summary={
+        'generated_segments':len(segments),
+        'segments_generated':len(segments),
+        'segments_eligibility_checked':len(segments),
+        'evaluated_segments':sum(bool(x.get('source_candidates')) for x in segments),
+        'segments_with_source_candidates':sum(bool(x.get('source_candidates')) for x in segments),
+        'source_candidates_total':len(source_candidates),
+        'source_candidates_feature_evaluated':sum(state not in (None,'unavailable') for state in candidate_states),
+        'source_candidates_unavailable':candidate_states.count('unavailable'),
+        'source_candidates_rejected_no_meaningful_improvement':candidate_states.count('rejected_no_meaningful_improvement'),
+        'source_candidates_rejected_held_out_degradation':candidate_states.count('rejected_held_out_degradation'),
+        'source_candidates_accepted':candidate_states.count('would_apply'),
+        'unavailable_reason_counts':unavailable_reasons,
+        'source_state_counts':source_state_counts,
+        'eligible_segments':sum(s=='would_apply' for s in states),
+        'boundary_assignments':sum(bool(x.get('assigned_boundary_activation')) for x in segments),
+        'boundary_activated_evaluated':sum(bool(x.get('assigned_boundary_activation')) and bool(x.get('source_candidates')) for x in segments),
+        'boundary_activated_skipped':sum(bool(x.get('assigned_boundary_activation')) and not bool(x.get('source_candidates')) for x in segments),
+        'skipped_baseline_accurate':states.count('skipped_baseline_accurate'),
+        'skipped_insufficient_features':states.count('skipped_insufficient_features'),
+        'segments_insufficient_features':states.count('skipped_insufficient_features'),
+        'segments_no_source_passed_gates':states.count('skipped_no_accepted_source'),
+        'would_apply':states.count('would_apply'),
+        'rejected':sum(s.startswith('rejected_') for s in states),
+        'maximum_proposed_change_ms':round(max([x.get('path',{}).get('maximum_residual_excursion_ms',0) for x in segments] or [0]),3),
+        'timing_changes_applied':False,
+        'selected_sources':{name:sum(name in (x.get('optimization_sources') or []) for x in segments) for name in sources}}
     boundaries_out=[{'measure':int(beats[i]['measure']),'nominal_time':float(beats[i]['t_gp']),
                      'tier':'fixed','evidence':['full_mix_frame'],'boundary_kind':'fixed_segment'} for i in boundaries]
     return {'version':'2.0','status':'diagnostic_only','timing_changes_applied':False,
@@ -510,12 +539,42 @@ def build_selective_warp(baseline, local_report, measure_downbeats, config=None)
         final=proposal;status='applied';applied=accepted
     report={'version':'1.0','status':status,'timing_changes_applied':bool(applied),
       'accepted_segment_count':len(accepted),'applied_segment_count':len(applied),
-      'applied_segments':[{'segment_id':x['segment_id'],'start_nominal_time':round(x['start'],6),
-        'end_nominal_time':round(x['end'],6),'maximum_change_ms':round(x['maximum_change_ms'],3)} for x in applied],
+      'applied_segments':[],
       'validation':{'overlap_free':not overlap,'monotonic':monotonic,
         'minimum_beat_stretch':round(beat_min,6),'maximum_beat_stretch':round(beat_max,6),
         'minimum_measure_stretch':round(measure_min,6),'maximum_measure_stretch':round(measure_max,6),
         'fallback_used':not bool(applied)}}
+    # Preserve exact musical location and evaluation evidence for every
+    # applied interval. This is the authoritative listening/debugging summary.
+    segment_by_id={x.get('segment_id'):x for x in (local_report or {}).get('segments',[])}
+    downbeats=[(int(x.get('measure',i+1)),float(x['t_gp'])) for i,x in enumerate(measure_downbeats)]
+    def measure_at(value):
+        eligible=[m for m,t in downbeats if t<=float(value)+1e-9]
+        return eligible[-1] if eligible else (downbeats[0][0] if downbeats else None)
+    for item in applied:
+        diagnostic=segment_by_id.get(item['segment_id'],{})
+        path=diagnostic.get('path') or {}
+        before=diagnostic.get('baseline') or {}
+        after=diagnostic.get('candidate') or {}
+        held=diagnostic.get('held_out_evaluation') or {}
+        report['applied_segments'].append({
+            'segment_id':item['segment_id'],
+            'start_nominal_time':round(item['start'],6),
+            'end_nominal_time':round(item['end'],6),
+            'start_measure':measure_at(item['start']),
+            'end_measure':measure_at(item['end']),
+            'maximum_change_ms':round(item['maximum_change_ms'],3),
+            'optimization_sources':list(diagnostic.get('optimization_sources') or []),
+            'held_out_sources':list(diagnostic.get('held_out_sources') or []),
+            'baseline_median_residual_ms':before.get('median_residual_ms'),
+            'candidate_median_residual_ms':after.get('median_residual_ms'),
+            'baseline_p95_residual_ms':before.get('p95_residual_ms'),
+            'candidate_p95_residual_ms':after.get('p95_residual_ms'),
+            'held_out_evaluation':held,
+            'minimum_beat_stretch':path.get('minimum_beat_stretch'),
+            'maximum_beat_stretch':path.get('maximum_beat_stretch'),
+            'maximum_residual_excursion_ms':path.get('maximum_residual_excursion_ms'),
+        })
     return final,report
 
 

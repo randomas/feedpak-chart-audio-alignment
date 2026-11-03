@@ -1,10 +1,89 @@
+# Secrets and private configuration
+Tokens And APIs.txt
+.env
+.env.*
+*.pem
+*.key
+
+# Python environments and caches
 env/
+venv/
 .venv/
 __pycache__/
-.pytest_cache/
+**/__pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node dependencies
 node_modules/
+**/node_modules/
+
+# Editors and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local song and private test materials
+my_test_song/
+my_test_song_2/
+my_test_song*/
+materials/private/
+Gemini_mess/
+
+# Generated build and cache output
+output/
+output_folder/
 _feedpak_build/
+**/_feedpak_build/
+.feedpak_cache/
+**/.feedpak_cache/
+
+# Corpus runs and diagnostics
+Diagnostics_light/
+**/Diagnostics_light/
+run_*/
+DSMN_midi_section_v16.6/
+
+# Generated FeedPak and reports
 *.feedpak
+*.feedpak.alignment_report.json
 *.alignment_report.json
+intermediate_arrangements.json
+intermediate_vocals.json
 intermediate_*.json
+gp5_inspection.json
+feedpak-project.v*.yaml
+
+# Private audio and prepared evidence
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.aif
+*.aiff
+*.opus
+*.webm
+*.muscriptor.mid
+
+# Downloaded and packaged archives
+*.zip
+*.zip.txt
+
+# Temporary patch, checkpoint, and backup files
+apply_checkpoint_*.py
+*_before_checkpoints.py
+*_checkpoint_v*.py
+*.before_*
+fix_checkpoint_*.py
+*.before-solo-role-authority
+pre-v15-golden-tracked-changes.patch
+
+# One-off local diagnostic scripts
+check_midi.py

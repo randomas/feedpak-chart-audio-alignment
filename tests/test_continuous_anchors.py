@@ -268,3 +268,27 @@ def test_force_mode_never_applies_a_non_monotonic_proposal():
     assert report["validation"]["fallback_used"] is True
     assert warp(4.0) == baseline(4.0)
 
+
+
+def test_drift_search_prior_interpolates_and_holds_residual():
+    baseline=lambda t:float(t)
+    preview={'selected_anchors':[{'score_time':10.0,'audio_time':11.0},{'score_time':20.0,'audio_time':23.0}]}
+    prior,report=ca.build_drift_search_prior(baseline,preview)
+    assert report['status']=='available'
+    assert prior(5.0)==6.0
+    assert prior(15.0)==17.0
+    assert prior(25.0)==28.0
+
+
+def test_dual_centre_merge_recovers_drift_only_candidate_without_dropping_baseline_candidate():
+    base=lambda t:float(t); drift=lambda t:float(t)+2.0
+    first={'matches':[{'score_event_id':'a','score_time':10.0,'source':'guitar','kind':'restart','candidates':[],
+                       'candidate_count':0,'best_candidate':None}], 'summary':{},'notes':[]}
+    second={'matches':[{'score_event_id':'a','score_time':10.0,'source':'guitar','kind':'restart',
+                        'candidates':[{'time':12.0,'confidence':0.9,'evidence_source':'guitar'}],
+                        'candidate_count':1,'best_candidate':{'time':12.0}}], 'summary':{}}
+    merged=ca.merge_dual_centre_reports(first,second,base,drift)
+    assert merged['summary']['second_pass_recovered_score_events']==1
+    assert merged['matches'][0]['candidates'][0]['search_centre']=='drift_adjusted'
+    assert merged['matches'][0]['baseline_prediction']==10.0
+    assert merged['matches'][0]['drift_adjusted_prediction']==12.0

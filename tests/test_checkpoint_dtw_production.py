@@ -1,3 +1,4 @@
+from pathlib import Path
 import unittest
 import checkpoint_dtw as c
 
@@ -40,3 +41,10 @@ if __name__=='__main__':unittest.main()
 
 
 
+
+
+def test_segment_source_summary_does_not_call_quality_rejection_insufficient_features():
+    source=Path(__file__).resolve().parents[1].joinpath('checkpoint_dtw.py').read_text()
+    assert "'segments_no_source_passed_gates':states.count('skipped_no_accepted_source')" in source
+    assert "'segments_insufficient_features':states.count('skipped_insufficient_features')" in source
+    assert "'source_candidates_feature_evaluated'" in source

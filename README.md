@@ -4,6 +4,67 @@ An automated Python pipeline for converting separated audio stems and a Guitar P
 
 The pipeline extracts playable arrangements, analyzes vocals, aligns Guitar Pro timing to the recorded performance, creates song-level timing data, writes Feedpak side files, and packages the result as a `.feedpak` ZIP archive.
 
+
+## Current development baseline
+
+The listening-validated reference remains Git tag `v15.0-dsmn-perfect`. The current integrated development baseline is **v16.6E.3 final phase-diagnostic cleanup**. It includes v15.1 hybrid geometry, exact Phase-1 and Phase-2B caching/instrumentation, expected-role solo authority, three-clock incipit acquisition, and mode-aware recovery that splits fused regions at production-policy failures instead of rejecting the entire region.
+
+The current MIDI-section production interface is:
+
+```powershell
+-MidiSectionFit `
+-MidiSectionFitMaterialization permissive
+```
+
+Available materialization policies are `conservative`, `permissive`, and `diagnostic-unsafe`. Unsupported intervals retain the selected baseline's local shape with an explicitly non-MIDI-validated carried or interpolated offset. The v16 Phase-1 optimizer groups performance MIDI once per role, uses indexed MIDI slices, caches exact symbolic alignments by slice, reuses pitch similarity matrices, and emits performance counters. It does not use coarse-to-fine search, approximate pruning, multiprocessing, Numba, or GPU execution.
+
+### Input responsibility and external preparation
+
+FeedPak consumes prepared assets. The future wizard will validate and use them, but it will not install or run stem separation or MIDI transcription tools.
+
+At minimum, provide the chart, song audio, and the stems needed by the selected alignment method. Stems may come from UVR, Moises, `audio-separator`, a DAW, or any other workflow. Optional role-specific performance MIDI may come from MuScriptor or another audio-to-MIDI system.
+
+Performance MIDI must be derived independently from the recording. MIDI exported from the Guitar Pro, MusicXML, Songsterr, or other chart being aligned is circular evidence and must not be used as chart-to-performance timing authority.
+
+Preferred tool-neutral filenames are discovered case-insensitively:
+
+```text
+piano.mid
+keys.mid
+keyboard.mid
+guitar.mid
+guitars.mid
+bass.mid
+drums.mid
+drum.mid
+percussion.mid
+```
+
+Legacy `Piano.muscriptor.mid`, `Guitar.muscriptor.mid`, `Bass.muscriptor.mid`, and `Drums.muscriptor.mid` filenames remain supported. Explicit project configuration takes precedence over automatic discovery. Missing MIDI roles are neutral rather than fatal.
+
+
+## Phase 2b.1 and 2b.2: pipeline profiling and exact preparation caches
+
+Phase 2b extends optimization beyond MIDI-section candidate search without changing alignment decisions.
+
+### Pipeline-wide performance report
+
+Every completed build writes `<feedpak>.pipeline_performance.json` with timings for project inspection and stem discovery, prepared-stem processing, vocal processing, GP/audio alignment and arrangement generation, manifest construction, packaging, report writing, and total build time. Cache status, fingerprint, lookup time, and miss reason are included where applicable.
+
+### Prepared-stem cache
+
+With `--keep-work-dir`, padded or copied stems under `_feedpak_build/stems` are reused only when an exact SHA-256 fingerprint matches all source stem contents and preparation parameters. The fingerprint includes source identities, padding amount, audio-content start, count-in duration, BPM, output names, and preparation implementation version. A missing, corrupt, stale, or incomplete cache causes normal rebuilding. Original stems are never modified.
+
+### Parsed-chart cache
+
+AlphaTab products are cached under `_feedpak_build/cache/chart`. The fingerprint includes the extracted score JSON, project configuration, adapter implementation, and supported schema. On a miss, the chart is parsed normally and the normalized products are written atomically. GP5/PyGuitarPro parsing remains unchanged and reports `not_applicable` for this cache.
+
+### Persistent MIDI-section candidate cache
+
+The exact MIDI-section report cache is retained. Its fingerprint covers playback measures, chart events, prepared performance-MIDI events, sampled baseline clocks, alignment mode, and padding. A cache hit skips candidate generation but still performs downstream materialization and output generation.
+
+These caches do not reuse the final FeedPak, final warped arrangements, or final baseline decision. They reuse only deterministic preparation artifacts and exact candidate evidence. Delete `_feedpak_build/cache` to force a cold run.
+
 ## Current capabilities
 
 - Guitar Pro parsing for guitar, bass, drums, and piano/keys
@@ -1760,3 +1821,93 @@ Artist - Song.UNSAFE-CONTINUOUS.feedpak
 ```
 
 The PowerShell corpus runner writes logs as UTF-8 and prefers a genuine modern `.gp` file when both `.gp` and `.gp5` are present.
+
+### Experimental structural second pass
+
+Enable drift-adjusted dual-centre candidate recovery only for the structural continuous method:
+
+```powershell
+.\run_all_alignment_methods.ps1 `
+  -MaterialsRoot "C:\path\to\materials" `
+  -OutputRoot "C:\path\to\outputs" `
+  -Only "my_song_folder" `
+  -Methods @("continuous-anchor-structural") `
+  -StructuralSecondPass `
+  -SkipUnitTests
+```
+
+Without `-StructuralSecondPass`, `continuous-anchor-structural` retains its previous single-pass behavior. The second pass uses the first-pass path only to move search centres, keeps baseline-centred candidates, merges both hypothesis sets, and reruns global monotonic path selection.
+
+## Optional transcription investigator
+
+The investigator is a method-independent, diagnostic-only prepared-evidence layer. It does not change production timing.
+
+Install either or both optional providers:
+
+```powershell
+pip install basic-pitch drumscript
+```
+
+Run with any alignment method:
+
+```powershell
+.\run_all_alignment_methods.ps1 `
+  -MaterialsRoot "C:\path\to\materials" `
+  -OutputRoot "C:\path\to\outputs" `
+  -Only "my_test_song*_gp" `
+  -Methods @("continuous-anchor-structural") `
+  -TranscriptionInvestigator `
+  -SkipUnitTests
+```
+
+Basic Pitch is attempted for available piano, guitar, and bass stems. DrumScript is attempted for the isolated drum stem. Missing or incompatible optional providers are reported and do not fail the build. Raw transcription is cached by audio hash, provider version, adapter settings, and adapter cache version under `_alignment_cache/transcription`.
+
+The investigator writes `<feedpak>.transcription_investigator.json`. All candidates are initially marked `production_eligible: false` and `timing_changes_applied: false`.
+
+## Prepared MuScriptor transcription evidence
+
+MuScriptor is a material-preparation stage, not a project dependency. Run it externally, or use another audio-derived MIDI transcription tool. Tool-neutral filenames such as `piano.mid`, `keys.mid`, `guitar.mid`, `bass.mid`, and `drums.mid` are preferred; the legacy `.muscriptor.mid` names remain compatible.
+
+Do not use MIDI exported from the chart being aligned. That is circular evidence and contains no independent information about recorded-performance timing.
+
+Files are optional and discovered case-insensitively. Missing roles are reported as `not_prepared` and do not fail the build. The prepared MIDI clock must reference the original unpadded source stem. The investigator adds the build's canonical `padding_added` during ingestion without modifying the MIDI.
+
+Enable prepared evidence with:
+
+```powershell
+-TranscriptionInvestigator
+```
+
+The option is available only for:
+
+```text
+dtw-checkpoint
+checkpoint-linear
+checkpoint-dtw-diagnostic
+checkpoint-dtw-selective
+continuous-anchor-linear
+continuous-anchor-dtw
+continuous-anchor-structural
+bar-landmark-regularized
+```
+
+It is deliberately unavailable for `nominal`, `offset`, `linear`, and unguarded `dtw`. The all-method runner automatically skips the investigator for those four methods. Direct unsupported invocations fail with a clear error.
+
+### Matching policy
+
+The matcher is always bidirectional. It discovers partial-sequence hypotheses, extends them forward and backward, reconciles both directions, previews a globally monotonic chain, and reports unsupported gaps. Matching is asymmetric: extra MuScriptor notes are cheap to skip, missing chart notes are tolerated at a higher cost, and incorrect pitch/order matches are discouraged. Exact pitch, octave-equivalent pitch, pitch class, relative timing, local stretch, timing prior, and runner-up margin contribute to candidate confidence.
+
+All transcription candidates remain diagnostic-only in this release:
+
+```text
+production_eligible: false
+timing_changes_applied: false
+candidate_count_applied: 0
+```
+
+The build writes `<feedpak>.transcription_investigator.json` containing prepared-file provenance, source and padded clocks, normalized events, forward/backward scores, candidates, the monotonic path preview, and unsupported gaps.
+
+
+### v16.3 cache compatibility and solo-role authority
+
+The persistent MIDI-section candidate cache is owned by `midi_section_fit.py`; orchestration passes a cache path and does not add a second report cache. Corroboration is relative to chart roles active in the interval. Strong evidence from the only expected role may establish a solo-role acquisition root. Invalid negative or non-monotonic baselines are rooted safely when possible and otherwise block materialization.
