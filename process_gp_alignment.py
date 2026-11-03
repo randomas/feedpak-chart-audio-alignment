@@ -2413,7 +2413,10 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             baseline_hypotheses={
                 "requested_method_baseline":warp_fn,
                 "prepared_chart_clock":lambda t:float(t),
-            },candidate_cache_path=candidate_cache_path)
+            },role_audio_starts={role:fc.detect_leading_silence_seconds(path)
+                for role,path in continuous_audio_paths.items()
+                if role in ("piano","guitar","bass","drums") and path},
+            candidate_cache_path=candidate_cache_path)
         cache=(midi_section_fit_report.get("performance") or {}).get("candidate_cache") or {}
         fc.log(f"MIDI SECTION CACHE: hit={cache.get('hit')}; reason={cache.get('reason')}; path={cache.get('path')}",indent=1)
         midi_section_fit_report["integration"]={"switch":"--midi-section-fit",
@@ -2794,6 +2797,13 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         warp_fn,section_application=msf.build_section_materialized_warp(
             fusion,baseline_before_section_fit,midi_section_fit_materialization)
         midi_section_fit_report["application_report"]=section_application
+        midi_section_fit_report["section_evidence_quality"]=msf.seq.build(midi_section_fit_report)
+        fusion_for_phase=(midi_section_fit_report.get("fusion_report") or {})
+        fusion_for_phase["section_evidence_quality"]=midi_section_fit_report["section_evidence_quality"]
+        phase_measures=[msf._normalise_measure(x,i) for i,x in enumerate(section_measures)]
+        midi_section_fit_report["phase_migration_qualification"]=msf.pmq.build(
+            fusion_for_phase,phase_measures,midi_section_fit_report["section_evidence_quality"],section_application)
+        fusion_for_phase["phase_migration_qualification"]=midi_section_fit_report["phase_migration_qualification"]
         decision["midi_section_fit_application"]=section_application
         if section_application.get("timing_changes_applied"):
             decision["timing_output"]=f"midi-section-fit-{midi_section_fit_materialization}"

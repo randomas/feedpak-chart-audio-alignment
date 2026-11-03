@@ -141,3 +141,15 @@ def test_persistent_cache_rebuild_and_disable(tmp_path):
         candidate_cache_path=str(cache),candidate_cache_disabled=True)
     assert disabled['performance']['candidate_cache']['enabled'] is False
     assert disabled['performance']['candidate_cache']['reason']=='cache_disabled'
+
+
+
+def test_v166a_diagnostics_do_not_invalidate_existing_candidate_cache(tmp_path):
+    path=tmp_path/'candidate.json'
+    payload={'schema_version':1,'fingerprint':'x','candidate_report':{'roles':{},'summary':{}}}
+    import json
+    path.write_text(json.dumps(payload))
+    report,diagnostic=msf._load_candidate_cache(str(path),'x',False,False)
+    assert diagnostic['hit'] is True
+    annotated=msf.annotate_candidate_phase_diagnostics(report)
+    assert annotated['phase_diagnostics_summary']['selection_behavior_changed'] is False

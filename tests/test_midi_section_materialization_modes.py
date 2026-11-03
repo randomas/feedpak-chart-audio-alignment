@@ -119,55 +119,75 @@ def test_fusion_retains_short_bounded_high_stretch_edge_for_materializer():
     assert stretch==pytest.approx(1.2)
 
 
-def _length_policy_region(measures=50):
+def test_length_adjusted_episode_delta_exception_allows_dsmn_edge():
     controls=[]
-    t=0.0;a=0.0
-    stretches=[.93]*28+[1.25]+[.9325]+[1.0]*18
-    controls.append({"score_time":t,"audio_time":a,"classification":"single_role_strong","roles":["piano","bass"]})
-    for stretch in stretches:
-        t+=1.5384615384615472;a+=1.5384615384615472*stretch
-        controls.append({"score_time":t,"audio_time":a,"classification":"single_role_strong","roles":["piano","bass"]})
-    return {"region_id":"long","chart_start":controls[0]["score_time"],"chart_end":controls[-1]["score_time"],
-        "controls":controls,"strong_control_count":len(controls),"monotonic":True,
-        "supported_playback_measure_count":measures,"catch_up_events":[
-        {"first_edge_index":27,"second_edge_index":28,"first_stretch":.93,"second_stretch":1.25},
-        {"first_edge_index":28,"second_edge_index":29,"first_stretch":1.25,"second_stretch":.9325}]}
+    for i in range(49):
+        controls.append({'score_time':float(i)*1.5384615384615472,
+                         'audio_time':float(i)*1.5384615384615472,
+                         'classification':'single_role_strong' if i<37 else 'single_role_provisional',
+                         'roles':['piano']})
+    # One local episode around edge 28, with the central edge matching DSMN's 1.25 / 384.6 ms correction.
+    for i in range(29,49): controls[i]['audio_time'] += 0.3846153846153868
+    region={'region_id':'r','chart_start':controls[0]['score_time'],'chart_end':controls[-1]['score_time'],
+            'controls':controls,'strong_control_count':37,
+            'catch_up_events':[{'first_edge_index':27,'second_edge_index':28},
+                               {'first_edge_index':28,'second_edge_index':29}],
+            'supported_playback_measure_count':50,'monotonic':True}
+    _,report=msf.build_section_materialized_warp({'regions':[region]},lambda t:t,'permissive')
+    assert len(report['applied_regions'])==1
+    exceptional=[x for x in report['applied_regions'][0]['edge_assessments']
+                 if x['acceptance_basis']=='length_adjusted_episode_delta_exception']
+    assert exceptional
+    assert exceptional[0]['episode_delta_allowance_seconds']==0.42000000000000004
 
 
-def test_adjacent_catchup_pairs_are_one_episode():
-    episodes=msf._catch_up_episodes(_length_policy_region()["catch_up_events"])
-    assert len(episodes)==1
-    assert episodes[0]["pair_count"]==2
-    assert (episodes[0]["first_edge_index"],episodes[0]["last_edge_index"])==(27,29)
+def _v165_control(score_time,audio_time):
+    return {'score_time':float(score_time),'audio_time':float(audio_time),
+            'classification':'single_role_strong','roles':['piano']}
 
 
-def test_episode_allowance_grows_after_16_measures_and_is_capped():
-    p=msf.MATERIALIZATION_MODES["permissive"]
-    assert msf._episode_delta_allowance(16,p)==pytest.approx(.25)
-    assert msf._episode_delta_allowance(50,p)==pytest.approx(.42)
-    assert msf._episode_delta_allowance(200,p)==pytest.approx(.50)
+def test_v165_splits_mode_unsafe_edge_and_recovers_later_suffix():
+    controls=[_v165_control(0,0),_v165_control(5,5),_v165_control(10,10),
+              _v165_control(15,14),_v165_control(20,19),_v165_control(25,24),
+              _v165_control(30,29)]
+    region={'region_id':'source','chart_start':0.0,'chart_end':30.0,'controls':controls,
+            'strong_control_count':len(controls),'supported_playback_measure_count':24,
+            'catch_up_events':[],'monotonic':True}
+    warp,report=msf.build_section_materialized_warp({'regions':[region]},lambda t:t,'conservative')
+    assert report['status']=='available_recovered'
+    assert report['materialization_recovery_applied'] is True
+    assert len(report['materialization_split_edges'])==1
+    assert len(report['applied_regions'])==2
+    assert report['applied_regions'][0]['source_region_id']=='source'
+    assert report['applied_regions'][1]['source_region_id']=='source'
+    assert report['applied_regions'][1]['trimmed_leading_control_count']==1
+    assert report['unsupported_gaps_midi_validated'] is False
+    assert report['global_monotonicity_validated'] is True
+    assert warp(10.0)==pytest.approx(10.0)
+    assert warp(20.0)==pytest.approx(19.0)
 
 
-def test_long_supported_dsmn_style_episode_passes_permissive():
-    region=_length_policy_region(50)
-    warp,report=msf.build_section_materialized_warp({"regions":[region]},lambda t:t,"permissive")
-    assert [x["region_id"] for x in report["applied_regions"]]==["long"]
-    assert not report["rejected_regions"]
-    edge=report["applied_regions"][0]["edge_assessments"][28]
-    assert edge["stretch"]==pytest.approx(1.25)
-    assert edge["absolute_correction_seconds"]==pytest.approx(.3846153846)
-    assert edge["episode_delta_allowance_seconds"]==pytest.approx(.42)
-    assert edge["acceptance_basis"]=="length_adjusted_episode_delta_exception"
+def test_v165_keeps_safe_prefix_when_suffix_cannot_reenter():
+    controls=[_v165_control(0,0),_v165_control(5,5),_v165_control(10,10),
+              _v165_control(15,12),_v165_control(20,17),_v165_control(25,22)]
+    region={'region_id':'source','chart_start':0.0,'chart_end':25.0,'controls':controls,
+            'strong_control_count':len(controls),'supported_playback_measure_count':24,
+            'catch_up_events':[],'monotonic':True}
+    _,report=msf.build_section_materialized_warp({'regions':[region]},lambda t:t,'conservative')
+    assert len(report['applied_regions'])==1
+    assert report['applied_regions'][0]['chart_end']==10.0
+    assert any(x.get('reason')=='transition_stretch_out_of_policy' for x in report['rejected_regions'])
+    assert report['materialization_split_edges']
 
 
-def test_same_episode_does_not_pass_conservative_hard_stretch_ceiling():
-    _,report=msf.build_section_materialized_warp({"regions":[_length_policy_region(50)]},lambda t:t,"conservative")
-    assert not report["applied_regions"]
-    assert report["rejected_regions"][0]["reason"] in {"evidence_tier_not_enabled","region_edge_geometry_out_of_policy"}
-
-
-def test_length_does_not_allow_non_episode_outlier():
-    region=_length_policy_region(80);region["catch_up_events"]=[]
-    _,report=msf.build_section_materialized_warp({"regions":[region]},lambda t:t,"permissive")
-    assert not report["applied_regions"]
-    assert report["rejected_regions"][0]["reason"]=="region_edge_geometry_out_of_policy"
+def test_v165_does_not_split_edge_accepted_by_episode_exception():
+    controls=[_v165_control(0,0),_v165_control(5,5),_v165_control(10,10),
+              _v165_control(11,11.2),_v165_control(16,16.2)]
+    region={'region_id':'episode','chart_start':0.0,'chart_end':16.0,'controls':controls,
+            'strong_control_count':len(controls),'supported_playback_measure_count':50,
+            'catch_up_events':[{'first_edge_index':1,'second_edge_index':2}],
+            'monotonic':True}
+    _,report=msf.build_section_materialized_warp({'regions':[region]},lambda t:t,'permissive')
+    assert report['materialization_split_edges']==[]
+    assert len(report['applied_regions'])==1
+    assert report['applied_regions'][0]['region_id']=='episode'

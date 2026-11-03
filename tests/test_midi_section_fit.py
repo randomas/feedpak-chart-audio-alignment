@@ -1,3 +1,4 @@
+import pytest
 import math
 import midi_section_fit as msf
 
@@ -209,3 +210,65 @@ def test_step3_still_never_materializes_timing():
     report=msf.fuse_monotonic_role_paths(multi_role_path_report({"piano":piano}))
     assert report["diagnostic_only"] is True
     assert report["timing_changes_applied"] is False
+
+
+def test_v166a_candidate_distinctiveness_is_diagnostic_only():
+    rows=[
+        msf.SectionCandidate('w','piano',0,10,1,11,1,1,6,6,8,1,.02,.04,.9,.8,.95,[],'valid',[]),
+        msf.SectionCandidate('w','piano',0,10,9,19,1,9,6,6,8,1,.02,.04,.89,.8,.93,[],'valid',[]),
+    ]
+    diagnostics=msf._phase_distinctiveness(rows)
+    assert diagnostics[0]['phase_distinctiveness']=='ambiguous_best'
+    assert diagnostics[0]['score_margin']==pytest.approx(.02)
+    assert diagnostics[0]['runner_up_temporal_separation_seconds']==pytest.approx(8.0)
+    assert diagnostics[0]['distinct_temporal_occurrence_count']==2
+
+
+def test_v166a_selected_phase_diagnostics_reports_jump_and_drift():
+    candidate_report={'roles':{'piano':{'windows':[
+        {'window':{'window_id':'w0','nominal_duration':8.0,'playback_measure_numbers':[1,2,3,4]}},
+        {'window':{'window_id':'w1','nominal_duration':8.0,'playback_measure_numbers':[2,3,4,5]}},
+    ]}}}
+    path_report={'roles':{'piano':{'streaks':[{'streak_id':'s','chart_start':0,'chart_end':18,
+        'candidates':[{'window_id':'w0','chart_start':0.0,'chart_end':10.0,'midi_start':0.0,'midi_end':10.0},
+                      {'window_id':'w1','chart_start':8.0,'chart_end':18.0,'midi_start':8.5,'midi_end':18.5}]}]}}}
+    report=msf.build_selected_phase_diagnostics(path_report,candidate_report)
+    transition=report['roles']['piano']['streaks'][0]['transitions'][0]
+    assert transition['beat_sized_phase_jump'] is True
+    assert transition['measure_sized_phase_jump'] is False
+    assert report['roles']['piano']['streaks'][0]['cumulative_offset_trend_seconds']==pytest.approx(.5)
+    assert report['selection_behavior_changed'] is False
+
+
+def test_v166a1_fused_diagnostics_classify_persistent_phase_and_region_drift():
+    controls=[]
+    for score,audio in [(0,0),(4,4),(8,8.5),(12,12.5),(16,16.5)]:
+        controls.append({'score_time':float(score),'audio_time':float(audio),
+            'roles':['drums'],'classification':'single_role_strong'})
+    fusion={'regions':[{'region_id':'r','chart_start':0.0,'chart_end':16.0,
+        'controls':controls,'acquisition_root':{'validated':True}}]}
+    measures=[{'playback_measure_number':i+1,'start_time':i*4.0,'end_time':(i+1)*4.0}
+              for i in range(5)]
+    report=msf.build_fused_production_phase_diagnostics(fusion,measures)
+    edge=report['regions'][0]['edges'][1]
+    assert edge['beat_sized_phase_change'] is False
+    assert edge['persistence']=='persistent_offset_state'
+    assert report['regions'][0]['cumulative_offset_trend']['seconds']==pytest.approx(.5)
+    assert report['opening']['status']=='rooted'
+    assert report['selection_behavior_changed'] is False
+
+
+def test_v166a1_materialization_accounts_for_gap_and_terminal_offset():
+    fusion={'production_phase_diagnostics':{'opening':{'status':'unrooted_opening'},
+        'terminal':{'chart_terminal_time':30.0},'regions':[],'review_points':[]}}
+    applied=[{'region_id':'a','chart_start':5.0,'chart_end':10.0,
+              'controls':[{'score_time':5.0,'audio_time':5.2},{'score_time':10.0,'audio_time':10.4}]},
+             {'region_id':'b','chart_start':15.0,'chart_end':20.0,
+              'controls':[{'score_time':15.0,'audio_time':15.8},{'score_time':20.0,'audio_time':20.8}]}]
+    transitions=[{'from_region':'a','to_region':'b','chart_start':10.0,'chart_end':15.0,
+                  'start_offset_seconds':.4,'end_offset_seconds':.8,'accepted':True}]
+    report=msf.build_materialization_phase_diagnostics(fusion,applied,[],transitions)
+    assert report['opening']['unrooted_leading_span_seconds']==pytest.approx(5.0)
+    assert report['terminal']['final_carried_offset_seconds']==pytest.approx(.8)
+    assert report['unsupported_gap_phase_accounting'][0]['offset_change_seconds']==pytest.approx(.4)
+    assert report['review_points'][0]['kind']=='unsupported_gap_phase_change'

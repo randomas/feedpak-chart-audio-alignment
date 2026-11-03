@@ -7,7 +7,7 @@ The pipeline extracts playable arrangements, analyzes vocals, aligns Guitar Pro 
 
 ## Current development baseline
 
-The listening-validated reference is Git tag `v15.0-dsmn-perfect`. It produced a perfect alignment on *Don't Stop Me Now*, including the previously unstable piano material around 30 seconds. Current v16 development adds v15.1 hybrid stretch-or-delta geometry and exact Phase-1 search acceleration while preserving the exhaustive search grid and scoring.
+The listening-validated reference remains Git tag `v15.0-dsmn-perfect`. The current integrated development baseline is **v16.6E.3 final phase-diagnostic cleanup**. It includes v15.1 hybrid geometry, exact Phase-1 and Phase-2B caching/instrumentation, expected-role solo authority, three-clock incipit acquisition, and mode-aware recovery that splits fused regions at production-policy failures instead of rejecting the entire region.
 
 The current MIDI-section production interface is:
 

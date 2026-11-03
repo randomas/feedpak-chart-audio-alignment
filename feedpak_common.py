@@ -298,7 +298,14 @@ def file_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
-def write_json(path, data, indent=2):
+def write_json(path, data, indent=2, replace_attempts=8, replace_delay_seconds=0.08):
+    """Atomically write JSON, tolerating short-lived Windows file locks.
+
+    Antivirus, indexers, preview handlers, and recently closed readers can hold
+    the destination briefly on Windows.  Keep the atomic replace semantics, but
+    retry PermissionError with bounded exponential backoff.  Other errors are
+    raised immediately.
+    """
     path = os.fspath(path)
     temporary = path + ".tmp"
     with open(temporary, "w", encoding="utf-8", newline="\n") as f:
@@ -306,7 +313,15 @@ def write_json(path, data, indent=2):
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
-    os.replace(temporary, path)
+    attempts = max(1, int(replace_attempts))
+    for attempt in range(attempts):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(float(replace_delay_seconds) * (2 ** min(attempt, 4)))
 
 
 def omit_if_negligible(d, key, value, threshold=0.05):

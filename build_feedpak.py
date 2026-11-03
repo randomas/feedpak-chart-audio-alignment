@@ -34,6 +34,7 @@ import re
 import subprocess
 import sys
 import zipfile
+import time
 
 import yaml
 
@@ -42,6 +43,7 @@ import process_gp_alignment as pga
 import project_config as pc
 import alphatab_score as ats
 import variant_materialization as vm
+import pipeline_cache as plc
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_EXTENSIONS = (".ogg", ".wav", ".flac")
@@ -282,24 +284,63 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     fc.log(f"Four beats at {bpm:.0f} BPM require {count_in_seconds:.3f}s -> "
            f"adding only missing difference {pad_seconds:.3f}s", indent=1)
 
-    padded_paths = {}
+    cache_started=time.perf_counter()
+    source_rows=[]; planned=[]
     for stem in stems:
-        src = os.path.join(song_folder, os.path.basename(stem["file"]))
-        src_basename = os.path.basename(stem["file"])
+        src=os.path.join(song_folder,os.path.basename(stem["file"]))
+        src_basename=os.path.basename(stem["file"])
+        source_rows.append({"id":stem["id"],"source":plc.file_identity(src)})
+        planned.append((stem,src,src_basename))
+    cache_payload={"cache_kind":"prepared_stems","implementation_version":3,
+        "sources":source_rows,"padding_added":float(pad_seconds),
+        "audio_content_start":float(leading_silence)+float(pad_seconds),
+        "count_in_seconds":float(count_in_seconds),"bpm":float(bpm),
+        "minimum_pad_epsilon":float(min_pad_epsilon)}
+    fingerprint=plc.canonical_hash(cache_payload)
+    manifest_path=os.path.join(work_dir,"cache","prepared_stems","manifest.json")
+    cached,cache_status=plc.cache_lookup(manifest_path,fingerprint)
+    padded_paths={}
+    cached_artifacts=(cached or {}).get("artifacts") or []
+    artifact_by_id={str(x.get("id")):x for x in cached_artifacts}
+    if cached:
+        required=[]
+        for stem,src,src_basename in planned:
+            artifact=artifact_by_id.get(str(stem["id"])) or {}
+            output_basename=artifact.get("file")
+            if not output_basename:
+                cache_status="cached_artifact_missing";cached=None;break
+            required.append(os.path.join(stems_out_dir,output_basename))
+        if cached and any(not os.path.isfile(x) for x in required):
+            cache_status="cached_artifact_missing";cached=None
+    if cached:
+        for stem,src,src_basename in planned:
+            output_basename=artifact_by_id[str(stem["id"])]["file"]
+            dst=os.path.join(stems_out_dir,output_basename)
+            if pad_seconds:stem["file"]=fc.to_posix_relpath("stems",output_basename)
+            padded_paths[stem["id"]]=dst
+        cache_report={"status":cache_status,"fingerprint":fingerprint,
+            "seconds":time.perf_counter()-cache_started,"artifact_count":len(required)}
+        fc.log(f"Prepared-stem cache: {cache_status}; reused {len(required)} artifact(s)",indent=1)
+    else:
+      artifacts=[]
+      for stem,src,src_basename in planned:
         if pad_seconds:
-            # Pad to WAV first (safe, no crash risk — see
-            # pad_audio_with_silence()'s docstring), then immediately
-            # compress that WAV before it's eligible for packaging.
-            wav_basename = os.path.splitext(src_basename)[0] + ".wav"
-            wav_path = os.path.join(stems_out_dir, wav_basename)
-            fc.pad_audio_with_silence(src, wav_path, pad_seconds)
-            dst = compress_padded_stem(wav_path, stems_out_dir)
-            stem["file"] = fc.to_posix_relpath("stems", os.path.basename(dst))
+            wav_basename=os.path.splitext(src_basename)[0]+".wav"
+            wav_path=os.path.join(stems_out_dir,wav_basename)
+            fc.pad_audio_with_silence(src,wav_path,pad_seconds)
+            dst=compress_padded_stem(wav_path,stems_out_dir)
+            stem["file"]=fc.to_posix_relpath("stems",os.path.basename(dst))
         else:
             import shutil
-            dst = os.path.join(stems_out_dir, src_basename)
-            shutil.copyfile(src, dst)
-        padded_paths[stem["id"]] = dst
+            dst=os.path.join(stems_out_dir,src_basename)
+            shutil.copyfile(src,dst)
+        padded_paths[stem["id"]]=dst
+        artifacts.append({"id":stem["id"],"file":os.path.basename(dst),"size":os.path.getsize(dst)})
+      plc.atomic_write_json(manifest_path,{"schema_version":plc.CACHE_SCHEMA,
+          "fingerprint":fingerprint,"payload":cache_payload,"artifacts":artifacts})
+      cache_report={"status":cache_status,"fingerprint":fingerprint,
+          "seconds":time.perf_counter()-cache_started,"artifact_count":len(artifacts)}
+      fc.log(f"Prepared-stem cache: {cache_status}; rebuilt {len(artifacts)} artifact(s)",indent=1)
 
     # The offset Script 2 needs is simply "how much silence precedes the
     # real content after padding" — max(existing, count_in_seconds)
@@ -310,7 +351,7 @@ def prepare_stems_with_count_in(song_folder, stems, gp_path, work_dir,
     # real content actually starts, not stay at zero).
     audio_content_start = float(leading_silence) + float(pad_seconds)
     fc.log(f"Post-padding audio content start: {audio_content_start:.3f}s; chart offset will be derived from the first configured instrumental score onset", indent=1)
-    return audio_content_start, pad_seconds, stems_out_dir, padded_paths
+    return audio_content_start, pad_seconds, stems_out_dir, padded_paths, cache_report
 
 
 # --------------------------------------------------------------------------
@@ -827,6 +868,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
+    total_started=time.perf_counter(); pipeline_performance={}
+    stage_started=time.perf_counter()
     total_steps=7
     fc.log(f"Building feedpak from: {song_folder}")
     gp_path=find_gp_file(song_folder,gp_parser); metadata_path=song_json_path or os.path.join(song_folder,"metadata.json")
@@ -873,11 +916,15 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
 
     work_dir = os.path.join(song_folder, "_feedpak_build")
     os.makedirs(os.path.join(work_dir, "arrangements"), exist_ok=True)
+    pipeline_performance["inspection_and_discovery_seconds"]=time.perf_counter()-stage_started
 
+    stage_started=time.perf_counter()
     fc.log_step(2, total_steps, "Count-in check (padding stems if needed)")
-    count_in_offset, padding_added, stems_dir, padded_paths = prepare_stems_with_count_in(
+    count_in_offset, padding_added, stems_dir, padded_paths, prepared_stem_cache = prepare_stems_with_count_in(
         song_folder, stems, gp_path, work_dir,
         initial_bpm=((alpha_data.get("metadata") or {}).get("tempo") if gp_parser=="alphatab" and gp_path else None))
+    pipeline_performance["prepared_stems_seconds"]=time.perf_counter()-stage_started
+    pipeline_performance["prepared_stem_cache"]=prepared_stem_cache
     # From here on, use the padded copies for everything — DTW reference,
     # vocal processing input, and duration probing all need to see the
     # same audio that ends up in the archive.
@@ -901,6 +948,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     duration = probe_duration_seconds(duration_source)
     fc.log(f"Duration: {duration}s (probed from padded {os.path.basename(duration_source)})", indent=1)
 
+    stage_started=time.perf_counter()
     fc.log_step(3, total_steps, "Vocal processing (Script 1)")
     vocal_pitch_file=vocal_pitch_contour_file=lyrics_file=None
     lyric_tracks=[]
@@ -929,6 +977,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     elif not gp_vocal_production and not vocals_path:
         fc.log(f"WARNING: No stem matching '{vocals_stem_name}' found; reliable vocals omitted.", indent=1)
 
+    pipeline_performance["vocal_processing_seconds"]=time.perf_counter()-stage_started
+    stage_started=time.perf_counter()
     fc.log_step(4, total_steps, "GP parsing + DTW alignment (Script 2)")
     arrangements = []
     drum_tab_file=keys_file=song_timeline_file=None
@@ -999,6 +1049,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     elif not (drums_path or bass_path or piano_path or guitar_path):
         fc.log("No configured instrumental alignment stem found; skipping GP alignment.",indent=1)
 
+    pipeline_performance["gp_alignment_and_arrangement_seconds"]=time.perf_counter()-stage_started
+    stage_started=time.perf_counter()
     fc.log_step(5, total_steps, "Building manifest.yaml")
     cover_file = next(
         (f for f in os.listdir(song_folder)
@@ -1020,11 +1072,15 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     validate_manifest_paths(manifest)
     fc.log(f"Manifest validated: {manifest['title']} — {manifest['artist']}", indent=1)
 
+    pipeline_performance["manifest_seconds"]=time.perf_counter()-stage_started
+    stage_started=time.perf_counter()
     fc.log_step(6, total_steps, "Packaging .feedpak")
     os.makedirs(output_folder, exist_ok=True)
     safe_name = f"{manifest['artist']} - {manifest['title']}{package_name_suffix}.feedpak".replace("/", "_")
     output_path = os.path.join(output_folder, safe_name)
     package_feedpak(work_dir,manifest,output_path)
+    pipeline_performance["packaging_seconds"]=time.perf_counter()-stage_started
+    stage_started=time.perf_counter()
     if phase3d_variants and alignment_proposals_report:
         import phase3d_materialization as p3d
         fc.log("Materializing Phase 3D variants from the completed analysis pass")
@@ -1088,6 +1144,12 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         expression_report_path=output_path+".expression_report.json"
         fc.write_json(expression_report_path,expression_report)
         fc.log(f"Wrote expression report: {expression_report_path}",indent=1)
+    pipeline_performance["report_writing_seconds"]=time.perf_counter()-stage_started
+    pipeline_performance["total_build_seconds"]=time.perf_counter()-total_started
+    pipeline_performance["schema_version"]=1
+    performance_path=output_path+".pipeline_performance.json"
+    fc.write_json(performance_path,pipeline_performance)
+    fc.log(f"Wrote pipeline performance report: {performance_path}",indent=1)
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     fc.log(f"Wrote {output_path} ({size_mb:.1f} MB)", indent=1)
 

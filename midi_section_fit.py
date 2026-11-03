@@ -18,6 +18,11 @@ import json
 import os
 import tempfile
 import solo_role_authority as sra
+import incipit_three_clock as itc
+import structural_repeat_diagnostics as srd
+import section_evidence_quality as seq
+import rooted_phrase_support as rps
+import phase_migration_qualification as pmq
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
@@ -406,6 +411,127 @@ def search_section_candidates(window: MeasureWindow, midi_events, baseline=None,
     return distinct
 
 
+def _phase_distinctiveness(candidate_rows: Sequence[SectionCandidate]):
+    """Return diagnostic-only temporal-occurrence competition for one window.
+
+    Candidate rows are already clustered into distinct MIDI occurrences by the
+    exhaustive search. These annotations do not change sorting, selection, or
+    authority in v16.6A.
+    """
+    rows=list(candidate_rows)
+    diagnostics=[]
+    near_margin=0.04
+    near_ratio=1.04
+    for rank,candidate in enumerate(rows,1):
+        alternatives=[x for x in rows if x is not candidate]
+        runner=max(alternatives,key=lambda x:x.combined_score) if alternatives else None
+        score=float(candidate.combined_score)
+        runner_score=float(runner.combined_score) if runner is not None else None
+        margin=None if runner is None else score-runner_score
+        ratio=None if runner is None or runner_score<=0 else score/runner_score
+        midpoint=(float(candidate.midi_start)+float(candidate.midi_end))/2
+        runner_midpoint=None if runner is None else (float(runner.midi_start)+float(runner.midi_end))/2
+        separation=None if runner_midpoint is None else abs(midpoint-runner_midpoint)
+        near_equivalent=sum(1 for other in alternatives
+            if score-float(other.combined_score)<=near_margin or
+               (float(other.combined_score)>0 and score/float(other.combined_score)<=near_ratio))
+        if runner is None:classification="unique_only_occurrence"
+        elif rank==1 and margin is not None and margin>=0.08 and ratio is not None and ratio>=1.08:
+            classification="dominant"
+        elif rank==1:classification="ambiguous_best"
+        else:classification="alternative_occurrence"
+        diagnostics.append({"occurrence_rank":rank,"selected_score":score,
+            "runner_up_score":runner_score,"score_margin":margin,"score_ratio":ratio,
+            "runner_up_temporal_separation_seconds":separation,
+            "near_equivalent_occurrence_count":near_equivalent,
+            "distinct_temporal_occurrence_count":len(rows),
+            "phase_distinctiveness":classification})
+    return diagnostics
+
+
+def annotate_candidate_phase_diagnostics(candidate_report: Mapping[str,Any]):
+    """Add v16.6A diagnostics without changing candidate values or ordering."""
+    annotated=0;ambiguous=0;multiple=0
+    for role_report in (candidate_report.get("roles") or {}).values():
+        for row in role_report.get("windows") or []:
+            candidates=row.get("candidates") or []
+            objects=[x if isinstance(x,SectionCandidate) else _candidate_from_dict(x) for x in candidates]
+            diagnostics=_phase_distinctiveness(objects)
+            serialized=[]
+            for candidate,diagnostic in zip(candidates,diagnostics):
+                item=asdict(candidate) if isinstance(candidate,SectionCandidate) else dict(candidate)
+                item["phase_diagnostics"]=diagnostic
+                serialized.append(item)
+                annotated+=1
+                if diagnostic["phase_distinctiveness"]=="ambiguous_best":ambiguous+=1
+            row["candidates"]=serialized
+            if len(serialized)>1:multiple+=1
+            row["phase_diagnostics"]={"candidate_count":len(serialized),
+                "distinct_temporal_occurrence_count":len(serialized),
+                "best_phase_distinctiveness":diagnostics[0]["phase_distinctiveness"] if diagnostics else "unavailable",
+                "best_score_margin":diagnostics[0]["score_margin"] if diagnostics else None,
+                "best_score_ratio":diagnostics[0]["score_ratio"] if diagnostics else None,
+                "near_equivalent_occurrence_count":diagnostics[0]["near_equivalent_occurrence_count"] if diagnostics else 0}
+    candidate_report["phase_diagnostics_summary"]={"version":"v16.6A-diagnostic-only",
+        "candidate_count":annotated,"windows_with_multiple_occurrences":multiple,
+        "ambiguous_best_window_count":ambiguous,"selection_behavior_changed":False}
+    return candidate_report
+
+
+def _window_timing_lookup(candidate_report):
+    lookup={}
+    for role_report in (candidate_report.get("roles") or {}).values():
+        for row in role_report.get("windows") or []:
+            window=row.get("window") or {}
+            if window.get("window_id"):
+                count=max(1,len(window.get("playback_measure_numbers") or []))
+                duration=float(window.get("nominal_duration") or
+                    (float(window.get("nominal_end",0))-float(window.get("nominal_start",0))))
+                measure=duration/count if duration>0 else None
+                lookup[window["window_id"]]={"estimated_measure_duration_seconds":measure,
+                    "estimated_beat_duration_seconds":measure/4 if measure else None}
+    return lookup
+
+
+def build_selected_phase_diagnostics(path_report: Mapping[str,Any],candidate_report: Mapping[str,Any]):
+    """Describe offset jumps and cumulative drift in selected paths only."""
+    lookup=_window_timing_lookup(candidate_report);roles={};jump_count=0;beat_like=0;measure_like=0
+    for role,report in (path_report.get("roles") or {}).items():
+        streak_rows=[]
+        for streak in report.get("streaks") or []:
+            candidates=streak.get("candidates") or []
+            transitions=[]
+            for previous,current in zip(candidates,candidates[1:]):
+                previous_offset=float(previous["midi_start"])-float(previous["chart_start"])
+                current_offset=float(current["midi_start"])-float(current["chart_start"])
+                jump=current_offset-previous_offset
+                timing=lookup.get(current.get("window_id"),{})
+                beat=timing.get("estimated_beat_duration_seconds");measure=timing.get("estimated_measure_duration_seconds")
+                beat_error=None if not beat else abs(abs(jump)-beat)
+                measure_error=None if not measure else abs(abs(jump)-measure)
+                beat_match=bool(beat and abs(jump)>=0.20 and beat_error<=max(0.08,beat*.18))
+                measure_match=bool(measure and abs(jump)>=0.40 and measure_error<=max(0.12,measure*.15))
+                jump_count+=1;beat_like+=int(beat_match);measure_like+=int(measure_match)
+                transitions.append({"from_window_id":previous.get("window_id"),"to_window_id":current.get("window_id"),
+                    "chart_time":float(current["chart_start"]),"previous_start_offset_seconds":previous_offset,
+                    "current_start_offset_seconds":current_offset,"offset_jump_seconds":jump,
+                    "estimated_beat_duration_seconds":beat,"estimated_measure_duration_seconds":measure,
+                    "beat_sized_phase_jump":beat_match,"measure_sized_phase_jump":measure_match,
+                    "diagnostic_only":True})
+            if candidates:
+                entry=float(candidates[0]["midi_start"])-float(candidates[0]["chart_start"])
+                exit_=float(candidates[-1]["midi_end"])-float(candidates[-1]["chart_end"])
+            else:entry=exit_=None
+            streak_rows.append({"streak_id":streak.get("streak_id"),"chart_start":streak.get("chart_start"),
+                "chart_end":streak.get("chart_end"),"entry_offset_seconds":entry,"exit_offset_seconds":exit_,
+                "cumulative_offset_trend_seconds":None if entry is None else exit_-entry,
+                "transition_count":len(transitions),"transitions":transitions})
+        roles[role]={"streak_count":len(streak_rows),"streaks":streak_rows}
+    return {"version":"v16.6A-diagnostic-only","selection_behavior_changed":False,
+        "transition_count":jump_count,"beat_sized_phase_jump_count":beat_like,
+        "measure_sized_phase_jump_count":measure_like,"roles":roles}
+
+
 def build_section_candidate_report(
     playback_measures: Sequence[Mapping[str, Any]],
     chart_events_by_role: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -457,9 +583,10 @@ def build_section_candidate_report(
     global_perf["candidate_search_seconds"]=time.perf_counter()-started
     global_perf["cache_hit_rate"]=(global_perf["alignment_cache_hits"]/
         max(1,global_perf["alignment_cache_hits"]+global_perf["dp_evaluations"]))
-    return {"version":"1.1-exact-optimized","method":"midi-section-fit","diagnostic_only":True,
+    report={"version":"1.2-v16.6A-phase-diagnostics","method":"midi-section-fit","diagnostic_only":True,
         "timing_changes_applied":False,"monotonic_path_selected":False,"config":asdict(cfg),
         "search_hypotheses":list(hypotheses),"summary":totals,"performance":global_perf,"roles":role_reports}
+    return annotate_candidate_phase_diagnostics(report)
 
 
 # ---------------------------------------------------------------------------
@@ -1224,106 +1351,178 @@ def _classify_catch_up(first: Mapping[str,Any], second: Mapping[str,Any]):
     return "baseline_return_catch_up"
 
 
+def _materialization_edge_assessments(region, policy):
+    """Assess every internal control edge under the selected production policy."""
+    controls=region.get("controls") or []
+    _,quality=_region_evidence_tier(region,policy)
+    assessments=[]
+    for index,(a,b) in enumerate(zip(controls,controls[1:])):
+        ds=float(b["score_time"])-float(a["score_time"])
+        da=float(b["audio_time"])-float(a["audio_time"])
+        assessment=_geometry_acceptance(ds,da,policy)
+        episodes=quality.get("catch_up_episodes") or []
+        belongs=any(int(ep["first_edge_index"])<=index<=int(ep["last_edge_index"]) for ep in episodes)
+        measures=int(quality.get("supported_playback_measure_count") or 1)
+        allowance=min(float(policy["episode_delta_max_seconds"]),
+            float(policy["short_delta_seconds"])+max(0,measures-int(policy["episode_growth_start_measures"]))*float(policy["episode_delta_growth_per_measure"]))
+        episode_pass=(not assessment["accepted"] and belongs and ds<=policy["short_duration_seconds"] and
+            allowance>=float(assessment.get("absolute_correction_seconds") or 1e9) and
+            policy["episode_stretch_min"]<=float(assessment.get("stretch") or 0)<=policy["episode_stretch_max"])
+        if episode_pass:
+            assessment["accepted"]=True
+            assessment["acceptance_basis"]="length_adjusted_episode_delta_exception"
+        assessment.update({"edge_belongs_to_catch_up_episode":belongs,
+            "episode_delta_allowance_seconds":allowance,
+            "region_supported_playback_measure_count":measures,
+            "episode_stretch_min":policy["episode_stretch_min"],"episode_stretch_max":policy["episode_stretch_max"],
+            "edge_index":index,"chart_start":float(a["score_time"]),"chart_end":float(b["score_time"])})
+        assessments.append(assessment)
+    return assessments
+
+
+def _materialization_fragments(region, policy):
+    """Split one fused region at edges that the selected production mode rejects."""
+    controls=list(region.get("controls") or [])
+    assessments=_materialization_edge_assessments(region,policy)
+    failed={int(x["edge_index"]):x for x in assessments if not x["accepted"]}
+    if not failed:
+        complete=dict(region,edge_assessments=assessments,source_region_id=region.get("region_id"),
+                      fragment_index=0,fragment_count=1,materialization_recovered=False)
+        if controls:
+            complete.setdefault("chart_start",float(controls[0]["score_time"]))
+            complete.setdefault("chart_end",float(controls[-1]["score_time"]))
+            complete.setdefault("midi_start",float(controls[0]["audio_time"]))
+            complete.setdefault("midi_end",float(controls[-1]["audio_time"]))
+        complete.setdefault("control_count",len(controls))
+        return [complete],[]
+    spans=[];begin=0
+    for edge_index in sorted(failed):
+        spans.append((begin,edge_index+1))
+        begin=edge_index+1
+    spans.append((begin,len(controls)))
+    fragments=[];discarded=[]
+    source_id=region.get("region_id")
+    valid_spans=[span for span in spans if span[1]-span[0]>=2]
+    for fragment_index,(a,b) in enumerate(valid_spans):
+        part=controls[a:b]
+        fragment=dict(region)
+        fragment.update({"region_id":f"{source_id}-materialized-{fragment_index+1}",
+            "source_region_id":source_id,"fragment_index":fragment_index,
+            "fragment_count":len(valid_spans),"materialization_recovered":True,
+            "controls":part,"chart_start":float(part[0]["score_time"]),"chart_end":float(part[-1]["score_time"]),
+            "midi_start":float(part[0]["audio_time"]),"midi_end":float(part[-1]["audio_time"]),
+            "control_count":len(part),
+            "strong_control_count":sum(x.get("classification")!="single_role_provisional" for x in part),
+            "monotonic":all(float(y["score_time"])>float(x["score_time"]) and float(y["audio_time"])>float(x["audio_time"])
+                            for x,y in zip(part,part[1:])),
+            "edge_assessments":[dict(x,edge_index=int(x["edge_index"])-a) for x in assessments[a:max(a,b-1)]],
+            "split_failed_edge_before":failed.get(a-1),"split_failed_edge_after":failed.get(b-1)})
+        fragments.append(fragment)
+    for a,b in spans:
+        if b-a<2:
+            adjacent=[failed.get(a-1),failed.get(b-1)]
+            catastrophic=any(x and x.get("acceptance_basis")=="catastrophic_non_positive_geometry" for x in adjacent)
+            discarded.append({"region_id":source_id,"reason":"materialization_fragment_too_short",
+                "control_count":b-a,"chart_start":float(controls[a]["score_time"]) if b>a else None,
+                "chart_end":float(controls[b-1]["score_time"]) if b>a else None,
+                "severity":"catastrophic" if catastrophic else "tier_1_close"})
+    return fragments,discarded
+
+
 def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: Callable[[float],float],
                                     mode: str="conservative"):
-    """Materialize MIDI regions by evidence tier and transition warp, never raw delta.
+    """Materialize policy-safe fragments while preserving evidence around bad edges.
 
-    Unsupported spans retain the baseline's local shape. Before the first and
-    after the last region, the nearest trusted displacement is carried. Between
-    regions, displacement is interpolated only when the resulting transition
-    stretch is permitted by the selected mode.
+    Unsupported spans retain the baseline's local shape. A fused region is first
+    subdivided at edges rejected by the selected materialization mode. Later
+    fragments are reconsidered independently and may trim leading controls until
+    a safe baseline-shaped handoff is available; no failed edge is represented as
+    MIDI-validated timing.
     """
     materialization_started=time.perf_counter()
     if mode not in MATERIALIZATION_MODES:
         raise ValueError(f"invalid MIDI section materialization mode: {mode}")
-    policy=MATERIALIZATION_MODES[mode]; eligible=[]; rejected=[]
+    policy=MATERIALIZATION_MODES[mode];eligible=[];rejected=[];split_edges=[]
     baseline,baseline_sanity=sra.safe_materialization_baseline(fusion_report,baseline)
     if not baseline_sanity.get("valid"):
         return baseline,{"status":"materialization_blocked","mode":mode,"reason":baseline_sanity.get("blocked_reason"),"baseline_sanity":baseline_sanity,"applied_regions":[],"rejected_regions":[],"transitions":[],"timing_changes_applied":False,"global_monotonicity_validated":False,"materialization_seconds":time.perf_counter()-materialization_started}
-    for region in sorted(fusion_report.get("regions") or [],key=lambda x:float(x.get("chart_start",0))):
-        tier,quality=_region_evidence_tier(region,policy)
-        controls=region.get("controls") or []
-        chart_start=region.get("chart_start") if region.get("chart_start") is not None else (controls[0].get("score_time") if controls else None)
-        chart_end=region.get("chart_end") if region.get("chart_end") is not None else (controls[-1].get("score_time") if controls else None)
-        row={"region_id":region.get("region_id"),"evidence_tier":tier,"quality":quality,
-             "chart_start":chart_start,"chart_end":chart_end}
-        if tier not in policy["tiers"]:
-            rejected.append({**row,"reason":"evidence_tier_not_enabled","severity":"tier_1_close" if tier=="B" else "tier_2_high_risk"});continue
-        if len(controls)<2 or not region.get("monotonic",False):
-            rejected.append({**row,"reason":"structurally_invalid_region","severity":"catastrophic"});continue
-        edge_assessments=[]
-        for index,(a,b) in enumerate(zip(controls,controls[1:])):
-            ds=float(b["score_time"])-float(a["score_time"])
-            da=float(b["audio_time"])-float(a["audio_time"])
-            assessment=_geometry_acceptance(ds,da,policy)
-            episodes=quality.get("catch_up_episodes") or []
-            belongs=any(int(ep["first_edge_index"])<=index<=int(ep["last_edge_index"]) for ep in episodes)
-            measures=int(quality.get("supported_playback_measure_count") or 1)
-            allowance=min(float(policy["episode_delta_max_seconds"]),
-                float(policy["short_delta_seconds"])+max(0,measures-int(policy["episode_growth_start_measures"]))*float(policy["episode_delta_growth_per_measure"]))
-            episode_pass=(not assessment["accepted"] and belongs and ds<=policy["short_duration_seconds"] and
-                allowance>=float(assessment.get("absolute_correction_seconds") or 1e9) and
-                policy["episode_stretch_min"]<=float(assessment.get("stretch") or 0)<=policy["episode_stretch_max"])
-            if episode_pass:
-                assessment["accepted"]=True;assessment["acceptance_basis"]="length_adjusted_episode_delta_exception"
-            assessment.update({"edge_belongs_to_catch_up_episode":belongs,
-                "episode_delta_allowance_seconds":allowance,
-                "region_supported_playback_measure_count":measures,
-                "episode_stretch_min":policy["episode_stretch_min"],"episode_stretch_max":policy["episode_stretch_max"],
-                "edge_index":index,"chart_start":float(a["score_time"]),"chart_end":float(b["score_time"])})
-            edge_assessments.append(assessment)
-        catastrophic=next((x for x in edge_assessments if x["acceptance_basis"]=="catastrophic_non_positive_geometry"),None)
-        if catastrophic:
-            rejected.append({**row,"reason":"non_monotonic_region_controls","severity":"catastrophic",
-                "failed_edge":catastrophic});continue
-        failed=[x for x in edge_assessments if not x["accepted"]]
-        if failed:
-            worst=max(failed,key=lambda x:x.get("absolute_correction_seconds") or 0)
-            rejected.append({**row,"reason":"region_edge_geometry_out_of_policy",
-                "severity":"tier_1_close" if tier=="A" else "tier_2_high_risk",
-                "failed_edge":worst,"edge_assessments":edge_assessments});continue
-        catch_up_classifications=[]
-        for first,second in zip(edge_assessments,edge_assessments[1:]):
-            x=(first["stretch"] or 1)-1;y=(second["stretch"] or 1)-1
-            if x*y<0 and abs(x)>=.06 and abs(y)>=.06:
-                catch_up_classifications.append({"first_edge_index":first["edge_index"],
-                    "second_edge_index":second["edge_index"],"kind":_classify_catch_up(first,second)})
-        local_stretches=[x["stretch"] for x in edge_assessments]
-        eligible.append({**row,"controls":[dict(x) for x in controls],
-            "entry_offset_seconds":float(controls[0]["audio_time"])-float(baseline(float(controls[0]["score_time"]))),
-            "exit_offset_seconds":float(controls[-1]["audio_time"])-float(baseline(float(controls[-1]["score_time"]))),
-            "minimum_region_stretch":min(local_stretches),"maximum_region_stretch":max(local_stretches),
-            "edge_assessments":edge_assessments,
-            "catch_up_classifications":catch_up_classifications})
 
+    for source in sorted(fusion_report.get("regions") or [],key=lambda x:float(x.get("chart_start",0))):
+        controls=source.get("controls") or []
+        if len(controls)<2 or not source.get("monotonic",False):
+            tier,quality=_region_evidence_tier(source,policy)
+            rejected.append({"region_id":source.get("region_id"),"source_region_id":source.get("region_id"),
+                "evidence_tier":tier,"quality":quality,"chart_start":source.get("chart_start"),"chart_end":source.get("chart_end"),
+                "reason":"structurally_invalid_region","severity":"catastrophic"})
+            continue
+        fragments,discarded=_materialization_fragments(source,policy)
+        rejected.extend(discarded)
+        source_assessments=_materialization_edge_assessments(source,policy)
+        split_edges.extend({"source_region_id":source.get("region_id"),**x} for x in source_assessments if not x["accepted"])
+        for fragment in fragments:
+            tier,quality=_region_evidence_tier(fragment,policy)
+            row={**fragment,"evidence_tier":tier,"quality":quality}
+            if tier not in policy["tiers"]:
+                rejected.append({**row,"reason":"evidence_tier_not_enabled",
+                    "severity":"tier_1_close" if tier=="B" else "tier_2_high_risk"})
+                continue
+            row["entry_offset_seconds"]=float(row["controls"][0]["audio_time"])-float(baseline(row["chart_start"]))
+            row["exit_offset_seconds"]=float(row["controls"][-1]["audio_time"])-float(baseline(row["chart_end"]))
+            eligible.append(row)
+
+    eligible.sort(key=lambda x:float(x["chart_start"]))
     applied=[];transitions=[]
-    for region in eligible:
+    for original in eligible:
+        region=original
         if not applied:
             applied.append(region);continue
         previous=applied[-1]
-        gap_start=float(previous["chart_end"]);gap_end=float(region["chart_start"])
-        if gap_end<=gap_start:
-            rejected.append({**region,"reason":"overlapping_or_reversed_region","severity":"catastrophic"});continue
-        stretches=_transition_stretches(baseline,gap_start,gap_end,
-            float(previous["exit_offset_seconds"]),float(region["entry_offset_seconds"]))
-        minimum=min(stretches);maximum=max(stretches)
-        start_audio=float(baseline(gap_start))+float(previous["exit_offset_seconds"])
-        end_audio=float(baseline(gap_end))+float(region["entry_offset_seconds"])
-        geometry=_geometry_acceptance(gap_end-gap_start,end_audio-start_audio,policy)
-        valid=geometry["accepted"]
-        transition={"from_region":previous["region_id"],"to_region":region["region_id"],
-            "chart_start":gap_start,"chart_end":gap_end,"duration_seconds":gap_end-gap_start,
-            "start_offset_seconds":previous["exit_offset_seconds"],"end_offset_seconds":region["entry_offset_seconds"],
-            "minimum_stretch":minimum,"maximum_stretch":maximum,"mode":mode,
-            "classification":"baseline_shaped_offset_transition","midi_validated":False,
-            "accepted":valid,**geometry}
-        transitions.append(transition)
-        if not valid:
-            distance=max(policy["transition_min"]-minimum,maximum-policy["transition_max"],0)
-            severity="tier_1_close" if distance<=.05 else "tier_2_high_risk" if minimum>0 and maximum<=1.5 else "catastrophic"
-            rejected.append({**region,"reason":"transition_stretch_out_of_policy","severity":severity,
-                "required_minimum_stretch":minimum,"required_maximum_stretch":maximum});continue
-        applied.append(region)
+        accepted=False
+        # A split suffix may discard leading controls until it has enough runway
+        # for a safe baseline-shaped re-entry. This preserves later evidence
+        # without pretending that the failed edge itself is validated.
+        for trim in range(0,max(1,len(region["controls"])-1)):
+            if trim:
+                part=region["controls"][trim:]
+                if len(part)<2:break
+                candidate=dict(region)
+                candidate.update({"region_id":f"{original['region_id']}-trim{trim}","controls":part,
+                    "chart_start":float(part[0]["score_time"]),"chart_end":float(part[-1]["score_time"]),
+                    "midi_start":float(part[0]["audio_time"]),"midi_end":float(part[-1]["audio_time"]),
+                    "control_count":len(part),"trimmed_leading_control_count":trim,
+                    "strong_control_count":sum(x.get("classification")!="single_role_provisional" for x in part)})
+                tier,quality=_region_evidence_tier(candidate,policy)
+                if tier not in policy["tiers"]:continue
+                candidate.update(evidence_tier=tier,quality=quality,
+                    entry_offset_seconds=float(part[0]["audio_time"])-float(baseline(candidate["chart_start"])),
+                    exit_offset_seconds=float(part[-1]["audio_time"])-float(baseline(candidate["chart_end"])))
+                region=candidate
+            gap_start=float(previous["chart_end"]);gap_end=float(region["chart_start"])
+            if gap_end<=gap_start:
+                continue
+            stretches=_transition_stretches(baseline,gap_start,gap_end,
+                float(previous["exit_offset_seconds"]),float(region["entry_offset_seconds"]))
+            minimum=min(stretches);maximum=max(stretches)
+            start_audio=float(baseline(gap_start))+float(previous["exit_offset_seconds"])
+            end_audio=float(baseline(gap_end))+float(region["entry_offset_seconds"])
+            geometry=_geometry_acceptance(gap_end-gap_start,end_audio-start_audio,policy)
+            transition={"from_region":previous["region_id"],"to_region":region["region_id"],
+                "chart_start":gap_start,"chart_end":gap_end,"duration_seconds":gap_end-gap_start,
+                "start_offset_seconds":previous["exit_offset_seconds"],"end_offset_seconds":region["entry_offset_seconds"],
+                "minimum_stretch":minimum,"maximum_stretch":maximum,"mode":mode,
+                "classification":"baseline_shaped_offset_transition","midi_validated":False,
+                "accepted":geometry["accepted"],**geometry}
+            transitions.append(transition)
+            if geometry["accepted"]:
+                applied.append(region);accepted=True;break
+        if not accepted:
+            last=transitions[-1] if transitions else None
+            failed=dict(original)
+            failed.update(reason="transition_stretch_out_of_policy",severity="tier_2_high_risk")
+            if last:
+                failed.update(required_minimum_stretch=last.get("minimum_stretch"),
+                              required_maximum_stretch=last.get("maximum_stretch"))
+            rejected.append(failed)
 
     def interpolation(controls,t):
         for a,b in zip(controls,controls[1:]):
@@ -1353,20 +1552,24 @@ def build_section_materialized_warp(fusion_report: Mapping[str,Any], baseline: C
         controls=region["controls"]
         samples.extend(float(x["score_time"]) for x in controls)
         samples.extend((float(region["chart_start"])-.001,float(region["chart_end"])+.001))
-    samples=sorted(set(samples)); globally_monotonic=all(warp(b)>warp(a) for a,b in zip(samples,samples[1:]))
+    samples=sorted(set(samples));globally_monotonic=all(warp(b)>warp(a) for a,b in zip(samples,samples[1:]))
     if not globally_monotonic:
         return baseline,{"status":"materialization_blocked","mode":mode,"reason":"global_monotonicity_failure",
             "applied_regions":[],"rejected_regions":rejected,"transitions":transitions,
-            "timing_changes_applied":False,"global_monotonicity_validated":False,
-            "materialization_seconds":time.perf_counter()-materialization_started}
-    return warp,{"status":"available" if applied else "no_eligible_regions","mode":mode,
-        "authority":"midi_section_fit_materialization","timing_changes_applied":bool(applied),
-        "applied_regions":applied,"rejected_regions":rejected,"transitions":transitions,
+            "materialization_split_edges":split_edges,"timing_changes_applied":False,
+            "global_monotonicity_validated":False,"materialization_seconds":time.perf_counter()-materialization_started}
+    recovered=any(x.get("materialization_recovered") for x in applied)
+    status="available_recovered" if applied and recovered else "available" if applied else "no_eligible_regions"
+    return warp,{"status":status,"mode":mode,"authority":"midi_section_fit_materialization",
+        "timing_changes_applied":bool(applied),"applied_regions":applied,"rejected_regions":rejected,
+        "transitions":transitions,"materialization_split_edges":split_edges,
+        "materialization_recovery_applied":recovered,
         "unsupported_gap_policy":"baseline_shape_with_carried_or_interpolated_offset",
         "unsupported_gaps_midi_validated":False,"global_monotonicity_validated":True,
         "raw_endpoint_delta_used_as_rejection":False,
         "geometry_policy":{**dict(policy),"tiers":sorted(policy["tiers"])},
         "baseline_sanity":baseline_sanity,
+        "production_phase_diagnostics":build_materialization_phase_diagnostics(fusion_report,applied,rejected,transitions),
         "materialization_seconds":time.perf_counter()-materialization_started}
 
 
@@ -1461,6 +1664,167 @@ def _write_candidate_cache(path,fingerprint,payload,candidate_report):
         if os.path.exists(tmp):os.remove(tmp)
 
 
+def _phase_measure_at(measures, chart_time):
+    for row in measures:
+        if float(row["start"])<=float(chart_time)<=float(row["end"])+1e-9:
+            duration=float(row["end"])-float(row["start"])
+            beats=int(row.get("numerator") or row.get("time_signature_numerator") or 4)
+            return {"measure_duration_seconds":duration,
+                "beat_duration_seconds":duration/max(1,beats),"beat_count":beats,
+                "playback_measure_number":int(row.get("playback_measure_number") or 0)}
+    return {"measure_duration_seconds":None,"beat_duration_seconds":None,
+        "beat_count":None,"playback_measure_number":None}
+
+
+def _phase_units(seconds, timing):
+    beat=timing.get("beat_duration_seconds");measure=timing.get("measure_duration_seconds")
+    return {"seconds":seconds,"beats":None if not beat else seconds/beat,
+        "measures":None if not measure else seconds/measure}
+
+
+def _phase_persistence(offsets, index):
+    previous=offsets[index];current=offsets[index+1];delta=current-previous
+    following=offsets[index+2:index+4]
+    if not following:return "unresolved_end_of_region"
+    remains=sum(abs(x-current)<=abs(x-previous) for x in following)
+    returns=sum(abs(x-previous)<abs(x-current) for x in following)
+    if returns==len(following):return "temporary_correction"
+    if remains==len(following):return "persistent_offset_state"
+    if delta and all((x-current)*delta>=-.08 for x in following):return "gradual_cumulative_drift"
+    return "mixed_or_noisy"
+
+
+def build_fused_production_phase_diagnostics(fusion_report, playback_measures):
+    """Diagnostic-only production-control, region, opening, and terminal analysis."""
+    measures=[_normalise_measure(x,i) for i,x in enumerate(playback_measures)]
+    region_reports=[];review=[]
+    for region in fusion_report.get("regions") or []:
+        controls=region.get("controls") or []
+        offsets=[float(x["audio_time"])-float(x["score_time"]) for x in controls]
+        edges=[]
+        for index,(a,b) in enumerate(zip(controls,controls[1:])):
+            delta=offsets[index+1]-offsets[index]
+            timing=_phase_measure_at(measures,float(b["score_time"]));units=_phase_units(delta,timing)
+            beat_abs=abs(units["beats"]) if units["beats"] is not None else None
+            measure_abs=abs(units["measures"]) if units["measures"] is not None else None
+            beat_like=bool(beat_abs is not None and abs(beat_abs-1)<=.22)
+            measure_like=bool(measure_abs is not None and abs(measure_abs-1)<=.18)
+            persistence=_phase_persistence(offsets,index)
+            common_roles=sorted(set(a.get("roles") or []) & set(b.get("roles") or []))
+            row={"edge_index":index,"chart_start":float(a["score_time"]),
+                "chart_end":float(b["score_time"]),"previous_offset_seconds":offsets[index],
+                "current_offset_seconds":offsets[index+1],"offset_change":units,
+                **timing,"beat_sized_phase_change":beat_like,
+                "measure_sized_phase_change":measure_like,"persistence":persistence,
+                "roles_before":a.get("roles") or [],"roles_after":b.get("roles") or [],
+                "persistent_supporting_roles":common_roles,"diagnostic_only":True}
+            edges.append(row)
+            severity=0
+            if persistence=="persistent_offset_state":severity+=2
+            if persistence=="gradual_cumulative_drift":severity+=1
+            if beat_like:severity+=2
+            if measure_like:severity+=3
+            if severity>=2:
+                review.append({"kind":"persistent_phase_change" if persistence=="persistent_offset_state" else "phase_change",
+                    "severity_score":severity,"chart_time":float(b["score_time"]),
+                    "region_id":region.get("region_id"),"roles":sorted(set(row["roles_before"]+row["roles_after"])),
+                    "offset_change":units,"persistence":persistence,
+                    "reason":"production fused-control phase movement","diagnostic_only":True})
+        if controls:
+            entry=offsets[0];exit_=offsets[-1];trend=exit_-entry
+            timing=_phase_measure_at(measures,float(controls[-1]["score_time"]));trend_units=_phase_units(trend,timing)
+            maximum=max(abs(x-entry) for x in offsets)
+            returns=abs(exit_-entry)<=max(.12,maximum*.35) if maximum else True
+        else:
+            entry=exit_=maximum=None;trend_units=_phase_units(None,{"beat_duration_seconds":None,"measure_duration_seconds":None})
+            returns=False
+        region_row={"region_id":region.get("region_id"),"chart_start":region.get("chart_start"),
+            "chart_end":region.get("chart_end"),"control_count":len(controls),
+            "entry_offset_seconds":entry,"exit_offset_seconds":exit_,
+            "cumulative_offset_trend":trend_units,"maximum_departure_from_entry_seconds":maximum,
+            "returns_toward_entry_phase":returns,"edge_count":len(edges),"edges":edges,
+            "diagnostic_only":True}
+        region_reports.append(region_row)
+        beats=trend_units.get("beats")
+        if beats is not None and abs(beats)>=1.25 and not returns:
+            review.append({"kind":"gradual_region_drift","severity_score":min(5,1+int(abs(beats))),
+                "chart_start":region.get("chart_start"),"chart_end":region.get("chart_end"),
+                "region_id":region.get("region_id"),"cumulative_offset_trend":trend_units,
+                "reason":"region exits materially displaced from its entry phase","diagnostic_only":True})
+    first_onset=None
+    for region in fusion_report.get("regions") or []:
+        if region.get("controls"):
+            value=float(region["controls"][0]["score_time"])
+            first_onset=value if first_onset is None else min(first_onset,value)
+    root=next((x for x in fusion_report.get("regions") or []
+        if (x.get("acquisition_root") or {}).get("validated")),None)
+    opening={"first_fused_control_chart_time":first_onset,
+        "validated_acquisition_root":bool(root),
+        "acquisition_root_region_id":root.get("region_id") if root else None,
+        "status":"rooted" if root else "unrooted_opening","diagnostic_only":True}
+    if not root:
+        review.append({"kind":"unrooted_opening","severity_score":4,"chart_time":first_onset,
+            "reason":"no validated acquisition root precedes production-region authority","diagnostic_only":True})
+    terminal_chart=float(measures[-1]["end"]) if measures else None
+    last_control=None
+    for region in fusion_report.get("regions") or []:
+        for control in region.get("controls") or []:
+            if last_control is None or float(control["score_time"])>float(last_control["score_time"]):last_control=control
+    terminal={"chart_terminal_time":terminal_chart,
+        "last_fused_control_chart_time":float(last_control["score_time"]) if last_control else None,
+        "last_fused_control_offset_seconds":float(last_control["audio_time"])-float(last_control["score_time"]) if last_control else None,
+        "unsupported_terminal_tail_seconds":None if terminal_chart is None or last_control is None else terminal_chart-float(last_control["score_time"]),
+        "diagnostic_only":True}
+    review.sort(key=lambda x:(-int(x.get("severity_score",0)),float(x.get("chart_time",x.get("chart_start",1e18)) or 0)))
+    return {"version":"v16.6A.1-production-phase-diagnostics","selection_behavior_changed":False,
+        "opening":opening,"terminal":terminal,"regions":region_reports,
+        "review_points":review[:24]}
+
+
+def build_materialization_phase_diagnostics(fusion_report, applied, rejected, transitions):
+    source=(fusion_report.get("production_phase_diagnostics") or {})
+    region_lookup={x.get("region_id"):x for x in source.get("regions") or []}
+    fragments=[];review=[]
+    for region in applied:
+        controls=region.get("controls") or []
+        if not controls:continue
+        entry=float(controls[0]["audio_time"])-float(controls[0]["score_time"])
+        exit_=float(controls[-1]["audio_time"])-float(controls[-1]["score_time"])
+        fragments.append({"region_id":region.get("region_id"),"source_region_id":region.get("source_region_id") or region.get("region_id"),
+            "chart_start":region.get("chart_start"),"chart_end":region.get("chart_end"),
+            "entry_offset_seconds":entry,"exit_offset_seconds":exit_,
+            "offset_trend_seconds":exit_-entry,"trimmed_leading_control_count":region.get("trimmed_leading_control_count",0),
+            "diagnostic_only":True})
+    gap_rows=[]
+    for transition in transitions:
+        start=float(transition.get("start_offset_seconds") or 0);end=float(transition.get("end_offset_seconds") or 0)
+        change=end-start
+        row={"from_region":transition.get("from_region"),"to_region":transition.get("to_region"),
+            "chart_start":transition.get("chart_start"),"chart_end":transition.get("chart_end"),
+            "start_offset_seconds":start,"end_offset_seconds":end,"offset_change_seconds":change,
+            "accepted":transition.get("accepted"),"midi_validated":False,"diagnostic_only":True}
+        gap_rows.append(row)
+        if abs(change)>=.35:
+            review.append({"kind":"unsupported_gap_phase_change","severity_score":3,
+                "chart_start":row["chart_start"],"chart_end":row["chart_end"],
+                "offset_change_seconds":change,"reason":"baseline-shaped gap changes carried phase",
+                "diagnostic_only":True})
+    terminal=dict(source.get("terminal") or {})
+    if fragments:
+        terminal["final_applied_region_id"]=fragments[-1]["region_id"]
+        terminal["final_carried_offset_seconds"]=fragments[-1]["exit_offset_seconds"]
+    opening=dict(source.get("opening") or {})
+    opening["first_applied_region_chart_time"]=fragments[0]["chart_start"] if fragments else None
+    if opening.get("status")=="unrooted_opening" and fragments:
+        opening["unrooted_leading_span_seconds"]=float(fragments[0]["chart_start"] or 0)
+    inherited=list(source.get("review_points") or [])
+    combined=sorted(inherited+review,key=lambda x:(-int(x.get("severity_score",0)),float(x.get("chart_time",x.get("chart_start",1e18)) or 0)))
+    return {"version":"v16.6A.1-production-phase-diagnostics","selection_behavior_changed":False,
+        "opening":opening,"terminal":terminal,"applied_fragments":fragments,
+        "unsupported_gap_phase_accounting":gap_rows,
+        "rejected_region_count":len(rejected),"review_points":combined[:24]}
+
+
 def build_section_fusion_report(
     playback_measures: Sequence[Mapping[str, Any]],
     chart_events_by_role: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -1470,6 +1834,7 @@ def build_section_fusion_report(
     path_config: SectionPathConfig | None = None,
     fusion_config: SectionFusionConfig | None = None,
     baseline_hypotheses: Mapping[str, Callable[[float], float]] | None = None,
+    role_audio_starts: Mapping[str, float] | None = None,
     candidate_cache_path: str | None = None,
     candidate_cache_rebuild: bool = False,
     candidate_cache_disabled: bool = False,
@@ -1489,26 +1854,64 @@ def build_section_fusion_report(
         if not candidate_cache_disabled and candidate_cache_path:
             _write_candidate_cache(candidate_cache_path,fingerprint,payload,candidate_report)
     candidate_seconds=time.perf_counter()-candidate_started
+    candidate_report=annotate_candidate_phase_diagnostics(candidate_report)
     path_started=time.perf_counter()
     path_report = select_monotonic_section_paths(candidate_report, path_config)
+    path_report["phase_diagnostics"]=build_selected_phase_diagnostics(path_report,candidate_report)
     path_seconds=time.perf_counter()-path_started
     fusion_started=time.perf_counter()
     fusion_report = fuse_monotonic_role_paths(path_report, fusion_config)
     sra.annotate_fusion_report(fusion_report,chart_events_by_role)
+    itc.reconcile_opening(fusion_report,chart_events_by_role,role_audio_starts or {})
     normalised_measures=[_normalise_measure(x,i) for i,x in enumerate(playback_measures)]
     for region in fusion_report.get("regions") or []:
         covered=[x for x in normalised_measures if float(x["start"])<float(region["chart_end"])+1e-9 and float(x["end"])>float(region["chart_start"])-1e-9]
         numbers=sorted({int(x["playback_measure_number"]) for x in covered})
         region["supported_playback_measure_count"]=len(numbers);region["playback_measure_numbers"]=numbers
         region["catch_up_episodes"]=_catch_up_episodes(region.get("catch_up_events") or [])
+    fusion_report["production_phase_diagnostics"]=build_fused_production_phase_diagnostics(fusion_report,normalised_measures)
+    structural_repeat_report=srd.build(playback_measures,chart_events_by_role,midi_events_by_role)
+    fusion_report["structural_repeat_diagnostics"]=structural_repeat_report
+    # v16.6D is a guarded second selection pass. Phrase evidence never creates
+    # timing controls and never removes candidates; it only rescales existing
+    # section candidates when an already validated opening root agrees with an
+    # exact, bounded phrase-ordinal run.
+    supported_candidate_report,phrase_authority=rps.apply(candidate_report,structural_repeat_report,fusion_report)
+    initial_summary={"region_count":len(fusion_report.get("regions") or []),
+                     "control_count":sum(len(x.get("controls") or []) for x in fusion_report.get("regions") or [])}
+    if phrase_authority.get("adjusted_candidate_count"):
+        candidate_report=supported_candidate_report
+        path_report=select_monotonic_section_paths(candidate_report,path_config)
+        path_report["phase_diagnostics"]=build_selected_phase_diagnostics(path_report,candidate_report)
+        fusion_report=fuse_monotonic_role_paths(path_report,fusion_config)
+        sra.annotate_fusion_report(fusion_report,chart_events_by_role)
+        itc.reconcile_opening(fusion_report,chart_events_by_role,role_audio_starts or {})
+        for region in fusion_report.get("regions") or []:
+            covered=[x for x in normalised_measures if float(x["start"])<float(region["chart_end"])+1e-9 and float(x["end"])>float(region["chart_start"])-1e-9]
+            numbers=sorted({int(x["playback_measure_number"]) for x in covered})
+            region["supported_playback_measure_count"]=len(numbers);region["playback_measure_numbers"]=numbers
+            region["catch_up_episodes"]=_catch_up_episodes(region.get("catch_up_events") or [])
+        fusion_report["production_phase_diagnostics"]=build_fused_production_phase_diagnostics(fusion_report,normalised_measures)
+        fusion_report["structural_repeat_diagnostics"]=structural_repeat_report
+    phrase_authority["initial_fusion_summary"]=initial_summary
+    phrase_authority["final_fusion_summary"]={"region_count":len(fusion_report.get("regions") or []),
+        "control_count":sum(len(x.get("controls") or []) for x in fusion_report.get("regions") or [])}
+    fusion_report["rooted_phrase_ordinal_support"]=phrase_authority
     fusion_seconds=time.perf_counter()-fusion_started
     performance={"candidate_generation_seconds":candidate_seconds,
         "candidate_cache":cache_report,
         "path_selection_seconds":path_seconds,"fusion_seconds":fusion_seconds,
         "total_section_fit_seconds":time.perf_counter()-total_started,
         "candidate_counters":candidate_report.get("performance") or {}}
-    return {"version": "1.1-step3-exact-optimized", "method": "midi-section-fit",
+    report={"version": "2.2-v16.6E.3-final-phase-diagnostic-cleanup", "method": "midi-section-fit",
             "diagnostic_only": True, "timing_changes_applied": False,
             "performance":performance,"candidate_report": candidate_report,
-            "path_report": path_report,"fusion_report": fusion_report}
+            "path_report": path_report,"fusion_report": fusion_report,
+            "structural_repeat_report":structural_repeat_report,
+            "rooted_phrase_ordinal_support":phrase_authority}
+    report["section_evidence_quality"]=seq.build(report)
+    fusion_report["section_evidence_quality"]=report["section_evidence_quality"]
+    report["phase_migration_qualification"]=pmq.build(fusion_report,normalised_measures,report["section_evidence_quality"])
+    fusion_report["phase_migration_qualification"]=report["phase_migration_qualification"]
+    return report
 
