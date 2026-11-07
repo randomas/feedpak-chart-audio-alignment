@@ -7,7 +7,7 @@ The pipeline extracts playable arrangements, analyzes vocals, aligns Guitar Pro 
 
 ## Current development baseline
 
-The listening-validated reference remains Git tag `v15.0-dsmn-perfect`. The current integrated development baseline is **v16.6E.3 final phase-diagnostic cleanup**. It includes v15.1 hybrid geometry, exact Phase-1 and Phase-2B caching/instrumentation, expected-role solo authority, three-clock incipit acquisition, and mode-aware recovery that splits fused regions at production-policy failures instead of rejecting the entire region.
+The listening-validated reference remains Git tag `v15.0-dsmn-perfect`. The current integrated functional baseline is **v16.6E.3 final phase-diagnostic cleanup**. The active v16.7 workstream is **v16.7R1**, a documentation-only audio-evidence reuse audit that restarts from v16.6E.3. Experimental v16.7A/A.1 threshold detectors are retained as research artifacts and are not part of the functional R-line implementation. It includes v15.1 hybrid geometry, exact Phase-1 and Phase-2B caching/instrumentation, expected-role solo authority, three-clock incipit acquisition, and mode-aware recovery that splits fused regions at production-policy failures instead of rejecting the entire region.
 
 The current MIDI-section production interface is:
 
@@ -22,7 +22,13 @@ Available materialization policies are `conservative`, `permissive`, and `diagno
 
 FeedPak consumes prepared assets. The future wizard will validate and use them, but it will not install or run stem separation or MIDI transcription tools.
 
-At minimum, provide the chart, song audio, and the stems needed by the selected alignment method. Stems may come from UVR, Moises, `audio-separator`, a DAW, or any other workflow. Optional role-specific performance MIDI may come from MuScriptor or another audio-to-MIDI system.
+At minimum, provide the chart, song audio, and the stems needed by the selected alignment method. Optional role-specific performance MIDI may come from MuScriptor or another audio-to-MIDI system.
+
+The current recommended separation baseline is **direct BS-RoFormer SW six-stem separation of the original full mix**. It produces nominal `bass`, `drums`, `other`, `vocals`, `guitar`, and `piano` outputs. In current tests on All That I Bleed and Caught in a Web, the direct six-stem result was more useful than the previous vocal-RoFormer followed by HTDemucs pipeline. The older sequential pipeline is retained only as a fallback or comparison when a documented direct-separation failure affects downstream MIR evidence.
+
+Stem separation remains an external preparation step. FeedPak does not install or run the separator. Preserve the recording clock: do not independently trim, pad, normalize, or time-shift model outputs. A model label is a hypothesis, not verified instrument identity: for example, `guitar` means candidate guitar evidence, while `other` may contain guitar, piano, keyboards, or separation leakage. Missing or ambiguous audio evidence is neutral and must not disauthorize reliable MIDI evidence.
+
+See [`BS_ROFORMER_SW_6STEM_SETUP.md`](BS_ROFORMER_SW_6STEM_SETUP.md) for the validated local command, directory layout, model references, environment policy, and output validation.
 
 Performance MIDI must be derived independently from the recording. MIDI exported from the Guitar Pro, MusicXML, Songsterr, or other chart being aligned is circular evidence and must not be used as chart-to-performance timing authority.
 
@@ -42,6 +48,12 @@ percussion.mid
 
 Legacy `Piano.muscriptor.mid`, `Guitar.muscriptor.mid`, `Bass.muscriptor.mid`, and `Drums.muscriptor.mid` filenames remain supported. Explicit project configuration takes precedence over automatic discovery. Missing MIDI roles are neutral rather than fatal.
 
+
+## v16.7R audio-evidence consolidation
+
+The v16.7 direction preserves performance MIDI as the primary dense timing source and uses only strict, sparse audio evidence to fill genuine MIDI blind spots. Missing or ambiguous audio evidence is neutral. The first stage is the documentation-only [`AUDIO_EVIDENCE_REUSE_AUDIT_V16_7R.md`](AUDIO_EVIDENCE_REUSE_AUDIT_V16_7R.md), which assigns ownership to existing opening, coverage, continuous-anchor, structural-search, source-quality, and MIDI diagnostic systems before any common schema or adapter code is added.
+
+The experimental v16.7A/A.1 global threshold inventory is not carried into this clean code line. Useful reporting ideas, including explicit clocks, provenance, limitations, and confidence-versus-authority, may be reintroduced through read-only adapters over existing algorithms.
 
 ## Phase 2b.1 and 2b.2: pipeline profiling and exact preparation caches
 
@@ -345,11 +357,11 @@ Install utilities:
 pip install jsonschema
 ```
 
-Optional upgrade command:
+Dependency policy:
 
-```powershell
-pip install --upgrade whisperx torchcrepe librosa scipy soundfile pyyaml pyphen pyguitarpro jsonschema numpy
-```
+> If it ain't broke, don't fix it.
+
+Do not broadly upgrade the working Python, PyTorch, CUDA, MIR, or audio stack merely to remove warnings. Perform dependency upgrades only as a separate, controlled task with the full unit suite, corpus run, and any required listening regressions. Do not install separator dependencies into a working FeedPak environment unless the exact combination has already been validated.
 
 ### 2.7 Verify CUDA
 
@@ -363,6 +375,54 @@ Expected output resembles:
 CUDA: True
 GPU: NVIDIA GeForce RTX 3060
 ```
+
+### 2.8 External BS-RoFormer SW six-stem preparation
+
+BS-RoFormer SW runs outside the FeedPak build. On the validated development machine it ran from the existing activated Audio Alignment environment through the cloned `Music-Source-Separation-Training` repository. This is a validated local configuration, not a requirement to modify another working installation. A separate environment is acceptable when the runner requirements are not already satisfied.
+
+The proven execution route is `python inference.py`, not `uvx`. MuScriptor may still be run through `uvx`; the two workflows remain independently versioned.
+
+From inside the cloned runner repository:
+
+```powershell
+python inference.py `
+  --model_type bs_roformer `
+  --config_path "..\models\bs_roformer_sw\bs_6stem_fixed.yaml" `
+  --start_check_point "..\models\bs_roformer_sw\bs_6stem_fixed.ckpt" `
+  --input_folder "..\audio\input" `
+  --store_dir "..\output\bs_roformer_sw" `
+  --flac_file
+```
+
+Expected model targets:
+
+```text
+bass
+ drums
+ other
+ vocals
+ guitar
+ piano
+```
+
+The runner should report `Using device: cuda:0` when GPU execution is active. Test-time augmentation is optional and should be treated as a comparison mode, not an automatic quality upgrade:
+
+```powershell
+python inference.py `
+  --model_type bs_roformer `
+  --config_path "..\models\bs_roformer_sw\bs_6stem_fixed.yaml" `
+  --start_check_point "..\models\bs_roformer_sw\bs_6stem_fixed.ckpt" `
+  --input_folder "..\audio\input" `
+  --store_dir "..\output\bs_roformer_sw_tta" `
+  --flac_file `
+  --use_tta
+```
+
+Retain non-TTA outputs until listening and downstream MIR diagnostics show that TTA is better. Do not overwrite the original mix or earlier separation results.
+
+After every run, verify sample rate, channel count, duration, start time, clipping, silent or malformed output, and approximate reconstruction. The apparent time translation observed during early testing was a Windows Media Player playback issue; Audacity confirmed that the generated audio remained correctly timed.
+
+Full setup notes and source links are in [`BS_ROFORMER_SW_6STEM_SETUP.md`](BS_ROFORMER_SW_6STEM_SETUP.md).
 
 ---
 
