@@ -33,7 +33,14 @@ param(
     [ValidateRange(0,10)] [int]$Phase3DStructuralCandidates = 1,
     [switch]$IncludeUnsafeContinuousComparison,
     [switch]$StructuralSecondPass,
-    [switch]$TranscriptionInvestigator
+    [switch]$TranscriptionInvestigator,
+    [switch]$MidiSectionFit,
+    [switch]$ForceMidiSectionFit,
+    [ValidateSet("conservative","permissive","diagnostic-unsafe")]
+    [string]$MidiSectionFitMaterialization,
+    [switch]$LightDiagnostics,
+    [switch]$KeepGoing,
+    [switch]$FourSongCorpus
 )
 
 Set-StrictMode -Version Latest
@@ -46,6 +53,15 @@ if (-not (Test-Path -LiteralPath $CorpusRunner -PathType Leaf)) {
 if ([string]::IsNullOrWhiteSpace($MaterialsRoot)) { $MaterialsRoot = $ProjectRoot }
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $MaterialsRoot "all_method_comparison_outputs"
+}
+if ($FourSongCorpus) {
+    $Only = @("my_test_song_2_gp","my_test_song_3_gp","my_test_song_3b_gp","my_test_song_7_gp")
+}
+if ($ForceMidiSectionFit -and [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization)) {
+    $MidiSectionFitMaterialization = "permissive"
+}
+if (-not [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization) -and -not $MidiSectionFit) {
+    throw "-MidiSectionFitMaterialization requires -MidiSectionFit"
 }
 $allowed = @(
     "nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear",
@@ -82,6 +98,8 @@ foreach ($method in $Methods) {
         Force = $Force
         Only = $Only
     }
+    if ($LightDiagnostics) { $params.LightDiagnostics = $true }
+    if ($KeepGoing) { $params.KeepGoing = $true }
     if ($IncludeVocals) {
         $params.IncludeVocals = $true
         # First method runs WhisperX/CREPE. Every later method reuses each song's
@@ -116,6 +134,17 @@ foreach ($method in $Methods) {
     elseif ($TranscriptionInvestigator) {
         Write-Host "Transcription investigator skipped for unsupported method: $method" -ForegroundColor DarkGray
     }
+    $midiEnabled = $transcriptionMethods -contains $method
+    if ($MidiSectionFit -and $midiEnabled) {
+        $params.MidiSectionFit = $true
+        if ($ForceMidiSectionFit) { $params.ForceMidiSectionFit = $true }
+        if (-not [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization)) {
+            $params.MidiSectionFitMaterialization = $MidiSectionFitMaterialization
+        }
+    }
+    elseif ($MidiSectionFit) {
+        Write-Host "MIDI section fit skipped for unsupported method: $method" -ForegroundColor DarkGray
+    }
     $started = Get-Date
     & $CorpusRunner @params
     $code = $LASTEXITCODE
@@ -124,6 +153,9 @@ foreach ($method in $Methods) {
         ExitCode = $code
         Seconds = [Math]::Round(((Get-Date) - $started).TotalSeconds, 1)
         Output = $methodOutput
+        Materials = ($Only -join ";")
+        MidiSectionFit = if ($MidiSectionFit -and $midiEnabled) { "enabled" } else { "unsupported_or_disabled" }
+        MidiMaterialization = if ($MidiSectionFit -and $midiEnabled -and -not [string]::IsNullOrWhiteSpace($MidiSectionFitMaterialization)) { $MidiSectionFitMaterialization } else { "none" }
         Vocals = if (-not $IncludeVocals) { "skipped" } elseif ($methodIndex -eq 1) { "analysed_once" } else { "hash_validated_cache" }
     })
     if ($code -ne 0) {

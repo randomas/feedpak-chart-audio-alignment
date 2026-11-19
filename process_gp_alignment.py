@@ -39,6 +39,17 @@ import continuous_anchors as ca
 import transcription_investigator as ti
 import midi_section_fit as msf
 import pipeline_cache as plc
+import audio_evidence_schema as aes
+import audio_evidence_qualification as aeq
+import strict_audio_queries as saq
+import query_result_evaluation as qre
+import evidence_contribution_ledger as ecl
+import hybrid_midi_audio_control as hmac
+import occurrence_audio_qualification as oaq
+import targeted_boundary_evidence as tbe
+import comparative_boundary_evidence as cbe
+import method_orchestration as mo
+import keys_metadata as km
 import continuous_anchors_legacy as ca_legacy
 
 try:
@@ -894,18 +905,30 @@ def sanitize_warped_downbeats(nominal, warped, min_ratio=0.30, max_ratio=2.00,
                   "unresolved_severe":severe,"original_reasons":reasons}
 
 
-def build_explicit_feedpak_beats(downbeats):
-    out=[]; previous=None
+def build_explicit_feedpak_beats(downbeats, nominal_downbeats=None):
+    """Project every expanded playback-measure beat without silently dropping identity.
+
+    Plain DTW can produce locally non-advancing raw measure starts.  The old
+    projector skipped those measures, making its beat inventory incomplete and
+    incomparable to the canonical beatmap.  Sanitized callers now preserve the
+    complete expanded measure inventory and let equivalence/monotonic validation
+    report timing defects rather than deleting beats.
+    """
+    out=[];previous=None;nominal=list(nominal_downbeats or [])
     for i,b in enumerate(downbeats):
-        start=float(b["time"]); count=max(1,int(b.get("ts_num",4)))
+        start=float(b["time"])
+        source=nominal[i] if i<len(nominal) else b
+        count=max(1,int(source.get("ts_num",b.get("ts_num",4))))
         duration=(float(downbeats[i+1]["time"])-start) if i+1<len(downbeats) else previous
-        if duration and duration>0: previous=duration
-        if out and start<=out[-1]["time"]: continue
-        out.append({"time":round(start,4),"measure":int(b["measure"])})
-        if not duration or duration<=0: continue
+        if duration is not None and duration>0:previous=duration
+        measure=int(source.get("measure",b.get("measure",i+1)))
+        out.append({"time":round(start,4),"measure":measure})
+        if duration is None:continue
+        # Preserve the complete identity inventory even when a raw DTW interval
+        # is locally non-advancing. Equivalence then reports the timing defect;
+        # it must not be hidden by deleting beats.
         for j in range(1,count):
-            t=round(start+j*duration/count,4)
-            if t>out[-1]["time"]: out.append({"time":t,"measure":-1})
+            out.append({"time":round(start+j*duration/count,4),"measure":-1})
     return out
 
 
@@ -2033,15 +2056,25 @@ def get_initial_tempo(gp_path):
 
 
 def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_path=None,
-            guitar_audio_path=None, full_audio_path=None,
+            guitar_audio_path=None, synth_audio_path=None, synth_midi_path=None, full_audio_path=None,
             sr=22050, count_in_offset=0.0, timeline_mode="both",
             allow_severe_alignment=False, anchors_path=None, padding_added=0.0,
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None):
+            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
+    prepared_midi_mode,prepared_midi_compatible,prepared_midi_reason=mo.validate_prepared_midi_mode(prepared_midi_mode,alignment_mode)
+    if prepared_midi_mode=="off":
+        transcription_investigator=False;force_midi_authority=False
+    elif prepared_midi_mode=="diagnostic":
+        transcription_investigator=prepared_midi_compatible;force_midi_authority=False
+    elif prepared_midi_mode=="auto":
+        transcription_investigator=prepared_midi_compatible
+    elif prepared_midi_mode=="force-trusted":
+        transcription_investigator=prepared_midi_compatible;force_midi_authority=prepared_midi_compatible
+    if transcription_investigator and alignment_mode=="continuous-anchor-structural":structural_second_pass=True
     if midi_section_fit:
         msf.validate_alignment_method(alignment_mode)
     if force_midi_section_fit and midi_section_fit_materialization is None:
@@ -2049,6 +2082,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     if midi_section_fit_materialization and not midi_section_fit:
         raise ValueError("midi_section_fit_materialization requires midi_section_fit")
     chart_cache_report={"status":"not_applicable","seconds":0.0}
+    opening_candidates=[]
     if gp_parser == "alphatab":
         fc.log(f"Processing modern GP through alphaTab: {gp_path}")
         json_path = score_json_path or ats.ensure_json(gp_path, extractor=alphatab_extractor, node=node_executable)
@@ -2075,6 +2109,9 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         drum_hits_gp=ap["drum_hits_gp"]; bass_alignment_events=ap["bass_alignment_events"]; piano_alignment_events=ap["piano_alignment_events"]
         guitar_alignment_events=ap["guitar_alignment_events"]; bass_pitch_events=ap["bass_pitch_events"]; guitar_pitch_events=ap["guitar_pitch_events"]
         piano_pitch_events=ap["piano_pitch_events"]; notation_tracks=ap["notation_tracks"]; gp_vocals=ap["gp_vocals"]
+        keys_alignment_events_by_stream=ap.get("keys_alignment_events_by_stream") or {"piano":piano_alignment_events}
+        keys_pitch_events_by_stream=ap.get("keys_pitch_events_by_stream") or {"piano":piano_pitch_events}
+        keys_arrangements=ap.get("keys_arrangements") or []
         key_events_gp=ap["key_events_gp"]; song_timeline_gp=ap["song_timeline_gp"]
         audio_content_start=float(count_in_offset); score_content_time=ap["score_content_time"]
         chart_offset=choose_chart_offset(audio_content_start,score_content_time)
@@ -2105,6 +2142,11 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         bass_pitch_events = []
         guitar_pitch_events = []
         piano_pitch_events = []
+        keys_alignment_raw = {}
+        keys_pitch_raw = {}
+        keys_alignment_events_by_stream = {}
+        keys_pitch_events_by_stream = {}
+        keys_arrangements = []
         notation_tracks = {}
         gp_vocals = None
         inventory=pc.inventory_song(song)
@@ -2113,7 +2155,12 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             validation=pc.validate_song_config(project_data,inventory)
             if not validation["valid"]: raise ValueError("Invalid project track configuration: "+json.dumps(validation["errors"],ensure_ascii=False))
             role_by_name=pc.resolved_roles(project_data,inventory)
-        else: role_by_name={x["name"]:x["automatic_role"] for x in inventory}
+            keys_descriptors=km.track_descriptors(project_data)
+            normalized_keys=km.normalize_keys_configuration(project_data)
+            keys_arrangements=[dict(x) for x in normalized_keys.get("arrangements",[])]
+        else:
+            role_by_name={x["name"]:x["automatic_role"] for x in inventory}
+            keys_descriptors={}; normalized_keys={"arrangements":[],"evidence_streams":{}}
 
         score_content_time=first_configured_instrument_time(
             song,role_by_name,tempo_events,first_tick)
@@ -2125,18 +2172,29 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         for track in song.tracks:
             if not track.measures: continue
             role=role_by_name.get(track.name,"unsupported")
+            key_descriptor=keys_descriptors.get(track.name)
+            if key_descriptor:role="keys_configured"
             if role == "drums":
                 fc.log(f"'{track.name}' -> main drums", indent=1); drum_hits_gp=parse_drum_track(track,tempo_events,first_tick); fc.log(f"{len(drum_hits_gp)} drum hits parsed",indent=2)
-            elif role in ("piano_left","piano_right","piano_combined"):
+            elif role in ("piano_left","piano_right","piano_combined","keys_configured"):
                 fc.log(f"'{track.name}' -> {role}",indent=1)
-                hand={"piano_left":"left","piano_right":"right","piano_combined":"combined"}[role]
-                notation=parse_keyboard_track(track,tempo_events,first_tick,hand=hand); notation_tracks[_safe_track_id(track)]=notation
-                piano_alignment_events.extend({"t_gp":t} for t in _keyboard_onsets(notation))
+                hand=(key_descriptor or {}).get("hand") or {"piano_left":"left","piano_right":"right","piano_combined":"combined"}.get(role,"combined")
+                stream=(key_descriptor or {}).get("evidence_stream","piano")
+                notation=parse_keyboard_track(track,tempo_events,first_tick,hand=hand)
+                notation.update({"family":"keys","arrangement_id":(key_descriptor or {}).get("arrangement_id","piano"),
+                    "display_name":(key_descriptor or {}).get("display_name",track.name),
+                    "staff_mode":(key_descriptor or {}).get("staff_mode","grand" if hand in ("left","right") else "combined"),
+                    "evidence_stream":stream})
+                notation_tracks[_safe_track_id(track)]=notation
                 for measure in notation.get("measures",[]):
                     for stave in measure.get("staves",{}).values():
                         for voice in stave.get("voices",[]):
                             for beat in voice.get("beats",[]):
-                                for note in beat.get("notes",[]): piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
+                                for note in beat.get("notes",[]):
+                                    event={"t_gp":beat["t_gp"],"end_gp":note.get("end_gp",beat["t_gp"]),"midi":int(note["midi"]),"source_track":track.name}
+                                    keys_pitch_raw.setdefault(stream,[]).append(event)
+                                    if stream=="piano":piano_pitch_events.append({"t_gp":beat["t_gp"],"midi":int(note["midi"])})
+                if stream=="piano":piano_alignment_events.extend({"t_gp":t} for t in _keyboard_onsets(notation))
             elif role == "lead_vocal":
                 capability=pc.classify_vocal_capability(song,inventory,role_by_name)
                 if capability.get("direct_gp_lyrics_supported"):
@@ -2168,6 +2226,11 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     for data in fretted_tracks.values():
         data["notes"] = shift_nominal_times(data["notes"], chart_offset)
         data["anchors"] = shift_nominal_times(data["anchors"], chart_offset, time_key="time")
+    if gp_parser=="gp5":
+        keys_pitch_events_by_stream={stream:km.deduplicate_symbolic_events(events) for stream,events in keys_pitch_raw.items()}
+        keys_alignment_events_by_stream={stream:[{"t_gp":x["t_gp"],"source_tracks":x.get("source_tracks",[]),"duplicate_count":x.get("duplicate_count",1)} for x in events]
+            for stream,events in keys_pitch_events_by_stream.items()}
+
     drum_hits_gp = shift_nominal_times(drum_hits_gp, chart_offset)
     bass_alignment_events = shift_nominal_times(bass_alignment_events, chart_offset)
     piano_alignment_events = shift_nominal_times(piano_alignment_events, chart_offset)
@@ -2175,6 +2238,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     bass_pitch_events = shift_nominal_times(bass_pitch_events, chart_offset)
     guitar_pitch_events = shift_nominal_times(guitar_pitch_events, chart_offset)
     piano_pitch_events = shift_nominal_times(piano_pitch_events, chart_offset)
+    keys_alignment_events_by_stream={role:shift_nominal_times(events,chart_offset) for role,events in keys_alignment_events_by_stream.items()}
+    keys_pitch_events_by_stream={role:shift_nominal_times(events,chart_offset) for role,events in keys_pitch_events_by_stream.items()}
     key_events_gp = shift_nominal_times(key_events_gp, chart_offset)
     song_timeline_gp["time_signatures"] = shift_nominal_times(
         song_timeline_gp["time_signatures"], chart_offset)
@@ -2380,13 +2445,23 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             continuous_score_events[role].append(row)
     continuous_score_events["piano"]=[{"t_gp":float(x["t_gp"]),"end_gp":float(x.get("end_gp",x["t_gp"])),"midi":int(x["midi"])}
                                              for x in (piano_pitch_events or [])]
+    # K4: configured Keys evidence streams participate as independent logical
+    # roles. Symbolic duplicates across authored arrangements were already
+    # collapsed by the parser-neutral per-stream product.
+    for stream_id,events in (keys_pitch_events_by_stream or {}).items():
+        if stream_id=="piano":continue
+        continuous_score_events[stream_id]=[{"t_gp":float(x["t_gp"]),
+            "end_gp":float(x.get("end_gp",x["t_gp"])),"midi":int(x["midi"])} for x in events]
     continuous_audio_paths={
         "drums":drums_audio_path,
         "bass":bass_audio_path,
         "guitar":guitar_audio_path,
         "piano":piano_audio_path,
+        "synth":synth_audio_path,
         "full":full_audio_path,
     }
+    prepared_midi_files=ti.discover_prepared_files(os.path.dirname(os.path.abspath(gp_path)))
+    if synth_midi_path:prepared_midi_files["synth"]=synth_midi_path
     midi_section_fit_report=None
     if midi_section_fit:
         section_measures=[]
@@ -2402,7 +2477,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 "written_measure_number":int(row.get("source_bar",row.get("measure",index+1))),
                 "start_time":start,"end_time":end})
         section_midi={}
-        for role,path in ti.discover_prepared_files(os.path.dirname(os.path.abspath(gp_path))).items():
+        for role,path in prepared_midi_files.items():
             provider=({"status":"not_prepared","events":[]} if path is None else
                       ti.parse_muscriptor_midi(path,role,padding_added))
             section_midi[role]=provider.get("events") or []
@@ -2415,7 +2490,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 "prepared_chart_clock":lambda t:float(t),
             },role_audio_starts={role:fc.detect_leading_silence_seconds(path)
                 for role,path in continuous_audio_paths.items()
-                if role in ("piano","guitar","bass","drums") and path},
+                if role in continuous_score_events and path},
             candidate_cache_path=candidate_cache_path)
         cache=(midi_section_fit_report.get("performance") or {}).get("candidate_cache") or {}
         fc.log(f"MIDI SECTION CACHE: hit={cache.get('hit')}; reason={cache.get('reason')}; path={cache.get('path')}",indent=1)
@@ -2466,7 +2541,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             nominal_prior=nominal_midi_prior,nominal_prior_report=nominal_midi_prior_report,
             observed_incipit_prior=observed_incipit_prior,
             observed_incipit_report=observed_incipit_report,
-            boundary_controls=_midi_boundaries,pass_label="dual_origin_sequence_search",config=investigator_config)
+            boundary_controls=_midi_boundaries,pass_label="dual_origin_sequence_search",config=investigator_config,
+            prepared_files=prepared_midi_files)
         decision["transcription_investigator"]=transcription_report
         ts=transcription_report.get("summary",{})
         fc.log(f"MuScriptor evidence: prepared roles={ts.get('prepared_role_count',0)}/{ts.get('expected_role_count',0)}; "
@@ -2533,6 +2609,10 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     decision["manual_anchor_quality"] = manual_anchor_report.get("quality")
     decision["manual_anchor_warp"] = manual_anchor_report.get("warp")
     decision["manual_anchor_status"] = manual_anchor_report.get("status")
+    simple_anchor_compatibility=mo.check_simple_method_compatibility(automatic_warp,manual_anchor_report,alignment_mode)
+    decision["manual_anchor_method_compatibility"]=simple_anchor_compatibility
+    if simple_anchor_compatibility.get("status")=="incompatible_method":
+        raise RuntimeError("MANUAL ANCHOR INCOMPATIBLE WITH METHOD: "+str(simple_anchor_compatibility.get("reason")))
     anchor_path_preview=continuous_engine.preview_monotonic_anchor_path(
         continuous_anchor_report,automatic_warp,
         manual_anchor_quality=manual_anchor_report.get("quality"),
@@ -2616,7 +2696,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             padding_added=padding_added,alignment_mode=alignment_mode,
             nominal_prior=nominal_midi_prior,nominal_prior_report=nominal_midi_prior_report,
             boundary_controls=_midi_boundaries+manual_controls,recovery_prior=recovery_prior,
-            pass_label="post_structural_recovery",config=investigator_config)
+            pass_label="post_structural_recovery",config=investigator_config,prepared_files=prepared_midi_files)
         transcription_report["second_pass"]=second_transcription_report
         transcription_report["final_global_monotonic_path_preview"]=second_transcription_report.get("global_monotonic_path_preview")
         transcription_report["summary"]["second_pass_selected_monotonic_candidates"]=(second_transcription_report.get("summary") or {}).get("selected_monotonic_candidates",0)
@@ -2775,6 +2855,11 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 indent=2,
             )
 
+    manual_anchor_verification=mo.verify_manual_anchors(warp_fn,manual_anchor_report,alignment_mode)
+    decision["manual_anchor_verification"]=manual_anchor_verification
+    if manual_anchor_verification.get("manual_anchor_status")=="materialization_failed":
+        raise RuntimeError("MANUAL ANCHOR INVARIANT FAILED: "+str(manual_anchor_verification.get("manual_anchor_conflicts")))
+
     guitar_coverage=diagnose_track_audio_coverage(
         _event_times(guitar_alignment_events),guitar_audio_path,warp_fn,sr=sr,source="guitar")
     decision["guitar_coverage_diagnostic"]=guitar_coverage
@@ -2822,7 +2907,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     ]
     warped_beats,sanitization=sanitize_warped_downbeats(song_timeline_gp["beats"],warped_beats)
     legacy_dense_tempos=compute_dense_measure_tempos(warped_beats,fallback_bpm=float(tempo_events[0][1]))
-    legacy_explicit_beats=build_explicit_feedpak_beats(warped_beats)
+    legacy_explicit_beats=build_explicit_feedpak_beats(warped_beats,song_timeline_gp["beats"])
     production_timing=finalize_production_timing(decision, alignment_mode)
     fc.log("FINAL PRODUCTION TIMING: "
         f"requested={production_timing['requested_method']}; selected={production_timing['selected_production_method']}; "
@@ -2862,6 +2947,90 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     },warp_fn,song_timeline_gp["beats"],regional_source_fusion_report,sr=sr)
     alignment_proposals_report=structural_search_module.append_to_alignment_proposals(
         alignment_proposals_report,structural_search_report,beatmap)
+    audio_evidence_bundle=aes.build_read_only_evidence_bundle(
+        opening_report=decision.get("opening_anchor"),
+        coverage_reports={"guitar":guitar_coverage},
+        three_clock_incipit=((midi_section_fit_report or {}).get("phase_migration_qualification") or {}).get("three_clock_incipit")
+            or ((midi_section_fit_report or {}).get("fusion_report") or {}).get("three_clock_incipit"),
+        continuous_anchor_report=decision.get("continuous_anchor_diagnostics"),
+        structural_search_report=structural_search_report,
+        instrument_evidence_report=instrument_evidence_report,
+        padding_added=float(padding_added))
+    audio_evidence_qualification=aeq.qualify_bundle(audio_evidence_bundle)
+    chart_times=[float(x.get("t_gp",0.0)) for x in song_timeline_gp.get("beats") or []]
+    strict_audio_queries=saq.build_report(qualification_report=audio_evidence_qualification,
+        midi_section_fit_report=midi_section_fit_report,alignment_report=alignment_report,
+        chart_start=min(chart_times) if chart_times else None,chart_end=max(chart_times) if chart_times else None)
+    query_result_evaluation=qre.build_report(strict_query_report=strict_audio_queries,
+        midi_section_fit_report=midi_section_fit_report)
+    evidence_contribution_ledger=ecl.build_ledger(audio_evidence_bundle=audio_evidence_bundle,
+        midi_section_fit_report=midi_section_fit_report,alignment_decision=decision,
+        production_timing=production_timing,query_result_evaluation=query_result_evaluation,
+        coverage_reports={"guitar":guitar_coverage},audio_evidence_qualification=audio_evidence_qualification,
+        strict_audio_queries=strict_audio_queries)
+    audio_qualified_occurrence_resolution=oaq.build_report(
+        midi_section_fit_report=midi_section_fit_report,
+        evidence_contribution_ledger=evidence_contribution_ledger)
+    targeted_boundary_evidence_acquisition=tbe.build_report(
+        occurrence_report=audio_qualified_occurrence_resolution,
+        audio_evidence_bundle=audio_evidence_bundle,
+        audio_evidence_qualification=audio_evidence_qualification)
+    comparative_boundary_evidence_triage=cbe.build_report(
+        occurrence_report=audio_qualified_occurrence_resolution,
+        audio_evidence_bundle=audio_evidence_bundle,
+        audio_evidence_qualification=audio_evidence_qualification)
+    hybrid_midi_audio_control_proposal=hmac.build_proposal(
+        evidence_contribution_ledger=evidence_contribution_ledger,
+        midi_section_fit_report=midi_section_fit_report,selected_production_timing=production_timing)
+    hybrid_midi_audio_control_proposal["audio_qualified_occurrence_resolution"]=audio_qualified_occurrence_resolution
+    hybrid_midi_audio_control_proposal["summary"]["occurrence_qualification_count"]=audio_qualified_occurrence_resolution["summary"]["repeated_window_count"]
+    hybrid_midi_audio_control_proposal["summary"]["occurrence_classification_counts"]=audio_qualified_occurrence_resolution["summary"]["classification_counts"]
+    alignment_report["evidence_contribution_ledger_summary"]=evidence_contribution_ledger.get("summary")
+    alignment_report["hybrid_midi_audio_control_proposal_summary"]=hybrid_midi_audio_control_proposal.get("summary")
+    alignment_report["audio_qualified_occurrence_resolution_summary"]=audio_qualified_occurrence_resolution.get("summary")
+    alignment_report["targeted_boundary_evidence_acquisition_summary"]=targeted_boundary_evidence_acquisition.get("summary")
+    alignment_report["comparative_boundary_evidence_triage_summary"]=comparative_boundary_evidence_triage.get("summary")
+    alignment_report["audio_evidence_bundle_summary"]=audio_evidence_bundle.get("summary")
+    alignment_report["audio_evidence_qualification_summary"]=audio_evidence_qualification.get("summary")
+    alignment_report["strict_audio_query_summary"]=strict_audio_queries.get("summary")
+    alignment_report["query_result_evaluation_summary"]=query_result_evaluation.get("summary")
+    ae_summary=audio_evidence_bundle.get("summary") or {}
+    aq_summary=audio_evidence_qualification.get("summary") or {}
+    fc.log(f"Audio evidence bundle: {ae_summary.get('evidence_count',0)} existing observation(s); detectors executed=False; timing unchanged",indent=1)
+    fc.log(f"Audio evidence qualification: strict={aq_summary.get('strict_eligible_count',0)}; "
+           f"categories={aq_summary.get('qualification_counts',{})}; MIDI authority unchanged",indent=1)
+    sq_summary=strict_audio_queries.get("summary") or {}
+    fc.log(f"Strict audio queries: total={sq_summary.get('query_count',0)}; "
+           f"supported={sq_summary.get('strict_support_query_count',0)}; "
+           f"insufficient={sq_summary.get('insufficient_query_count',0)}; anchors created=False; timing unchanged",indent=1)
+    q2_summary=query_result_evaluation.get("summary") or {}
+    fc.log(f"Query-result evaluation: classes={q2_summary.get('classification_counts',{})}; "
+           f"bridge={q2_summary.get('bridge_geometry_counts',{})}; "
+           f"future audio-only anchor candidates={q2_summary.get('future_audio_only_anchor_candidate_count',0)}; diagnostic only",indent=1)
+    ledger_summary=evidence_contribution_ledger.get("summary") or {}
+    fc.log(f"Evidence contribution ledger: events={ledger_summary.get('event_count',0)}; "
+           f"cross-modal={ledger_summary.get('cross_modal_event_count',0)}; "
+           f"audio-only={ledger_summary.get('audio_only_event_count',0)}; "
+           f"MIDI-only={ledger_summary.get('midi_only_event_count',0)}; "
+           f"blocked elsewhere={ledger_summary.get('materialization_blocked_elsewhere_count',0)}",indent=1)
+    hybrid_summary=hybrid_midi_audio_control_proposal.get("summary") or {}
+    occurrence_summary=audio_qualified_occurrence_resolution.get("summary") or {}
+    fc.log(f"Audio-qualified occurrence resolution: repeated windows={occurrence_summary.get('repeated_window_count',0)}; "
+           f"classes={occurrence_summary.get('classification_counts',{})}; "
+           f"neighbor-consistent regions={occurrence_summary.get('neighbor_consistent_region_count',0)}; "
+           f"boundary queries={occurrence_summary.get('targeted_boundary_query_count',0)}; "
+           f"boundary evaluations={occurrence_summary.get('boundary_query_evaluation_count',0)}; "
+           f"discriminative pairs={occurrence_summary.get('discriminative_boundary_pair_count',0)}; timing unchanged",indent=1)
+    targeted_summary=targeted_boundary_evidence_acquisition.get("summary") or {}
+    fc.log(f"Targeted boundary evidence acquisition: requests={targeted_summary.get('request_count',0)}; "
+           f"merged={targeted_summary.get('merged_request_count',0)}; pairs={targeted_summary.get('targeted_boundary_pair_count',0)}; "
+           f"whole-song recomputation=False; timing unchanged",indent=1)
+    comparative_summary=comparative_boundary_evidence_triage.get("summary") or {}
+    fc.log(f"Comparative boundary evidence triage: levels={comparative_summary.get('evidence_level_counts',{})}; "
+           f"pairs={comparative_summary.get('comparative_boundary_pair_count',0)}; "
+           f"detector execution windows={comparative_summary.get('detector_execution_window_count',0)}; timing unchanged",indent=1)
+    fc.log(f"Hybrid MIDI-audio control proposal: proposals={hybrid_summary.get('proposal_count',0)}; "
+           f"bounded local controls={hybrid_summary.get('bounded_local_control_count',0)}; timing unchanged",indent=1)
     beatmap_report=bm.build_beatmap_report(beatmap,timeline_equivalence)
     alignment_report["beatmap_timeline_equivalence"]=timeline_equivalence
     alignment_report["beatmap_evidence_summary"]=beatmap_evidence_report["summary"]
@@ -2932,13 +3101,26 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         alignment_report.setdefault("piano_duration_quantization", {})[track_id]=piano_diag
         fc.log(f"Piano duration quantization {track_id}: {piano_diag['unique_before_count']} -> {piano_diag['unique_after_count']} unique durations (quantum={piano_diag['quantum_ms']}ms)",indent=2)
         fc.log(f"'{track_id}' notation and playable piano lane warped ({len(arrangements_out[track_id]['notes'])} notes)", indent=1)
+    method_result_envelope=mo.build_result_envelope(alignment_mode=alignment_mode,decision=decision,
+        prepared_midi_mode=prepared_midi_mode,manual_anchor_verification=manual_anchor_verification,
+        alignment_report=alignment_report,transcription_report=transcription_report,midi_section_fit_report=midi_section_fit_report,
+        occurrence_report=audio_qualified_occurrence_resolution,
+        comparative_report=comparative_boundary_evidence_triage,
+        strict_query_report=strict_audio_queries,
+        targeted_boundary_report=targeted_boundary_evidence_acquisition,
+        hybrid_report=hybrid_midi_audio_control_proposal)
+    alignment_report["method_result_envelope"]=method_result_envelope
     result = {
+        "method_result_envelope":method_result_envelope,
         "arrangements": arrangements_out,
         "drum_tab": {"version": 1, "hits": drum_hits} if drum_hits else None,
         "notation": warped_notation if warped_notation else None,
         "keys": {"version": 1, "events": [{"t": e["t"], "key": e["key"]} for e in key_events]}
                  if key_events else None,
         "song_timeline": song_timeline,
+        "keys_alignment_events_by_stream":keys_alignment_events_by_stream,
+        "keys_pitch_events_by_stream":keys_pitch_events_by_stream,
+        "keys_arrangements":keys_arrangements,
         "alignment_report": alignment_report,
         "beatmap": beatmap,
         "beatmap_report": beatmap_report,
@@ -2949,6 +3131,16 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "structural_search_report": structural_search_report,
         "transcription_investigator_report": transcription_report,
         "midi_section_fit_report": midi_section_fit_report,
+        "audio_evidence_bundle": audio_evidence_bundle,
+        "audio_evidence_qualification":audio_evidence_qualification,
+        "strict_audio_queries":strict_audio_queries,
+        "query_result_evaluation":query_result_evaluation,
+        "evidence_contribution_ledger":evidence_contribution_ledger,
+        "audio_qualified_occurrence_resolution":audio_qualified_occurrence_resolution,
+        "targeted_boundary_evidence_acquisition":targeted_boundary_evidence_acquisition,
+        "comparative_boundary_evidence_triage":comparative_boundary_evidence_triage,
+        "hybrid_midi_audio_control":hybrid_midi_audio_control_proposal,
+        "hybrid_midi_audio_control_proposal":hybrid_midi_audio_control_proposal,  # compatibility alias
         "parsed_chart_cache": chart_cache_report,
         "expression_report": {
             track_id: arrangement.get("expression_diagnostics", {"encoded": ee.count_fields(arrangement.get("notes", []))})
@@ -2983,6 +3175,8 @@ def main():
     parser.add_argument("--bass-audio", default=None)
     parser.add_argument("--piano-audio", default=None)
     parser.add_argument("--guitar-audio", default=None)
+    parser.add_argument("--synth-audio", default=None)
+    parser.add_argument("--synth-midi", default=None)
     parser.add_argument("--full-audio", default=None)
     parser.add_argument("--alignment-mode",choices=("nominal","offset","linear","dtw","dtw-checkpoint","checkpoint-linear","checkpoint-dtw-diagnostic","checkpoint-dtw-selective","continuous-anchor-linear","continuous-anchor-dtw","continuous-anchor-structural","bar-landmark-regularized"),default="dtw")
     parser.add_argument("--timeline-mode", choices=("tempos","beats","both"), default="both",
@@ -2996,7 +3190,9 @@ def main():
     parser.add_argument("--structural-second-pass", action="store_true",
                         help="Enable dual-centre drift-adjusted anchor recovery for continuous-anchor-structural")
     parser.add_argument("--transcription-investigator", action="store_true",
-                        help="Read prepared *.muscriptor.mid evidence diagnostically for guarded/checkpoint/continuous methods")
+                        help="Legacy alias: read prepared MIDI evidence")
+    parser.add_argument("--prepared-midi-mode",choices=("off","auto","diagnostic","force-trusted"),default="auto",
+                        help="Continuous MIDI landmark policy for compatible audio methods")
     parser.add_argument("--midi-section-fit", action="store_true",
                         help="DIAGNOSTIC ONLY: build overlapping measure-section MIDI candidate, monotonic path, and fusion reports")
     parser.add_argument("--force-midi-section-fit", action="store_true",
@@ -3039,7 +3235,8 @@ def main():
                    allow_compatible_audio_refinement=args.allow_compatible_audio_refinement,
                    midi_section_fit=args.midi_section_fit,
                    force_midi_section_fit=args.force_midi_section_fit,
-                   midi_section_fit_materialization=args.midi_section_fit_materialization)
+                   midi_section_fit_materialization=args.midi_section_fit_materialization,
+                   prepared_midi_mode=args.prepared_midi_mode)
     fc.write_json(args.out, result)
     print(f"Wrote {args.out}")
 

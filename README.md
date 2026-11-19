@@ -7,7 +7,7 @@ The pipeline extracts playable arrangements, analyzes vocals, aligns Guitar Pro 
 
 ## Current development baseline
 
-The listening-validated reference remains Git tag `v15.0-dsmn-perfect`. The current integrated functional baseline is **v16.6E.3 final phase-diagnostic cleanup**. The active v16.7 workstream is **v16.7R1**, a documentation-only audio-evidence reuse audit that restarts from v16.6E.3. Experimental v16.7A/A.1 threshold detectors are retained as research artifacts and are not part of the functional R-line implementation. It includes v15.1 hybrid geometry, exact Phase-1 and Phase-2B caching/instrumentation, expected-role solo authority, three-clock incipit acquisition, and mode-aware recovery that splits fused regions at production-policy failures instead of rejecting the entire region.
+The listening-validated reference remains Git tag `v15.0-dsmn-perfect`. The current integrated functional baseline is **v16.6E.3 final phase-diagnostic cleanup**. The active v16.7 line is **v16.7K3.1.2 inner-fusion progress**, restarted cleanly from v16.6E.3. Experimental v16.7A/A.1 threshold detectors remain research artifacts and are not part of this functional line. It includes v15.1 hybrid geometry, exact Phase-1 and Phase-2B caching/instrumentation, expected-role solo authority, three-clock incipit acquisition, and mode-aware recovery that splits fused regions at production-policy failures instead of rejecting the entire region.
 
 The current MIDI-section production interface is:
 
@@ -22,13 +22,9 @@ Available materialization policies are `conservative`, `permissive`, and `diagno
 
 FeedPak consumes prepared assets. The future wizard will validate and use them, but it will not install or run stem separation or MIDI transcription tools.
 
-At minimum, provide the chart, song audio, and the stems needed by the selected alignment method. Optional role-specific performance MIDI may come from MuScriptor or another audio-to-MIDI system.
+The current default external separator is direct BS-RoFormer SW six-stem separation of the original mix. It provides nominal bass, drums, other, vocals, guitar, and piano outputs. Direct six-stem output was preferred over vocal-RoFormer followed by HTDemucs in current tests on All That I Bleed and Caught in a Web. See [`BS_ROFORMER_SW_6STEM_SETUP.md`](BS_ROFORMER_SW_6STEM_SETUP.md). Preserve the original clock and treat stem labels as model hypotheses rather than verified instrument identity.
 
-The current recommended separation baseline is **direct BS-RoFormer SW six-stem separation of the original full mix**. It produces nominal `bass`, `drums`, `other`, `vocals`, `guitar`, and `piano` outputs. In current tests on All That I Bleed and Caught in a Web, the direct six-stem result was more useful than the previous vocal-RoFormer followed by HTDemucs pipeline. The older sequential pipeline is retained only as a fallback or comparison when a documented direct-separation failure affects downstream MIR evidence.
-
-Stem separation remains an external preparation step. FeedPak does not install or run the separator. Preserve the recording clock: do not independently trim, pad, normalize, or time-shift model outputs. A model label is a hypothesis, not verified instrument identity: for example, `guitar` means candidate guitar evidence, while `other` may contain guitar, piano, keyboards, or separation leakage. Missing or ambiguous audio evidence is neutral and must not disauthorize reliable MIDI evidence.
-
-See [`BS_ROFORMER_SW_6STEM_SETUP.md`](BS_ROFORMER_SW_6STEM_SETUP.md) for the validated local command, directory layout, model references, environment policy, and output validation.
+At minimum, provide the chart, song audio, and the stems needed by the selected alignment method. Stems may come from UVR, Moises, `audio-separator`, a DAW, or any other workflow. Optional role-specific performance MIDI may come from MuScriptor or another audio-to-MIDI system.
 
 Performance MIDI must be derived independently from the recording. MIDI exported from the Guitar Pro, MusicXML, Songsterr, or other chart being aligned is circular evidence and must not be used as chart-to-performance timing authority.
 
@@ -49,11 +45,40 @@ percussion.mid
 Legacy `Piano.muscriptor.mid`, `Guitar.muscriptor.mid`, `Bass.muscriptor.mid`, and `Drums.muscriptor.mid` filenames remain supported. Explicit project configuration takes precedence over automatic discovery. Missing MIDI roles are neutral rather than fatal.
 
 
+## v16.7K Keys and Synth metadata
+
+[`GENERIC_PREPARED_MIDI_AND_DTW_BEAT_FIXES_V16_7K4_1.md`](GENERIC_PREPARED_MIDI_AND_DTW_BEAT_FIXES_V16_7K4_1.md) restores provider-neutral generic role MIDI discovery and preserves complete expanded beat identities in plain-DTW legacy projection.
+
+
+[`MIDI_SECTION_STAGE_PROGRESS_V16_7K3_1_1.md`](MIDI_SECTION_STAGE_PROGRESS_V16_7K3_1_1.md) adds immediate cache, path-selection, and fusion progress messages without changing selection behavior or timing. [`MIDI_SECTION_INNER_FUSION_PROGRESS_V16_7K3_1_2.md`](MIDI_SECTION_INNER_FUSION_PROGRESS_V16_7K3_1_2.md) moves the heartbeat into each fused DP layer so a long selector call remains observable.
+
+
+[`KEYS_SYNTH_METADATA_NORMALIZATION_V16_7K1.md`](KEYS_SYNTH_METADATA_NORMALIZATION_V16_7K1.md) adds an optional, backward-compatible metadata model for separate Piano, Synth Solo, and Synth Pad arrangements. Piano and Synth remain in the Keys family; Piano uses its own evidence stream, while Synth Solo and Synth Pad may share one `synth.mid` and one configured `other` audio source. K1 established normalization and validation. [`KEYS_SYNTH_PARSER_PRODUCTS_V16_7K2.md`](KEYS_SYNTH_PARSER_PRODUCTS_V16_7K2.md) connects the model to both chart parsers, preserves separate authored Synth arrangements, and emits deduplicated Piano and Synth symbolic streams while retaining all legacy Piano aliases. [`KEYS_SYNTH_MIDI_STEM_ROUTING_V16_7K3.md`](KEYS_SYNTH_MIDI_STEM_ROUTING_V16_7K3.md) now resolves each configured Keys evidence stream to its exact prepared MIDI filename and candidate physical stem, preserving the distinction between logical Synth and a physical `keys`/`other` source. Missing assets remain neutral. All-method participation remains deferred to K4. [`MIDI_SECTION_EXACT_EQUIVALENT_CACHE_PROGRESS_V16_7K3_1.md`](MIDI_SECTION_EXACT_EQUIVALENT_CACHE_PROGRESS_V16_7K3_1.md) preserves valid monolithic caches, adds exact per-role atomic caches and visible progress, and prevents Synth-only Keys stems from being implicitly routed to legacy Piano.
+
 ## v16.7R audio-evidence consolidation
 
-The v16.7 direction preserves performance MIDI as the primary dense timing source and uses only strict, sparse audio evidence to fill genuine MIDI blind spots. Missing or ambiguous audio evidence is neutral. The first stage is the documentation-only [`AUDIO_EVIDENCE_REUSE_AUDIT_V16_7R.md`](AUDIO_EVIDENCE_REUSE_AUDIT_V16_7R.md), which assigns ownership to existing opening, coverage, continuous-anchor, structural-search, source-quality, and MIDI diagnostic systems before any common schema or adapter code is added.
+[`CROSS_MODAL_RECONCILIATION_V16_7Q3_1.md`](CROSS_MODAL_RECONCILIATION_V16_7Q3_1.md) distinguishes exact onset agreement from same-phrase support, includes coverage incipits and full clocks, and attributes MIDI materialization by applied chart intervals.
 
-The experimental v16.7A/A.1 global threshold inventory is not carried into this clean code line. Useful reporting ideas, including explicit clocks, provenance, limitations, and confidence-versus-authority, may be reintroduced through read-only adapters over existing algorithms.
+
+[`EVIDENCE_CONTRIBUTION_LEDGER_V16_7Q3.md`](EVIDENCE_CONTRIBUTION_LEDGER_V16_7Q3.md) explains positive chart, audio, and MIDI contribution per structural event and distinguishes local evidence success from global materialization failure.
+
+
+[`QUERY_LOCALIZATION_V16_7Q2_2.md`](QUERY_LOCALIZATION_V16_7Q2_2.md) prevents unlocalized diagnostics from selecting global audio evidence and records legitimate shared evidence across overlapping bounded queries.
+
+
+[`BRIDGE_GEOMETRY_ROBUSTNESS_V16_7Q2_1.md`](BRIDGE_GEOMETRY_ROBUSTNESS_V16_7Q2_1.md) prevents near-zero bridge singularities, bounds point queries, collapses duplicate controls, and distinguishes direct corroboration from safe opening, terminal, and two-sided gap geometry.
+
+
+[`QUERY_RESULT_EVALUATION_V16_7Q2.md`](QUERY_RESULT_EVALUATION_V16_7Q2.md) classifies Q1 results, evaluates their bridge geometry to neighboring MIDI controls, and identifies diagnostic future audio-only-anchor candidates without changing timing or authority.
+
+
+[`STRICT_AUDIO_QUERIES_V16_7Q1.md`](STRICT_AUDIO_QUERIES_V16_7Q1.md) generates bounded diagnostic questions from MIDI/alignment uncertainty and answers them conservatively from R4-qualified, physically independent audio evidence without creating anchors or changing timing.
+
+
+[`AUDIO_EVIDENCE_QUALIFICATION_V16_7R4.md`](AUDIO_EVIDENCE_QUALIFICATION_V16_7R4.md) classifies existing R3.1 observations, groups correlated physical sources, and answers strict diagnostic queries without executing detectors or changing timing or MIDI authority.
+
+
+[`AUDIO_EVIDENCE_REUSE_AUDIT_V16_7R.md`](AUDIO_EVIDENCE_REUSE_AUDIT_V16_7R.md) assigns ownership to existing opening, coverage, continuous-anchor, structural-search, source-quality, and MIDI systems. [`AUDIO_EVIDENCE_COMMON_SCHEMA_V16_7R2.md`](AUDIO_EVIDENCE_COMMON_SCHEMA_V16_7R2.md) documents the read-only schema and adapters. [`AUDIO_EVIDENCE_RUNTIME_AGGREGATION_V16_7R3.md`](AUDIO_EVIDENCE_RUNTIME_AGGREGATION_V16_7R3.md) connects those adapters after existing detectors have run and writes a diagnostic bundle. R3 performs no new audio analysis and changes no timing or MIDI authority. [`AUDIO_EVIDENCE_EXACT_FIELD_MAPPINGS_V16_7R3_1.md`](AUDIO_EVIDENCE_EXACT_FIELD_MAPPINGS_V16_7R3_1.md) maps the actual nested report shapes, emits retained continuous hypotheses and structural clusters rather than broad search containers, and preserves detector-native quality fields.
 
 ## Phase 2b.1 and 2b.2: pipeline profiling and exact preparation caches
 
@@ -357,11 +382,11 @@ Install utilities:
 pip install jsonschema
 ```
 
-Dependency policy:
+Optional upgrade command:
 
-> If it ain't broke, don't fix it.
-
-Do not broadly upgrade the working Python, PyTorch, CUDA, MIR, or audio stack merely to remove warnings. Perform dependency upgrades only as a separate, controlled task with the full unit suite, corpus run, and any required listening regressions. Do not install separator dependencies into a working FeedPak environment unless the exact combination has already been validated.
+```powershell
+pip install --upgrade whisperx torchcrepe librosa scipy soundfile pyyaml pyphen pyguitarpro jsonschema numpy
+```
 
 ### 2.7 Verify CUDA
 
@@ -375,54 +400,6 @@ Expected output resembles:
 CUDA: True
 GPU: NVIDIA GeForce RTX 3060
 ```
-
-### 2.8 External BS-RoFormer SW six-stem preparation
-
-BS-RoFormer SW runs outside the FeedPak build. On the validated development machine it ran from the existing activated Audio Alignment environment through the cloned `Music-Source-Separation-Training` repository. This is a validated local configuration, not a requirement to modify another working installation. A separate environment is acceptable when the runner requirements are not already satisfied.
-
-The proven execution route is `python inference.py`, not `uvx`. MuScriptor may still be run through `uvx`; the two workflows remain independently versioned.
-
-From inside the cloned runner repository:
-
-```powershell
-python inference.py `
-  --model_type bs_roformer `
-  --config_path "..\models\bs_roformer_sw\bs_6stem_fixed.yaml" `
-  --start_check_point "..\models\bs_roformer_sw\bs_6stem_fixed.ckpt" `
-  --input_folder "..\audio\input" `
-  --store_dir "..\output\bs_roformer_sw" `
-  --flac_file
-```
-
-Expected model targets:
-
-```text
-bass
- drums
- other
- vocals
- guitar
- piano
-```
-
-The runner should report `Using device: cuda:0` when GPU execution is active. Test-time augmentation is optional and should be treated as a comparison mode, not an automatic quality upgrade:
-
-```powershell
-python inference.py `
-  --model_type bs_roformer `
-  --config_path "..\models\bs_roformer_sw\bs_6stem_fixed.yaml" `
-  --start_check_point "..\models\bs_roformer_sw\bs_6stem_fixed.ckpt" `
-  --input_folder "..\audio\input" `
-  --store_dir "..\output\bs_roformer_sw_tta" `
-  --flac_file `
-  --use_tta
-```
-
-Retain non-TTA outputs until listening and downstream MIR diagnostics show that TTA is better. Do not overwrite the original mix or earlier separation results.
-
-After every run, verify sample rate, channel count, duration, start time, clipping, silent or malformed output, and approximate reconstruction. The apparent time translation observed during early testing was a Windows Media Player playback issue; Audacity confirmed that the generated audio remained correctly timed.
-
-Full setup notes and source links are in [`BS_ROFORMER_SW_6STEM_SETUP.md`](BS_ROFORMER_SW_6STEM_SETUP.md).
 
 ---
 

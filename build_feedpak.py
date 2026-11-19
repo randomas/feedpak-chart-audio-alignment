@@ -39,6 +39,7 @@ import time
 import yaml
 
 import feedpak_common as fc
+import keys_metadata as km
 import process_gp_alignment as pga
 import project_config as pc
 import alphatab_score as ats
@@ -385,13 +386,13 @@ def load_reusable_vocals(path, vocals_path):
     return None
 
 def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
-                  bass_path=None,piano_path=None,guitar_path=None,full_path=None,
+                  bass_path=None,piano_path=None,guitar_path=None,synth_path=None,synth_midi_path=None,full_path=None,
                   timeline_mode="both",
                   allow_severe_alignment=False,anchors_path=None,padding_added=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
                   gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None):
+                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -401,6 +402,8 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
     if bass_path: cmd += ["--bass-audio",bass_path]
     if piano_path: cmd += ["--piano-audio",piano_path]
     if guitar_path: cmd += ["--guitar-audio",guitar_path]
+    if synth_path: cmd += ["--synth-audio",synth_path]
+    if synth_midi_path: cmd += ["--synth-midi",synth_midi_path]
     if full_path: cmd += ["--full-audio",full_path]
     if allow_severe_alignment: cmd.append("--allow-severe-alignment")
     if force_continuous_anchor_warp: cmd.append("--force-continuous-anchor-warp")
@@ -410,6 +413,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
     if allow_compatible_audio_refinement: cmd.append("--allow-compatible-audio-refinement")
     if structural_second_pass: cmd.append("--structural-second-pass")
     if transcription_investigator: cmd.append("--transcription-investigator")
+    cmd.extend(("--prepared-midi-mode",prepared_midi_mode))
     if midi_section_fit: cmd.append("--midi-section-fit")
     if force_midi_section_fit: cmd.append("--force-midi-section-fit")
     if midi_section_fit_materialization: cmd.extend(("--midi-section-fit-materialization",midi_section_fit_materialization))
@@ -864,7 +868,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
           gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,
+          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,prepared_midi_mode="auto",
           package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
@@ -937,6 +941,20 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     bass_path=select_stem_path(padded_paths,bass_alignment_stem,("bass",))
     piano_path=select_stem_path(padded_paths,piano_alignment_stem,("piano","keys","keyboard"))
     guitar_path=select_stem_path(padded_paths,guitar_alignment_stem,("guitar","rhythm_guitar","lead_guitar"))
+    normalized_keys=km.normalize_keys_configuration(metadata)
+    # Do not implicitly claim a generic Keys stem as legacy Piano when the
+    # project has no Piano arrangement and explicitly assigns the source to Synth.
+    has_piano_arrangement=any(x.get("arrangement_id")=="piano" for x in normalized_keys.get("arrangements",[]))
+    if not has_piano_arrangement and piano_alignment_stem is None:
+        piano_path=None
+    keys_evidence_sources=km.resolve_evidence_sources(metadata,padded_paths,song_folder)
+    synth_source=keys_evidence_sources.get("synth") or {}
+    synth_path=synth_source.get("audio_path") if synth_source.get("audio_available") else None
+    synth_midi_path=synth_source.get("midi_path") if synth_source.get("midi_available") else None
+    for stream_id,source in keys_evidence_sources.items():
+        fc.log(f"Keys evidence source {stream_id}: audio={source.get('physical_audio_source') or 'off'} "
+               f"({'available' if source.get('audio_available') else 'missing'}), MIDI={source.get('performance_midi') or 'off'} "
+               f"({'available' if source.get('midi_available') else 'missing'}); diagnostic-only",indent=1)
     fc.log(f"Alignment stem routing: drums={os.path.basename(drums_path) if drums_path else 'off'}, "
            f"bass={os.path.basename(bass_path) if bass_path else 'off'}, "
            f"piano={os.path.basename(piano_path) if piano_path else 'off'}, "
@@ -983,6 +1001,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     arrangements = []
     drum_tab_file=keys_file=song_timeline_file=None
     alignment_report=None
+    method_result_envelope=None
     beatmap=None
     beatmap_report=None
     beatmap_evidence_report=None
@@ -992,12 +1011,18 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     structural_search_report=None
     transcription_investigator_report=None
     midi_section_fit_report=None
+    audio_evidence_bundle=None
+    audio_evidence_qualification=None
+    strict_audio_queries=None
+    query_result_evaluation=None
+    evidence_contribution_ledger=None
+    hybrid_midi_audio_control=None
     expression_report=None
     if gp_path and (drums_path or bass_path or piano_path or guitar_path) and not skip_gp:
         gp_intermediate = os.path.join(song_folder, "intermediate_arrangements.json")
         run_gp_script(gp_path,drums_path,gp_intermediate,count_in_offset=count_in_offset,
                       bass_path=bass_path,piano_path=piano_path,guitar_path=guitar_path,
-                      full_path=full_path,timeline_mode=timeline_mode,
+                      synth_path=synth_path,synth_midi_path=synth_midi_path,full_path=full_path,timeline_mode=timeline_mode,
                       allow_severe_alignment=allow_severe_alignment,
                       anchors_path=anchors_path,padding_added=padding_added,
                       auto_chunk_measures=auto_chunk_measures,alignment_mode=alignment_mode,
@@ -1011,7 +1036,8 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       allow_compatible_audio_refinement=allow_compatible_audio_refinement,
                       midi_section_fit=midi_section_fit,
                       force_midi_section_fit=force_midi_section_fit,
-                      midi_section_fit_materialization=midi_section_fit_materialization)
+                      midi_section_fit_materialization=midi_section_fit_materialization,
+          prepared_midi_mode=prepared_midi_mode)
         with open(gp_intermediate, "r", encoding="utf-8") as f:
             gp_data = json.load(f)
         if gp_vocal_production:
@@ -1028,6 +1054,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         song_timeline_file=write_song_timeline(gp_data,work_dir)
         embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,arrangements)
         alignment_report=gp_data.get("alignment_report")
+        method_result_envelope=gp_data.get("method_result_envelope")
         beatmap=gp_data.get("beatmap")
         beatmap_report=gp_data.get("beatmap_report")
         beatmap_evidence_report=gp_data.get("beatmap_evidence_report")
@@ -1037,7 +1064,18 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         structural_search_report=gp_data.get("structural_search_report")
         transcription_investigator_report=gp_data.get("transcription_investigator_report")
         midi_section_fit_report=gp_data.get("midi_section_fit_report")
+        audio_evidence_bundle=gp_data.get("audio_evidence_bundle")
+        audio_evidence_qualification=gp_data.get("audio_evidence_qualification")
+        strict_audio_queries=gp_data.get("strict_audio_queries")
+        query_result_evaluation=gp_data.get("query_result_evaluation")
+        evidence_contribution_ledger=gp_data.get("evidence_contribution_ledger")
+        audio_qualified_occurrence_resolution=gp_data.get("audio_qualified_occurrence_resolution")
+        targeted_boundary_evidence_acquisition=gp_data.get("targeted_boundary_evidence_acquisition")
+        comparative_boundary_evidence_triage=gp_data.get("comparative_boundary_evidence_triage")
+        hybrid_midi_audio_control=(gp_data.get("hybrid_midi_audio_control")
+            or gp_data.get("hybrid_midi_audio_control_proposal"))
         expression_report=gp_data.get("expression_report")
+        gp_data["keys_evidence_sources"]=keys_evidence_sources
         fc.log(f"Wrote {len(arrangements)} arrangement entr(y/ies), "
                f"drum_tab={'yes' if drum_tab_file else 'no'}, "
                f"keys={'yes' if keys_file else 'no'}, "
@@ -1125,6 +1163,15 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         if not os.path.isfile(proposals_path):
             raise RuntimeError(f"Alignment proposals report write failed: {proposals_path}")
         fc.log(f"Wrote alignment proposals: {proposals_path}",indent=1)
+    if method_result_envelope is not None:
+        method_result_envelope=dict(method_result_envelope)
+        method_result_envelope["feedpak_path"]=os.path.abspath(output_path)
+        if alignment_report is not None:
+            alignment_report["method_result_envelope"]=method_result_envelope
+        method_path=output_path+".method_result_envelope.json"
+        fc.write_json(method_path,method_result_envelope)
+        if not os.path.isfile(method_path): raise RuntimeError(f"Method result envelope write failed: {method_path}")
+        fc.log(f"Wrote method result envelope: {method_path}",indent=1)
     if transcription_investigator_report:
         transcription_path=output_path+".transcription_investigator.json"
         fc.write_json(transcription_path,transcription_investigator_report)
@@ -1134,6 +1181,57 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.write_json(section_path,midi_section_fit_report)
         fc.log(f"Wrote MIDI section-fit report: {section_path}",indent=1)
 
+    if keys_evidence_sources:
+        keys_sources_path=output_path+".keys_evidence_sources.json"
+        fc.write_json(keys_sources_path,{"version":"v16.7K3","diagnostic_only":True,"timing_changes_applied":False,
+            "normalized_keys":normalized_keys,"sources":keys_evidence_sources})
+        fc.log(f"Wrote Keys evidence source routing: {keys_sources_path}",indent=1)
+    if audio_evidence_bundle:
+        evidence_path=output_path+".audio_evidence_bundle.json"
+        fc.write_json(evidence_path,audio_evidence_bundle)
+        fc.log(f"Wrote read-only audio evidence bundle: {evidence_path}",indent=1)
+    if audio_evidence_qualification:
+        qualification_path=output_path+".audio_evidence_qualification.json"
+        fc.write_json(qualification_path,audio_evidence_qualification)
+        fc.log(f"Wrote diagnostic audio evidence qualification: {qualification_path}",indent=1)
+    if strict_audio_queries:
+        query_path=output_path+".strict_audio_queries.json"
+        fc.write_json(query_path,strict_audio_queries)
+        fc.log(f"Wrote diagnostic strict audio queries: {query_path}",indent=1)
+    if query_result_evaluation:
+        evaluation_path=output_path+".query_result_evaluation.json"
+        fc.write_json(evaluation_path,query_result_evaluation)
+        fc.log(f"Wrote diagnostic query-result evaluation: {evaluation_path}",indent=1)
+    if evidence_contribution_ledger:
+        ledger_path=output_path+".evidence_contribution_ledger.json"
+        fc.write_json(ledger_path,evidence_contribution_ledger)
+        fc.log(f"Wrote diagnostic evidence contribution ledger: {ledger_path}",indent=1)
+    if audio_qualified_occurrence_resolution is not None:
+        occurrence_path=output_path+".audio_qualified_occurrence_resolution.json"
+        fc.write_json(occurrence_path,audio_qualified_occurrence_resolution)
+        if not os.path.isfile(occurrence_path):
+            raise RuntimeError(f"Audio-qualified occurrence report write failed: {occurrence_path}")
+        fc.log(f"Wrote diagnostic audio-qualified occurrence resolution: {occurrence_path}",indent=1)
+    if targeted_boundary_evidence_acquisition is not None:
+        targeted_path=output_path+".targeted_boundary_evidence_acquisition.json"
+        fc.write_json(targeted_path,targeted_boundary_evidence_acquisition)
+        if not os.path.isfile(targeted_path):
+            raise RuntimeError(f"Targeted boundary evidence report write failed: {targeted_path}")
+        fc.log(f"Wrote diagnostic targeted boundary evidence acquisition: {targeted_path}",indent=1)
+    if comparative_boundary_evidence_triage is not None:
+        comparative_path=output_path+".comparative_boundary_evidence_triage.json"
+        fc.write_json(comparative_path,comparative_boundary_evidence_triage)
+        if not os.path.isfile(comparative_path):
+            raise RuntimeError(f"Comparative boundary evidence report write failed: {comparative_path}")
+        fc.log(f"Wrote diagnostic comparative boundary evidence triage: {comparative_path}",indent=1)
+    if hybrid_midi_audio_control is not None:
+        control_path=output_path+".hybrid_midi_audio_control.json"
+        fc.write_json(control_path,hybrid_midi_audio_control)
+        if not os.path.isfile(control_path):
+            raise RuntimeError(f"Hybrid MIDI-audio control report write failed: {control_path}")
+        fc.log(f"Wrote diagnostic hybrid MIDI-audio control proposal: {control_path}",indent=1)
+    elif midi_section_fit_report is not None and evidence_contribution_ledger is not None:
+        raise RuntimeError("Hybrid MIDI-audio proposal inputs exist but the proposal report was not generated")
     if structural_search_report:
         structural_path=output_path+".structural_search_report.json"
         fc.write_json(structural_path,structural_search_report)
@@ -1203,7 +1301,9 @@ def main():
     parser.add_argument("--force-monotonic-chain",action="store_true",help="DIAGNOSTIC ONLY: build the selected role-specific monotonic chain even when normal incipit authority rejects it")
     parser.add_argument("--allow-wide-monotonic-warp",action="store_true",help="DIAGNOSTIC ONLY: allow 0.70-1.30 chart stretch in forced monotonic-chain comparisons")
     parser.add_argument("--allow-compatible-audio-refinement",action="store_true",help="Allow compatible audio refinement after a forced monotonic chain; disabled by default")
-    parser.add_argument("--transcription-investigator",action="store_true",help="Read prepared MuScriptor MIDI evidence (not available for nominal, offset, linear, or unguarded dtw)")
+    parser.add_argument("--transcription-investigator",action="store_true",help="Legacy alias: read prepared MIDI evidence")
+    parser.add_argument("--prepared-midi-mode",choices=("off","auto","diagnostic","force-trusted"),default="auto",
+                        help="Continuous MIDI landmark policy for compatible audio methods")
     parser.add_argument("--midi-section-fit",action="store_true",help="DIAGNOSTIC ONLY: write overlapping measure-section MIDI candidate/path/fusion report")
     parser.add_argument("--force-midi-section-fit",action="store_true",help="DEPRECATED alias for permissive MIDI section materialization")
     parser.add_argument("--midi-section-fit-materialization",choices=("conservative","permissive","diagnostic-unsafe"),default=None,
@@ -1289,7 +1389,8 @@ def main():
           allow_compatible_audio_refinement=args.allow_compatible_audio_refinement,
           midi_section_fit=args.midi_section_fit,
           force_midi_section_fit=args.force_midi_section_fit,
-          midi_section_fit_materialization=args.midi_section_fit_materialization)
+          midi_section_fit_materialization=args.midi_section_fit_materialization,
+          prepared_midi_mode=args.prepared_midi_mode)
 
     if args.build_unsafe_continuous_comparison:
         if args.alignment_mode not in ("continuous-anchor-linear", "continuous-anchor-dtw"):

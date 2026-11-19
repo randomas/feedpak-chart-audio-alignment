@@ -11,6 +11,7 @@ production timing.
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from collections import deque
 import hashlib, json, math
 import statistics
 
@@ -33,6 +34,7 @@ ROLE_FILENAMES = {
     "guitar": "Guitar.muscriptor.mid",
     "bass": "Bass.muscriptor.mid",
     "drums": "Drums.muscriptor.mid",
+    "synth": "Synth.muscriptor.mid",
 }
 
 @dataclass(frozen=True)
@@ -110,9 +112,36 @@ def _discover_case_insensitive(folder: Path, expected: str):
     return None
 
 
-def discover_prepared_files(song_folder):
-    folder=Path(song_folder)
-    return {role:_discover_case_insensitive(folder,name) for role,name in ROLE_FILENAMES.items()}
+ROLE_MIDI_ALIASES={
+    "bass":["Bass.muscriptor.mid","Bass.mid"],
+    "drums":["Drums.muscriptor.mid","Drums.mid"],
+    "guitar":["Guitar.muscriptor.mid","Guitar.mid"],
+    "piano":["Piano.muscriptor.mid","Piano.mid","Keys.mid","Keyboard.mid"],
+    "synth":["Synth.muscriptor.mid","Synth.mid","Keys.muscriptor.mid","Keys.mid"],
+}
+
+
+def discover_prepared_files(song_folder, configured_streams=None, return_diagnostics=False):
+    """Discover explicit, canonical, then generic role MIDI case-insensitively."""
+    folder=Path(song_folder);configured=dict(configured_streams or {});result={};diagnostics={}
+    roles=list(dict.fromkeys(list(ROLE_FILENAMES)+list(configured)))
+    for role in roles:
+        explicit=(configured.get(role) or {}).get("performance_midi")
+        names=([str(explicit)] if explicit else [])+list(ROLE_MIDI_ALIASES.get(role,[ROLE_FILENAMES.get(role)]))
+        names=[x for i,x in enumerate(names) if x and x.casefold() not in {y.casefold() for y in names[:i]}]
+        found=[]
+        for rank,name in enumerate(names):
+            path=_discover_case_insensitive(folder,name)
+            if path is not None:found.append((rank,name,path))
+        selected=found[0][2] if found else None;result[str(role)]=selected
+        selected_name=None if selected is None else selected.name
+        mode=("explicit_metadata" if selected is not None and explicit and selected.name.casefold()==str(explicit).casefold()
+              else "canonical_provider_filename" if selected is not None and ".muscriptor.mid" in selected.name.casefold()
+              else "generic_role_filename" if selected is not None else "not_prepared")
+        diagnostics[str(role)]={"selected":selected_name,"discovery_mode":mode,
+            "provider":"muscriptor" if mode=="canonical_provider_filename" else "prepared_midi",
+            "ignored_alternatives":[x[2].name for x in found[1:]],"searched_names":names}
+    return (result,diagnostics) if return_diagnostics else result
 
 
 def _load_provenance(midi_path: Path):
@@ -125,32 +154,28 @@ def _load_provenance(midi_path: Path):
 
 
 def parse_muscriptor_midi(path, role, padding_added=0.0):
+    provider="muscriptor" if ".muscriptor.mid" in Path(path).name.casefold() else "prepared_midi"
+    discovery_mode="canonical_provider_filename" if provider=="muscriptor" else "generic_role_filename"
     if mido is None:
-        return {"provider":"muscriptor","source":role,"status":"unavailable",
+        return {"provider":provider,"discovery_mode":discovery_mode,"source":role,"status":"unavailable",
                 "reason":"mido_not_installed","events":[]}
     midi_path=Path(path); provenance,provenance_path=_load_provenance(midi_path)
     try:
         midi=mido.MidiFile(str(midi_path))
-        current=0.0; active={}; events=[]
-        # mido.merge_tracks preserves delta ticks and combines the tempo/event stream.
-        for message in mido.merge_tracks(midi.tracks):
-            current += mido.tick2second(message.time,midi.ticks_per_beat,500000)
-            if message.type=="set_tempo":
-                # mido MidiFile.length handles tempo changes, but tick2second needs current tempo.
-                # Reparse below using a maintained tempo; this branch is retained for clarity.
-                pass
+        active={}; events=[]
+        # One merged pass is sufficient; maintain the active tempo while consuming delta ticks.
         tempo=500000; current=0.0
         for message in mido.merge_tracks(midi.tracks):
             current += mido.tick2second(message.time,midi.ticks_per_beat,tempo)
             if message.type=="set_tempo":
                 tempo=message.tempo; continue
             if message.type=="note_on" and message.velocity>0:
-                active.setdefault((getattr(message,"channel",0),message.note),[]).append((current,message.velocity))
+                active.setdefault((getattr(message,"channel",0),message.note),deque()).append((current,message.velocity))
             elif message.type in ("note_off","note_on"):
                 key=(getattr(message,"channel",0),message.note)
                 if active.get(key):
-                    start,velocity=active[key].pop(0)
-                    event={"provider":"muscriptor","source":role,
+                    start,velocity=active[key].popleft()
+                    event={"provider":provider,"discovery_mode":discovery_mode,"source":role,
                            "event_type":"drum_hit" if role=="drums" else "pitched_note",
                            "source_time":round(start,6),"audio_time":round(start+padding_added,6),
                            "duration":round(max(0.0,current-start),6),"pitch":int(message.note),
@@ -162,7 +187,7 @@ def parse_muscriptor_midi(path, role, padding_added=0.0):
         # Drums may omit note-offs in some MIDI writers: retain unmatched onsets as onset-only.
         for (_channel,note),starts in active.items():
             for start,velocity in starts:
-                events.append({"provider":"muscriptor","source":role,
+                events.append({"provider":provider,"discovery_mode":discovery_mode,"source":role,
                     "event_type":"drum_hit" if role=="drums" else "pitched_note",
                     "source_time":round(start,6),"audio_time":round(start+padding_added,6),
                     "duration":0.0,"pitch":int(note),"pitch_class":int(note)%12,
@@ -170,7 +195,7 @@ def parse_muscriptor_midi(path, role, padding_added=0.0):
                     "canonical_drum_piece":fc.gm_drum_to_piece(int(note)) if role=="drums" else None,
                     "padding_added":float(padding_added)})
         events.sort(key=lambda x:(x["audio_time"],x["pitch"]))
-        return {"provider":"muscriptor","source":role,"status":"available",
+        return {"provider":provider,"discovery_mode":discovery_mode,"source":role,"status":"available",
                 "prepared_file":str(midi_path),"prepared_file_sha256":_sha256(midi_path),
                 "provenance":provenance,"provenance_path":provenance_path,
                 "timeline":{"midi_reference":"source_audio_unpadded","alignment_reference":"padded_audio",
@@ -178,7 +203,7 @@ def parse_muscriptor_midi(path, role, padding_added=0.0):
                             "padding_added_seconds":float(padding_added)},
                 "events":events,"retained_event_count":len(events)}
     except Exception as exc:
-        return {"provider":"muscriptor","source":role,"status":"failed_nonfatal",
+        return {"provider":provider,"discovery_mode":discovery_mode,"source":role,"status":"failed_nonfatal",
                 "prepared_file":str(midi_path),"reason":f"{type(exc).__name__}: {exc}","events":[]}
 
 
@@ -1096,13 +1121,14 @@ def build_transcription_prior(report,fallback):
 
 def investigate(score_events,song_folder,baseline,padding_added=0.0,alignment_mode=None,config=None,
                 nominal_prior=None,nominal_prior_report=None,boundary_controls=None,recovery_prior=None,
-                pass_label="initial",observed_incipit_prior=None,observed_incipit_report=None):
+                pass_label="initial",observed_incipit_prior=None,observed_incipit_report=None,
+                prepared_files=None):
     cfg=config or InvestigatorConfig()
     if alignment_mode is not None:validate_method(alignment_mode)
     nominal_prior=nominal_prior or (lambda t:float(t))
-    discovered=discover_prepared_files(song_folder);providers=[]
+    discovered=dict(prepared_files) if prepared_files is not None else discover_prepared_files(song_folder);providers=[]
     for role,path in discovered.items():
-        providers.append({"provider":"muscriptor","source":role,"status":"not_prepared","expected_file":ROLE_FILENAMES[role],"events":[]}
+        providers.append({"provider":"muscriptor","source":role,"status":"not_prepared","expected_file":ROLE_FILENAMES.get(role),"events":[]}
                          if path is None else parse_muscriptor_midi(path,role,padding_added))
     profiles=build_role_activity_profiles(score_events,providers)
     incipit_tracking=track_incipit_role(score_events,providers,nominal_prior,observed_incipit_prior,cfg)

@@ -539,8 +539,15 @@ def build_section_candidate_report(
     baseline: Callable[[float], float] | None = None,
     cfg: SectionFitConfig | None = None,
     baseline_hypotheses: Mapping[str, Callable[[float], float]] | None = None,
+    precomputed_role_reports: Mapping[str, Mapping[str, Any]] | None = None,
+    role_complete_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
+    progress_interval_seconds: float = 15.0,
 ) -> dict[str, Any]:
-    """Build exact Step-1 diagnostics with reusable MIDI preparation and caches."""
+    """Build exact Step-1 diagnostics with optional exact per-role reuse.
+
+    Reused role reports are copied verbatim.  Candidate search grids, scoring,
+    validity, ordering, and limits are unchanged.
+    """
     started=time.perf_counter();cfg=cfg or SectionFitConfig()
     hypotheses=dict(baseline_hypotheses or {})
     if not hypotheses:hypotheses["requested_method_baseline"]=baseline or (lambda t:float(t))
@@ -549,41 +556,67 @@ def build_section_candidate_report(
     prep_started=time.perf_counter()
     prepared_by_role={role:prepare_grouped_midi(midi_events_by_role.get(role) or [],cfg) for role in windows}
     grouping_seconds=time.perf_counter()-prep_started
+    cached=dict(precomputed_role_reports or {})
     role_reports={};totals={"window_count":0,"observable_window_count":0,"candidate_count":0}
     global_perf={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0,
-                 "unique_midi_slices":0,"midi_grouping_seconds":grouping_seconds}
-    for role,role_windows in windows.items():
-        role_started=time.perf_counter();rows=[];prepared=prepared_by_role[role]
-        counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0}
-        for window in role_windows:
-            pooled=[];alignment_cache={}
-            for hypothesis_name,hypothesis_baseline in hypotheses.items():
-                pooled.extend(search_section_candidates(window,prepared,hypothesis_baseline,cfg,hypothesis_name,
-                                                        alignment_cache,counters))
-            pooled.sort(key=lambda x:(x.combined_score,x.chart_coverage,-x.median_residual_seconds),reverse=True)
-            candidates=[]
-            for item in pooled:
-                if any(abs(item.midi_start-other.midi_start)<cfg.distinct_occurrence_seconds for other in candidates):continue
-                candidates.append(item)
-                if len(candidates)>=cfg.candidate_limit:break
-            totals["window_count"]+=1;totals["observable_window_count"]+=int(window.observability=="observable")
-            totals["candidate_count"]+=len(candidates)
-            window_data=asdict(window)
-            window_data["groups"]=[{"time":x["time"],"pitches":list(x["pitches"])} for x in window.groups]
-            window_data["context_groups"]=[]
-            rows.append({"window":window_data,"candidates":[asdict(x) for x in candidates],
-                         "performance":{"unique_midi_slices":len(alignment_cache)}})
-            global_perf["unique_midi_slices"]+=len(alignment_cache)
-        role_perf={**counters,"elapsed_seconds":time.perf_counter()-role_started,
-                   "prepared_midi_group_count":len(prepared["groups"]),
-                   "window_count":len(role_windows)}
+                 "unique_midi_slices":0,"midi_grouping_seconds":grouping_seconds,
+                 "role_cache_hit_count":0,"role_cache_miss_count":0}
+    role_count=len(windows)
+    for role_number,(role,role_windows) in enumerate(windows.items(),1):
+        if role in cached:
+            role_report=_candidate_cache_json_safe(cached[role]);role_reports[role]=role_report
+            global_perf["role_cache_hit_count"]+=1
+            print(f"  [*] MIDI candidates [{role}]: exact role-cache hit ({role_number}/{role_count}; {len(role_windows)} windows)",flush=True)
+        else:
+            global_perf["role_cache_miss_count"]+=1
+            role_started=time.perf_counter();last_progress=role_started;rows=[];prepared=prepared_by_role[role]
+            counters={"transform_trials":0,"midi_slice_lookups":0,"dp_evaluations":0,"alignment_cache_hits":0}
+            print(f"  [*] MIDI candidates [{role}]: cache miss; windows={len(role_windows)}; MIDI groups={len(prepared['groups'])} ({role_number}/{role_count})",flush=True)
+            for window_number,window in enumerate(role_windows,1):
+                pooled=[];alignment_cache={}
+                for hypothesis_name,hypothesis_baseline in hypotheses.items():
+                    pooled.extend(search_section_candidates(window,prepared,hypothesis_baseline,cfg,hypothesis_name,
+                                                            alignment_cache,counters))
+                pooled.sort(key=lambda x:(x.combined_score,x.chart_coverage,-x.median_residual_seconds),reverse=True)
+                candidates=[]
+                for item in pooled:
+                    if any(abs(item.midi_start-other.midi_start)<cfg.distinct_occurrence_seconds for other in candidates):continue
+                    candidates.append(item)
+                    if len(candidates)>=cfg.candidate_limit:break
+                window_data=asdict(window)
+                window_data["groups"]=[{"time":x["time"],"pitches":list(x["pitches"])} for x in window.groups]
+                window_data["context_groups"]=[]
+                rows.append({"window":window_data,"candidates":[asdict(x) for x in candidates],
+                             "performance":{"unique_midi_slices":len(alignment_cache)}})
+                now=time.perf_counter()
+                if window_number==len(role_windows) or now-last_progress>=progress_interval_seconds:
+                    elapsed=now-role_started;rate=elapsed/max(1,window_number)
+                    remaining=rate*(len(role_windows)-window_number)
+                    hits=counters["alignment_cache_hits"];evals=counters["dp_evaluations"]
+                    hit_rate=hits/max(1,hits+evals)
+                    print(f"  [*] MIDI candidates [{role}]: window {window_number}/{len(role_windows)}; "
+                          f"trials={counters['transform_trials']}; DP={evals}; cache-hit={hit_rate:.1%}; "
+                          f"elapsed={elapsed:.1f}s; ETA={remaining:.1f}s",flush=True)
+                    last_progress=now
+            role_perf={**counters,"elapsed_seconds":time.perf_counter()-role_started,
+                       "prepared_midi_group_count":len(prepared["groups"]),"window_count":len(role_windows)}
+            role_report={"window_count":len(role_windows),"windows":rows,"performance":role_perf}
+            role_reports[role]=role_report
+            if role_complete_callback:role_complete_callback(role,role_report)
+            print(f"  [*] MIDI candidates [{role}] complete: candidates={sum(len(x.get('candidates') or []) for x in rows)}; "
+                  f"elapsed={role_perf['elapsed_seconds']:.1f}s; role cache committed",flush=True)
+        report=role_reports[role]
+        rows=report.get("windows") or [];perf=report.get("performance") or {}
+        totals["window_count"]+=len(rows)
+        totals["observable_window_count"]+=sum(int((x.get("window") or {}).get("observability")=="observable") for x in rows)
+        totals["candidate_count"]+=sum(len(x.get("candidates") or []) for x in rows)
         for key in ("transform_trials","midi_slice_lookups","dp_evaluations","alignment_cache_hits"):
-            global_perf[key]+=counters[key]
-        role_reports[role]={"window_count":len(role_windows),"windows":rows,"performance":role_perf}
+            global_perf[key]+=int(perf.get(key,0) or 0)
+        global_perf["unique_midi_slices"]+=sum(int((x.get("performance") or {}).get("unique_midi_slices",0) or 0) for x in rows)
     global_perf["candidate_search_seconds"]=time.perf_counter()-started
     global_perf["cache_hit_rate"]=(global_perf["alignment_cache_hits"]/
         max(1,global_perf["alignment_cache_hits"]+global_perf["dp_evaluations"]))
-    report={"version":"1.2-v16.6A-phase-diagnostics","method":"midi-section-fit","diagnostic_only":True,
+    report={"version":"1.3-v16.7K3.1-role-cache-progress","method":"midi-section-fit","diagnostic_only":True,
         "timing_changes_applied":False,"monotonic_path_selected":False,"config":asdict(cfg),
         "search_hypotheses":list(hypotheses),"summary":totals,"performance":global_perf,"roles":role_reports}
     return annotate_candidate_phase_diagnostics(report)
@@ -1089,11 +1122,13 @@ def _fused_transition(previous: FusedControlCandidate,
 
 
 def _select_fused_monotonic_controls(layers: Sequence[Mapping[str, Any]],
-                                     cfg: SectionFusionConfig):
+                                     cfg: SectionFusionConfig,
+                                     progress_callback: Callable[[Mapping[str, Any]], None] | None = None):
     if not layers:
         return [], [], {"status": "no_supported_controls"}
     beam = []
     transition_rejections = {}
+    transition_checks=0
     for index, layer in enumerate(layers):
         next_beam = []
         candidates = layer.get("candidates") or []
@@ -1103,12 +1138,18 @@ def _select_fused_monotonic_controls(layers: Sequence[Mapping[str, Any]],
         else:
             for score, path, edges in beam:
                 for candidate in candidates:
+                    transition_checks+=1
                     valid, reason, edge_stretch, adjustment = _fused_transition(path[-1], candidate, cfg)
                     if not valid:
                         transition_rejections[reason] = transition_rejections.get(reason, 0) + 1
                         continue
                     next_beam.append((score + candidate.confidence + adjustment,
                                       path + [candidate], edges + [edge_stretch]))
+        if progress_callback:
+            progress_callback({"dp_layer_index":index,"dp_layer_count":len(layers),
+                "previous_state_count":len(beam),"candidate_count":len(candidates),
+                "next_state_count":len(next_beam),"transition_checks":transition_checks,
+                "transition_rejections":dict(transition_rejections)})
         if not next_beam:
             return [], [], {"status": "no_global_monotonic_fused_path",
                             "failed_layer_index": index,
@@ -1168,7 +1209,8 @@ def _catch_up_events(edges: Sequence[float], cfg: SectionFusionConfig):
 
 
 def fuse_monotonic_role_paths(path_report: Mapping[str, Any],
-                              cfg: SectionFusionConfig | None = None) -> dict[str, Any]:
+                              cfg: SectionFusionConfig | None = None,
+                              progress_interval_seconds: float = 15.0) -> dict[str, Any]:
     """Fuse compatible role paths into sparse diagnostic timing-map proposals.
 
     Incompatible role clusters are never averaged. Global control monotonicity
@@ -1177,6 +1219,8 @@ def fuse_monotonic_role_paths(path_report: Mapping[str, Any],
     """
     cfg = cfg or SectionFusionConfig()
     layers, unsupported, role_conflicts = build_fused_control_candidates(path_report, cfg)
+    progress_started=time.perf_counter();last_progress=progress_started
+    transition_checks=0;selection_failures=0
 
     # Split at chart-time support gaps before selection so a later region cannot
     # invalidate a strong earlier path or imply authority across the gap.
@@ -1197,9 +1241,34 @@ def fuse_monotonic_role_paths(path_report: Mapping[str, Any],
         while cursor<len(block):
             best=None;best_end=None;failure=None
             for end in range(cursor+1,len(block)+1):
-                path,edges,selection=_select_fused_monotonic_controls(block[cursor:end],cfg)
-                if not path:
-                    failure=selection;break
+                def inner_progress(state):
+                    nonlocal last_progress
+                    now=time.perf_counter()
+                    if now-last_progress<progress_interval_seconds:return
+                    completed=sum(len(x) for x in blocks[:block_index])+cursor+int(state.get("dp_layer_index",0))+1
+                    elapsed=now-progress_started;fraction=completed/max(1,len(layers))
+                    eta=max(0.0,elapsed/fraction-elapsed) if fraction else 0.0
+                    rejections=state.get("transition_rejections") or {}
+                    print(f"  [*] MIDI fusion inner: global layer {min(completed,len(layers))}/{len(layers)}; "
+                          f"block {block_index+1}/{len(blocks)}; DP layer {int(state.get('dp_layer_index',0))+1}/{state.get('dp_layer_count',0)}; "
+                          f"states={state.get('previous_state_count',0)}->{state.get('next_state_count',0)}; "
+                          f"candidates={state.get('candidate_count',0)}; transitions={state.get('transition_checks',0)}; "
+                          f"geometry rejects={rejections.get('unsafe_fused_edge_geometry',0)}; "
+                          f"nonadvance rejects={rejections.get('midi_control_did_not_advance',0)}; "
+                          f"elapsed={elapsed:.1f}s; ETA={eta:.1f}s",flush=True)
+                    last_progress=now
+                path,edges,selection=_select_fused_monotonic_controls(block[cursor:end],cfg,inner_progress)
+                transition_checks+=1
+                if not path:selection_failures+=1;failure=selection
+                now=time.perf_counter()
+                if now-last_progress>=progress_interval_seconds:
+                    completed=sum(len(x) for x in blocks[:block_index])+min(end,len(block))
+                    elapsed=now-progress_started;fraction=completed/max(1,len(layers))
+                    eta=max(0.0,elapsed/fraction-elapsed) if fraction else 0.0
+                    print(f"  [*] MIDI fusion: layer {completed}/{len(layers)}; block {block_index+1}/{len(blocks)}; "
+                          f"checks={transition_checks}; failures={selection_failures}; elapsed={elapsed:.1f}s; ETA={eta:.1f}s",flush=True)
+                    last_progress=now
+                if not path:break
                 best=(path,edges,selection);best_end=end
             if best is None:
                 rejected_blocks.append({"block_index":block_index,"layer_index":cursor,
@@ -1267,6 +1336,9 @@ def fuse_monotonic_role_paths(path_report: Mapping[str, Any],
         "role_conflicts": role_conflicts,
         "unsupported_points": unsupported,
         "rejected_blocks": rejected_blocks,
+        "progress_diagnostics":{"layer_count":len(layers),"block_count":len(blocks),
+            "transition_checks":transition_checks,"selection_failures":selection_failures,
+            "elapsed_seconds":time.perf_counter()-progress_started},
     }
 
 
@@ -1650,6 +1722,68 @@ def _load_candidate_cache(path,fingerprint,disabled,rebuild):
     return candidate_report,report
 
 
+def _role_cache_directory(monolithic_path):
+    if not monolithic_path:return None
+    base=os.path.splitext(os.path.abspath(os.fspath(monolithic_path)))[0]
+    return base+".roles"
+
+
+def _role_cache_payload(playback_measures, chart_events_by_role, midi_events_by_role,
+                        baseline, candidate_config, baseline_hypotheses, role):
+    return _candidate_cache_payload(playback_measures,
+        {role:list(chart_events_by_role.get(role) or [])},
+        {role:list(midi_events_by_role.get(role) or [])},
+        baseline,candidate_config,baseline_hypotheses)
+
+
+def _role_cache_path(directory,role):
+    safe="".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(role))
+    return os.path.join(directory,safe+".json")
+
+
+def _load_role_caches(directory, role_payloads, disabled=False, rebuild=False):
+    reports={};statuses={}
+    if disabled:return reports,{role:"disabled" for role in role_payloads}
+    if rebuild:return reports,{role:"rebuild_requested" for role in role_payloads}
+    for role,payload in role_payloads.items():
+        path=_role_cache_path(directory,role);fingerprint=_candidate_cache_fingerprint(payload)
+        if not os.path.isfile(path):statuses[role]="role_cache_file_missing";continue
+        try:data=json.load(open(path,"r",encoding="utf-8"))
+        except Exception:statuses[role]="role_cache_load_error";continue
+        if data.get("schema_version")!=1:statuses[role]="role_cache_schema_mismatch";continue
+        if data.get("fingerprint")!=fingerprint:statuses[role]="role_cache_fingerprint_mismatch";continue
+        report=data.get("role_report")
+        if not isinstance(report,dict):statuses[role]="role_cache_report_missing";continue
+        reports[role]=report;statuses[role]="exact_role_cache_hit"
+    return reports,statuses
+
+
+def _write_role_cache(directory,role,payload,role_report,source="generated"):
+    path=_role_cache_path(directory,role);os.makedirs(directory,exist_ok=True)
+    data={"schema_version":1,"cache_kind":"midi_section_role_candidates",
+        "implementation_version":"v16.7K3.1-exact-equivalent-role-cache-v1",
+        "role":role,"fingerprint":_candidate_cache_fingerprint(payload),
+        "payload":payload,"source":source,"created_unix":time.time(),
+        "role_report":_candidate_cache_json_safe(role_report)}
+    fd,tmp=tempfile.mkstemp(prefix=".midi-section-role-cache-",suffix=".tmp",dir=directory)
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8",newline="\n") as f:
+            json.dump(data,f,sort_keys=True,separators=(",",":"),allow_nan=False)
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.remove(tmp)
+    return path
+
+
+def _import_monolithic_roles(directory,role_payloads,candidate_report):
+    imported=[]
+    for role,role_report in (candidate_report.get("roles") or {}).items():
+        if role in role_payloads:
+            _write_role_cache(directory,role,role_payloads[role],role_report,"legacy_monolithic_import")
+            imported.append(role)
+    return imported
+
+
 def _write_candidate_cache(path,fingerprint,payload,candidate_report):
     if not path:return
     parent=os.path.dirname(os.path.abspath(path));os.makedirs(parent,exist_ok=True)
@@ -1847,18 +1981,53 @@ def build_section_fusion_report(
     candidate_report,cache_report=_load_candidate_cache(
         candidate_cache_path,fingerprint,bool(candidate_cache_disabled),bool(candidate_cache_rebuild))
     candidate_started=time.perf_counter()
-    if candidate_report is None:
+    role_cache_dir=_role_cache_directory(candidate_cache_path)
+    role_payloads={role:_role_cache_payload(playback_measures,chart_events_by_role,midi_events_by_role,
+        baseline,candidate_config,baseline_hypotheses,role) for role in chart_events_by_role}
+    cache_report["legacy_monolithic_checked"]=bool(candidate_cache_path)
+    cache_report["role_cache_directory"]=role_cache_dir
+    if candidate_report is not None:
+        imported=[]
+        if role_cache_dir and not candidate_cache_disabled:
+            imported=_import_monolithic_roles(role_cache_dir,role_payloads,candidate_report)
+        cache_report["legacy_monolithic_accepted"]=True
+        cache_report["legacy_roles_imported"]=imported
+        cache_report["role_status"]={role:("legacy_monolithic_import" if role in imported else "legacy_monolithic_hit") for role in role_payloads}
+    else:
+        cached_roles,role_status=_load_role_caches(role_cache_dir,role_payloads,
+            bool(candidate_cache_disabled),bool(candidate_cache_rebuild))
+        cache_report["legacy_monolithic_accepted"]=False
+        cache_report["role_status"]=role_status
+        def commit_role(role,report):
+            if not candidate_cache_disabled and role_cache_dir:
+                _write_role_cache(role_cache_dir,role,role_payloads[role],report,"generated")
+                cache_report["role_status"][role]="generated_and_committed"
         candidate_report = build_section_candidate_report(
             playback_measures, chart_events_by_role, midi_events_by_role,
-            baseline=baseline, cfg=candidate_config, baseline_hypotheses=baseline_hypotheses)
+            baseline=baseline, cfg=candidate_config, baseline_hypotheses=baseline_hypotheses,
+            precomputed_role_reports=cached_roles,role_complete_callback=commit_role)
         if not candidate_cache_disabled and candidate_cache_path:
             _write_candidate_cache(candidate_cache_path,fingerprint,payload,candidate_report)
+            cache_report["monolithic_cache_written"]=True
+        cache_report["role_cache_hits"]=sorted(cached_roles)
+        cache_report["role_cache_misses"]=sorted(set(role_payloads)-set(cached_roles))
     candidate_seconds=time.perf_counter()-candidate_started
     candidate_report=annotate_candidate_phase_diagnostics(candidate_report)
+    if cache_report.get("hit"):
+        print(f"  [*] MIDI candidate cache: legacy monolithic exact hit; load={cache_report.get('load_seconds',0.0):.2f}s; generation skipped",flush=True)
+        imported=cache_report.get("legacy_roles_imported") or []
+        if imported:print(f"  [*] MIDI candidate role-cache import: {', '.join(imported)}",flush=True)
+    else:
+        print(f"  [*] MIDI candidate role caches: hits={cache_report.get('role_cache_hits') or 'none'}; misses={cache_report.get('role_cache_misses') or 'none'}",flush=True)
+    role_count=len((candidate_report.get("roles") or {}))
+    print(f"  [*] MIDI role paths: starting monotonic selection for {role_count} role(s)",flush=True)
     path_started=time.perf_counter()
     path_report = select_monotonic_section_paths(candidate_report, path_config)
     path_report["phase_diagnostics"]=build_selected_phase_diagnostics(path_report,candidate_report)
     path_seconds=time.perf_counter()-path_started
+    print(f"  [*] MIDI role paths complete: elapsed={path_seconds:.2f}s",flush=True)
+    preview_layers,_,_=build_fused_control_candidates(path_report,fusion_config or SectionFusionConfig())
+    print(f"  [*] MIDI fusion: starting cross-role fusion; layers={len(preview_layers)}; roles={role_count}",flush=True)
     fusion_started=time.perf_counter()
     fusion_report = fuse_monotonic_role_paths(path_report, fusion_config)
     sra.annotate_fusion_report(fusion_report,chart_events_by_role)
@@ -1898,6 +2067,10 @@ def build_section_fusion_report(
         "control_count":sum(len(x.get("controls") or []) for x in fusion_report.get("regions") or [])}
     fusion_report["rooted_phrase_ordinal_support"]=phrase_authority
     fusion_seconds=time.perf_counter()-fusion_started
+    print(f"  [*] MIDI fusion complete: regions={len(fusion_report.get('regions') or [])}; "
+          f"controls={sum(len(x.get('controls') or []) for x in fusion_report.get('regions') or [])}; "
+          f"conflicts={len(fusion_report.get('role_conflicts') or [])}; rejected={len(fusion_report.get('rejected_blocks') or [])}; "
+          f"elapsed={fusion_seconds:.2f}s",flush=True)
     performance={"candidate_generation_seconds":candidate_seconds,
         "candidate_cache":cache_report,
         "path_selection_seconds":path_seconds,"fusion_seconds":fusion_seconds,

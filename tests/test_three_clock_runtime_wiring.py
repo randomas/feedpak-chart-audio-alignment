@@ -17,7 +17,7 @@ def test_process_supplies_real_role_audio_starts():
     import process_gp_alignment as pga
     text = Path(pga.__file__).read_text(encoding="utf-8")
     assert "role_audio_starts={role:fc.detect_leading_silence_seconds(path)" in text
-    assert 'if role in ("piano","guitar","bass","drums") and path' in text
+    assert 'if role in continuous_score_events and path' in text
 
 
 def test_light_diagnostics_expose_three_clock_result():

@@ -14,6 +14,7 @@ import subprocess
 
 import feedpak_common as fc
 import expression_encoding as ee
+import keys_metadata as km
 
 SUPPORTED_SCHEMA = 4
 
@@ -118,6 +119,12 @@ def resolved_roles(data, project_config_path=None):
                 assign(name, role)
     return roles
 
+
+def resolved_keys(data, project_config_path=None):
+    if not project_config_path or not os.path.isfile(project_config_path):
+        return {}, {"arrangements":[],"evidence_streams":{}}
+    with open(project_config_path,"r",encoding="utf-8") as f:cfg=json.load(f)
+    return km.track_descriptors(cfg), km.normalize_keys_configuration(cfg)
 
 def _tempo_events(data):
     initial = float((data.get("metadata") or {}).get("tempo") or 120.0)
@@ -242,6 +249,7 @@ def products(data, project_config_path=None):
     ppq = int(data["source"]["ppq"])
     tempo = _tempo_events(data)
     roles = resolved_roles(data, project_config_path)
+    keys_descriptors, normalized_keys = resolved_keys(data, project_config_path)
     tracks = {int(t["index"]): t for t in data.get("tracks", [])}
 
     notes_by_id = {}
@@ -261,6 +269,7 @@ def products(data, project_config_path=None):
     gp_vocals = None
     bass_on, guitar_on, piano_on = [], [], []
     bass_pitch, guitar_pitch, piano_pitch = [], [], []
+    keys_alignment_raw, keys_pitch_raw = {}, {}
     unresolved_drums = Counter()
 
     occurrences = data["playback"].get("beat_occurrences", [])
@@ -273,6 +282,8 @@ def products(data, project_config_path=None):
     for idx, track in tracks.items():
         name = track.get("name") or f"Track {idx + 1}"
         role = roles.get(name, "ignore")
+        key_descriptor = keys_descriptors.get(name)
+        if key_descriptor: role = "keys_configured"
         tid = _safe_id(name, idx)
         events = by_track.get(idx, [])
 
@@ -400,12 +411,11 @@ def products(data, project_config_path=None):
                     }
                 )
 
-        elif role in ("piano_left", "piano_right", "piano_combined"):
-            hand = {
-                "piano_left": "left",
-                "piano_right": "right",
-                "piano_combined": "combined",
-            }[role]
+        elif role in ("piano_left", "piano_right", "piano_combined", "keys_configured"):
+            hand = (key_descriptor or {}).get("hand") or ({
+                "piano_left": "left", "piano_right": "right", "piano_combined": "combined",
+            }.get(role,"combined"))
+            stream=(key_descriptor or {}).get("evidence_stream","piano")
             measures = []
             visits = {
                 x["playback_index"]: x
@@ -427,13 +437,20 @@ def products(data, project_config_path=None):
                     start = _seconds(event["absolute_start_tick"], tempo, ppq)
                     end = _seconds(event["absolute_start_tick"] + _effective_duration_ticks(event, notes_by_id.get((idx, event.get("note_id")))), tempo, ppq)
                     voice_beats[staff_id].append({"t_gp": start, "notes": [{"midi": midi, "end_gp": end}]})
-                    piano_on.append({"t_gp": start})
-                    piano_pitch.append({"t_gp": start, "midi": midi})
+                    key_event={"t_gp":start,"end_gp":end,"midi":midi,"source_track":name}
+                    keys_alignment_raw.setdefault(stream,[]).append({"t_gp":start,"source_track":name})
+                    keys_pitch_raw.setdefault(stream,[]).append(key_event)
+                    if stream=="piano":
+                        piano_on.append({"t_gp": start})
+                        piano_pitch.append({"t_gp": start, "midi": midi})
                 for staff_id, beats_for_staff in voice_beats.items():
                     if beats_for_staff:
                         staves[staff_id]["voices"] = [{"beats": beats_for_staff}]
                 measures.append({"idx": pi + 1, "t_gp": _seconds(visit["start_tick"], tempo, ppq), "staves": staves})
-            notation[tid] = {"version": 1, "source_track": name, "hand": hand, "measures": measures}
+            notation[tid] = {"version": 1, "source_track": name, "hand": hand, "measures": measures,
+                "family":"keys","arrangement_id":(key_descriptor or {}).get("arrangement_id","piano"),
+                "display_name":(key_descriptor or {}).get("display_name",name),"staff_mode":(key_descriptor or {}).get("staff_mode","grand" if hand in ("left","right") else "combined"),
+                "evidence_stream":stream}
 
         elif role == "lead_vocal":
             lyrics, pitch_notes = [], []
@@ -498,6 +515,10 @@ def products(data, project_config_path=None):
             keys.append({"t_gp": _seconds(visit["start_tick"], tempo, ppq), "key": key})
             last_key = key
 
+    keys_pitch_events_by_stream={stream:km.deduplicate_symbolic_events(events) for stream,events in keys_pitch_raw.items()}
+    keys_alignment_events_by_stream={stream:[{"t_gp":x["t_gp"],"source_tracks":x.get("source_tracks",[]),"duplicate_count":x.get("duplicate_count",1)} for x in events]
+        for stream,events in keys_pitch_events_by_stream.items()}
+    keys_arrangements=[dict(x) for x in normalized_keys.get("arrangements",[])]
     score_onsets = [x["t_gp"] for x in bass_on + guitar_on + piano_on + drums]
     return {
         "tempo_events": tempo,
@@ -510,6 +531,9 @@ def products(data, project_config_path=None):
         "bass_pitch_events": bass_pitch,
         "guitar_pitch_events": guitar_pitch,
         "piano_pitch_events": piano_pitch,
+        "keys_alignment_events_by_stream":keys_alignment_events_by_stream,
+        "keys_pitch_events_by_stream":keys_pitch_events_by_stream,
+        "keys_arrangements":keys_arrangements,
         "notation_tracks": notation,
         "gp_vocals": gp_vocals,
         "key_events_gp": keys,

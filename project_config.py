@@ -1,4 +1,5 @@
 import difflib,json,os,re,unicodedata
+import keys_metadata as km
 ROLES={'lead_vocal','drums','piano_left','piano_right','piano_combined','guitar','bass','ignore'}
 def norm(s): return re.sub(r'\s+',' ',re.sub(r'[()\[\]{}_/\\-]+',' ',unicodedata.normalize('NFKC',str(s or '')).strip().lower())).strip()
 def classify_name(name,percussion=False):
@@ -30,7 +31,20 @@ def default_allocation(inv):
  ignored=[x['name'] for x in inv if x['automatic_role'] in {'ignored_vocal','ignored_percussion'}]
  return {'lead_vocal':first('lead_vocal'),'drums':first('drums'),'piano':{'left':first('piano_left'),'right':first('piano_right'),'combined':first('piano_combined')},'guitars':guitars,'bass':bass,'ignored_tracks':ignored,'overrides':{},'unused_tracks':[x['name'] for x in inv if x['name'] not in active]}
 def names(t):
- p=t.get('piano') or {};return [x for x in [t.get('lead_vocal'),t.get('drums'),p.get('left'),p.get('right'),p.get('combined')] if x]+(t.get('guitars') or [])+(t.get('bass') or [])+(t.get('ignored_tracks') or [])+list((t.get('overrides') or {}).keys())
+ p=t.get('piano') or {};keys=t.get('keys') or {};key_names=[]
+ arrangements=keys.get('arrangements') or {}
+ if isinstance(arrangements,dict):
+  for spec in arrangements.values():
+   if not isinstance(spec,dict):continue
+   raw=spec.get('tracks')
+   if raw is None and spec.get('track') is not None:raw=[spec.get('track')]
+   for item in raw or []:key_names.append(item if isinstance(item,str) else item.get('name'))
+ streams=keys.get('evidence_streams') or {}
+ if isinstance(streams,dict):
+  for spec in streams.values():
+   if isinstance(spec,dict):key_names.extend(spec.get('tracks') or [])
+ return [x for x in [t.get('lead_vocal'),t.get('drums'),p.get('left'),p.get('right'),p.get('combined')] if x]+(t.get('guitars') or [])+(t.get('bass') or [])+(t.get('ignored_tracks') or [])+list((t.get('overrides') or {}).keys())+[x for x in key_names if x]
+
 def ensure_song_json(path,gp,inv):
  existed=os.path.isfile(path);data=json.load(open(path,encoding='utf8')) if existed else {'title':'Unknown Title','artist':'Unknown Artist','album':None,'year':None,'genres':[]}
  pr=data.setdefault('feedpak_project',{});pr.setdefault('version',1);pr.setdefault('chart',gp);tr=pr.setdefault('tracks',{})
@@ -67,7 +81,10 @@ def validate_song_config(data,inv):
  for n,r in pairs:
   if n in ignored:err.append({'code':'active_track_also_ignored','track':n})
  if p.get('left') and p.get('left')==p.get('right'):err.append({'code':'piano_hands_use_same_track','track':p['left']})
- return {'valid':not err,'errors':err,'warnings':[]}
+ keys_validation=km.validate_keys_configuration(data,available_tracks=avail)
+ err.extend(keys_validation['errors'])
+ return {'valid':not err,'errors':err,'warnings':keys_validation['warnings'],
+         'normalized_keys':keys_validation['normalized']}
 def resolved_roles(data,inv):
  tr=data['feedpak_project']['tracks'];out={x['name']:x['automatic_role'] for x in inv}
  for n in tr.get('unused_tracks') or []:out[n]='unsupported'
@@ -102,6 +119,12 @@ def inspect_song(song,gp,data,inv,val):
 
 
 
+
+def normalize_keys_configuration(data):
+ return km.normalize_keys_configuration(data)
+def validate_keys_configuration(data,inventory=None,available_stems=None):
+ available=[x['name'] for x in (inventory or [])]
+ return km.validate_keys_configuration(data,available_tracks=available,available_stems=available_stems)
 
 def classify_vocal_capability(song, inventory=None, roles=None):
     inventory = inventory if inventory is not None else inventory_song(song)
