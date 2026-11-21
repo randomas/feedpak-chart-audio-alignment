@@ -44,3 +44,16 @@ def test_report_includes_equivalence():
     beats=bm.beatmap_to_explicit_beats(result); tempos=bm.beatmap_to_dense_tempos(result,60)
     c=bm.compare_timeline_outputs(beats,beats,tempos,tempos)
     assert bm.build_beatmap_report(result,c)["timeline_equivalence"]["status"]=="equivalent"
+
+
+def test_direct_warp_evaluation_preserves_non_linear_fractional_beats():
+    timeline={"beats":[{"t_gp":0.0,"measure":1,"ts_num":4},
+                        {"t_gp":4.0,"measure":2,"ts_num":4}],
+              "time_signatures":[]}
+    warped=[{"time":0.0,"measure":1,"ts_num":4},
+            {"time":8.0,"measure":2,"ts_num":4}]
+    warp=lambda t: float(t)*float(t)/2.0
+    result=bm.build_beatmap(timeline,warped,warp_fn=warp)
+    first_measure=result['beats'][:4]
+    assert [x['timing']['audio_time'] for x in first_measure]==[0.0,0.5,2.0,4.5]
+    assert all(x['provenance']['method']=='final_warp_direct_evaluation' for x in first_measure)

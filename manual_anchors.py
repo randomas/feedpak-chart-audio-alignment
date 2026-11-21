@@ -229,3 +229,93 @@ def apply_exact_anchors(baseline, assessment, bars):
             for x, y, kind in pts
         ],
     }
+
+
+def constrain_warp_to_exact_anchors(method_warp, assessment, bars):
+    """Preserve a method warp's local shape while making exact anchors immutable.
+
+    A piecewise-linear residual correction is applied between method endpoints and
+    exact manual anchors. This is intentionally a finalization layer: it can be
+    applied after DTW, MIDI, structural, or section materialization without
+    discarding the method's internal timing shape.
+    """
+    exact = sorted(
+        [x for x in assessment.get('anchors', []) if x.get('mode') == 'exact'],
+        key=lambda x: float(x['nominal_time'])
+    )
+    if not exact:
+        return method_warp, {'status':'no_exact_anchors','timing_changes_applied':False,
+                            'controls':[],'intervals':[]}
+    start=float(bars[0]['t_gp']); end=float(bars[-1]['t_gp'])
+    controls=[{'chart_time':start,'target_time':float(method_warp(start)),'kind':'method_start','id':'method_start'}]
+    controls += [{'chart_time':float(x['nominal_time']),'target_time':float(x['padded_audio_time']),
+                  'kind':'manual_exact','id':x.get('id')} for x in exact]
+    controls += [{'chart_time':end,'target_time':float(method_warp(end)),'kind':'method_end','id':'method_end'}]
+    ded={}
+    for row in controls:
+        x=row['chart_time']
+        if x not in ded or row['kind']=='manual_exact': ded[x]=row
+    controls=sorted(ded.values(),key=lambda x:x['chart_time'])
+    if any(b['target_time'] <= a['target_time'] for a,b in zip(controls,controls[1:])):
+        raise ValueError('manual anchors conflict with final method map endpoints or each other')
+    xs=np.array([x['chart_time'] for x in controls],dtype=float)
+    residuals=np.array([x['target_time']-float(method_warp(x['chart_time'])) for x in controls],dtype=float)
+    def warp(t):
+        value=float(t)
+        if value < xs[0] or value > xs[-1]: return float(method_warp(value))
+        return float(method_warp(value) + np.interp(value,xs,residuals))
+    intervals=[]
+    for a,b in zip(controls,controls[1:]):
+        intervals.append({'from':a['id'],'to':b['id'],'chart_start':a['chart_time'],
+                          'chart_end':b['chart_time'],'residual_start_seconds':
+                          a['target_time']-float(method_warp(a['chart_time'])),
+                          'residual_end_seconds':b['target_time']-float(method_warp(b['chart_time']))})
+    # Finalization must never trade anchor accuracy for invalid beat ordering.
+    sample_times=sorted(set([float(x['t_gp']) for x in bars]+list(xs)))
+    sample_values=[warp(x) for x in sample_times]
+    if any(b <= a for a,b in zip(sample_values,sample_values[1:])):
+        fallback,fallback_report=apply_exact_anchors(method_warp,assessment,bars)
+        fallback_report.update({'status':'fallback_non_monotonic_shape_correction',
+                                'strategy':'anchored_linear_fallback',
+                                'rejected_strategy':'shape_preserving_residual'})
+        return fallback,fallback_report
+    return warp, {'status':'applied','timing_changes_applied':True,'strategy':'shape_preserving_residual',
+                  'controls':controls,'intervals':intervals,'monotonic_sample_count':len(sample_times)}
+
+
+def verify_exported_beatmap(beatmap, assessment, tolerance_seconds=.001):
+    """Verify exact anchors from exported controls; use grid interpolation only for legacy Beatmaps."""
+    controls={str(x.get('id')):x for x in (beatmap.get('timing_controls') or [])
+              if str(x.get('mode','exact')).casefold()=='exact'}
+    points=[]
+    for row in beatmap.get('beats',[]) or []:
+        timing=row.get('timing') or {}
+        if timing.get('score_time') is not None and timing.get('audio_time') is not None:
+            points.append((float(timing['score_time']),float(timing['audio_time'])))
+    points=sorted(set(points))
+    anchors=[x for x in assessment.get('anchors',[]) if x.get('mode')=='exact']
+    checks=[]
+    xs=np.array([x for x,_ in points]) if points else None
+    ys=np.array([y for _,y in points]) if points else None
+    for row in anchors:
+        aid=str(row.get('id')); chart=float(row['nominal_time']); target=float(row['padded_audio_time'])
+        control=controls.get(aid)
+        if control is not None:
+            mapped=float(control['audio_time']); source='timing_control'
+            score_error=abs(float(control['score_time'])-chart)
+        elif points:
+            mapped=float(np.interp(chart,xs,ys)); source='beat_grid_interpolation'; score_error=0.0
+        else:
+            continue
+        error=abs(mapped-target)
+        checks.append({'anchor_id':row.get('id'),'chart_time':chart,
+                       'target_audio_time':target,'exported_audio_time':mapped,
+                       'error_ms':error*1000.0,'score_time_error_ms':score_error*1000.0,
+                       'verification_source':source,
+                       'satisfied':error<=tolerance_seconds and score_error<=tolerance_seconds})
+    status='not_supplied' if not anchors else ('unavailable' if len(checks)!=len(anchors) else
+            ('satisfied' if all(x['satisfied'] for x in checks) else 'export_failed'))
+    return {'manual_anchor_count':len(anchors),'exported_manual_anchor_status':status,
+            'maximum_exported_manual_anchor_error_ms':max((x['error_ms'] for x in checks),default=0.0),
+            'exported_manual_anchor_conflicts':[x for x in checks if not x['satisfied']],
+            'anchors':checks}

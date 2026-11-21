@@ -45,7 +45,8 @@ def validate_beatmap(beats,safe_stretch=DEFAULT_SAFE_STRETCH):
     return {"status":"error" if errors else "warning" if warnings else "ok","safe_stretch_range":[low,high],
             "error_count":len(errors),"warning_count":len(warnings),"errors":errors,"warnings":warnings}
 
-def build_beatmap(nominal_timeline,warped_downbeats,alignment_report=None,metadata=None,safe_stretch=DEFAULT_SAFE_STRETCH):
+def build_beatmap(nominal_timeline,warped_downbeats,alignment_report=None,metadata=None,
+                  safe_stretch=DEFAULT_SAFE_STRETCH,warp_fn=None,timing_controls=None):
     report=alignment_report or {}; nominal=list(nominal_timeline.get("beats") or []); warped=list(warped_downbeats)
     signatures=list(nominal_timeline.get("time_signatures") or [])
     if len(nominal)!=len(warped): raise ValueError("Beatmap nominal/warped downbeat counts differ")
@@ -59,13 +60,17 @@ def build_beatmap(nominal_timeline,warped_downbeats,alignment_report=None,metada
             f=b/count; flags=[]
             if stretch is not None and not safe_stretch[0]<=stretch<=safe_stretch[1]: flags.append("stretch_outside_safe_range")
             if measure in repaired: flags.append("repaired_timeline_interval")
+            score_time=float(source["t_gp"])+(nd or 0)*f
+            audio_time=(float(warp_fn(score_time)) if warp_fn is not None
+                        else float(mapped["time"])+(wd or 0)*f)
             beats.append({"identity":{"beat_id":f"seg{seg:03d}.m{measure:04d}.o{occ:02d}.b{b:02d}","playback_segment":seg,
                                       "playback_measure":measure,"source_measure":src,"source_occurrence":occ,"beat_index":b},
-                          "timing":{"score_time":round(float(source["t_gp"])+(nd or 0)*f,6),"audio_time":round(float(mapped["time"])+(wd or 0)*f,6),
+                          "timing":{"score_time":round(score_time,6),"audio_time":round(audio_time,6),
                                     "nominal_bpm":None if nbpm is None else round(nbpm,6),"mapped_bpm":None if mbpm is None else round(mbpm,6),
                                     "local_stretch":None if stretch is None else round(stretch,6)},
                           "meter":meter,"structural_role":"downbeat" if b==0 else "beat",
-                          "provenance":{"status":"inferred","method":"accepted_measure_warp_even_subdivision","left_measure":measure,
+                          "provenance":{"status":"observed" if warp_fn is not None else "inferred",
+                                        "method":"final_warp_direct_evaluation" if warp_fn is not None else "accepted_measure_warp_even_subdivision","left_measure":measure,
                                         "right_measure":int(nominal[i+1].get("measure",measure+1)) if i+1<len(nominal) else None,
                                         "repaired_interval":measure in repaired,"confidence":None,"flags":flags}})
     validation=validate_beatmap(beats,safe_stretch); downs=[b for b in beats if b["structural_role"]=="downbeat"]
@@ -76,18 +81,36 @@ def build_beatmap(nominal_timeline,warped_downbeats,alignment_report=None,metada
              "last_audio_time":beats[-1]["timing"]["audio_time"] if beats else None,"min_mapped_bpm":round(min(bpms),6) if bpms else None,
              "max_mapped_bpm":round(max(bpms),6) if bpms else None,"min_local_stretch":round(min(stretches),6) if stretches else None,
              "max_local_stretch":round(max(stretches),6) if stretches else None,"repaired_measure_count":len(repaired),"method":method}
-    return {"schema":"feedpak.beatmap","schema_version":SCHEMA_VERSION,"metadata":dict(metadata or {}),"summary":summary,"validation":validation,"beats":beats}
+    output_metadata=dict(metadata or {})
+    output_metadata["direct_warp_evaluation"]=bool(warp_fn is not None)
+    controls=[]
+    for row in timing_controls or []:
+        if str(row.get("mode","exact")).casefold()!="exact": continue
+        controls.append({"id":row.get("id"),"mode":"exact",
+                         "score_time":round(float(row["nominal_time"]),9),
+                         "audio_time":round(float(row["padded_audio_time"]),9),
+                         "playback_bar":row.get("playback_bar"),"beat":row.get("beat"),
+                         "source":"manual_anchor"})
+    return {"schema":"feedpak.beatmap","schema_version":SCHEMA_VERSION,
+            "metadata":output_metadata,"summary":summary,"validation":validation,
+            "beats":beats,"timing_controls":controls}
 
 def beatmap_to_explicit_beats(beatmap):
     return [{"time":round(float(p["timing"]["audio_time"]),4),"measure":int(p["identity"]["playback_measure"]) if p["structural_role"]=="downbeat" else -1} for p in beatmap.get("beats",[])]
 
 def beatmap_to_dense_tempos(beatmap,fallback_bpm):
     down=[p for p in beatmap.get("beats",[]) if p["structural_role"]=="downbeat"]; out=[]
+    direct=bool((beatmap.get("metadata") or {}).get("direct_warp_evaluation"))
     for i,p in enumerate(down):
         t=float(p["timing"]["audio_time"])
-        if i+1<len(down):
-            d=float(down[i+1]["timing"]["audio_time"])-t; bpm=round(max(1,int(p["meter"][0]))*60/d,3) if d>0 else (out[-1]["bpm"] if out else fallback_bpm)
-        else: bpm=out[-1]["bpm"] if out else fallback_bpm
+        mapped=p.get("timing",{}).get("mapped_bpm") if direct else None
+        if mapped is not None:
+            bpm=round(float(mapped),3)
+        elif i+1<len(down):
+            d=float(down[i+1]["timing"]["audio_time"])-t
+            bpm=round(max(1,int(p["meter"][0]))*60/d,3) if d>0 else (out[-1]["bpm"] if out else fallback_bpm)
+        else:
+            bpm=out[-1]["bpm"] if out else fallback_bpm
         out.append({"time":round(t,4),"bpm":bpm})
     return out
 

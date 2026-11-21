@@ -905,7 +905,7 @@ def sanitize_warped_downbeats(nominal, warped, min_ratio=0.30, max_ratio=2.00,
                   "unresolved_severe":severe,"original_reasons":reasons}
 
 
-def build_explicit_feedpak_beats(downbeats, nominal_downbeats=None):
+def build_explicit_feedpak_beats(downbeats, nominal_downbeats=None, warp_fn=None):
     """Project every expanded playback-measure beat without silently dropping identity.
 
     Plain DTW can produce locally non-advancing raw measure starts.  The old
@@ -928,7 +928,19 @@ def build_explicit_feedpak_beats(downbeats, nominal_downbeats=None):
         # is locally non-advancing. Equivalence then reports the timing defect;
         # it must not be hidden by deleting beats.
         for j in range(1,count):
-            out.append({"time":round(start+j*duration/count,4),"measure":-1})
+            if warp_fn is not None and i < len(nominal):
+                if i+1<len(nominal):
+                    nominal_duration=float(nominal[i+1]["t_gp"])-float(source["t_gp"])
+                elif i:
+                    nominal_duration=float(source["t_gp"])-float(nominal[i-1]["t_gp"])
+                else:
+                    nominal_duration=None
+                beat_score=(float(source["t_gp"])+j*nominal_duration/count
+                            if nominal_duration is not None and nominal_duration>0 else None)
+                beat_audio=float(warp_fn(beat_score)) if beat_score is not None else start+j*duration/count
+            else:
+                beat_audio=start+j*duration/count
+            out.append({"time":round(beat_audio,4),"measure":-1})
     return out
 
 
@@ -2462,6 +2474,13 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     }
     prepared_midi_files=ti.discover_prepared_files(os.path.dirname(os.path.abspath(gp_path)))
     if synth_midi_path:prepared_midi_files["synth"]=synth_midi_path
+    material_compatibility_report=plc.build_material_compatibility_report(
+        chart_path=gp_path,
+        audio_paths={"drums":drums_audio_path,"bass":bass_audio_path,"piano":piano_audio_path,
+                     "guitar":guitar_audio_path,"synth":synth_audio_path,"full":full_audio_path},
+        prepared_midi_files=prepared_midi_files,anchors_path=anchors_path,
+        padding_added=padding_added)
+    decision["material_compatibility"]=material_compatibility_report
     midi_section_fit_report=None
     if midi_section_fit:
         section_measures=[]
@@ -2855,10 +2874,10 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
                 indent=2,
             )
 
-    manual_anchor_verification=mo.verify_manual_anchors(warp_fn,manual_anchor_report,alignment_mode)
-    decision["manual_anchor_verification"]=manual_anchor_verification
-    if manual_anchor_verification.get("manual_anchor_status")=="materialization_failed":
-        raise RuntimeError("MANUAL ANCHOR INVARIANT FAILED: "+str(manual_anchor_verification.get("manual_anchor_conflicts")))
+    # Preliminary verification is diagnostic only. Section Fit may still mutate
+    # the map below; final verification occurs after the last timing mutation.
+    preliminary_manual_anchor_verification=mo.verify_manual_anchors(warp_fn,manual_anchor_report,alignment_mode)
+    decision["preliminary_manual_anchor_verification"]=preliminary_manual_anchor_verification
 
     guitar_coverage=diagnose_track_audio_coverage(
         _event_times(guitar_alignment_events),guitar_audio_path,warp_fn,sr=sr,source="guitar")
@@ -2898,16 +2917,26 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         else:
             fc.log(f"FORCED MIDI SECTION FIT unavailable: {section_application.get('status')}",indent=1)
 
+    # Final invariant layer. Preserve the selected method shape, but make every
+    # exact manual anchor immutable after the last timing mutation.
+    warp_fn,final_anchor_application=ma.constrain_warp_to_exact_anchors(
+        warp_fn,manual_anchor_report.get("quality") or {},song_timeline_gp["beats"])
+    decision["final_manual_anchor_application"]=final_anchor_application
+    manual_anchor_verification=mo.verify_manual_anchors(warp_fn,manual_anchor_report,alignment_mode)
+    decision["manual_anchor_verification"]=manual_anchor_verification
+    if manual_anchor_verification.get("manual_anchor_status")=="materialization_failed":
+        raise RuntimeError("FINAL MANUAL ANCHOR INVARIANT FAILED: "+str(manual_anchor_verification.get("manual_anchor_conflicts")))
+
     drum_hits = apply_warp(drum_hits_gp, warp_fn)
     key_events = apply_warp(key_events_gp, warp_fn)
 
     warped_beats = [
-        {"time": round(warp_fn(e["t_gp"]), 4), "measure": e["measure"], "ts_num": e["ts_num"]}
+        {"time": float(warp_fn(e["t_gp"])), "measure": e["measure"], "ts_num": e["ts_num"]}
         for e in song_timeline_gp["beats"]
     ]
     warped_beats,sanitization=sanitize_warped_downbeats(song_timeline_gp["beats"],warped_beats)
     legacy_dense_tempos=compute_dense_measure_tempos(warped_beats,fallback_bpm=float(tempo_events[0][1]))
-    legacy_explicit_beats=build_explicit_feedpak_beats(warped_beats,song_timeline_gp["beats"])
+    legacy_explicit_beats=build_explicit_feedpak_beats(warped_beats,song_timeline_gp["beats"],warp_fn=warp_fn)
     production_timing=finalize_production_timing(decision, alignment_mode)
     fc.log("FINAL PRODUCTION TIMING: "
         f"requested={production_timing['requested_method']}; selected={production_timing['selected_production_method']}; "
@@ -2919,7 +2948,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     if transcription_report is not None: alignment_report["transcription_investigator_report"]=transcription_report
     beatmap=bm.build_beatmap(song_timeline_gp,warped_beats,alignment_report=alignment_report,
                              metadata={"gp_parser":gp_parser,"alignment_mode":alignment_mode,
-                                       "timeline_authority":"beatmap"})
+                                       "timeline_authority":"beatmap"},warp_fn=warp_fn,
+                             timing_controls=(manual_anchor_report.get("quality") or {}).get("anchors") or [])
     explicit_beats=bm.beatmap_to_explicit_beats(beatmap)
     dense_tempos=bm.beatmap_to_dense_tempos(beatmap,float(tempo_events[0][1]))
     timeline_equivalence=bm.compare_timeline_outputs(legacy_explicit_beats,explicit_beats,
@@ -3032,6 +3062,13 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     fc.log(f"Hybrid MIDI-audio control proposal: proposals={hybrid_summary.get('proposal_count',0)}; "
            f"bounded local controls={hybrid_summary.get('bounded_local_control_count',0)}; timing unchanged",indent=1)
     beatmap_report=bm.build_beatmap_report(beatmap,timeline_equivalence)
+    exported_anchor_verification=ma.verify_exported_beatmap(
+        beatmap,manual_anchor_report.get("quality") or {},mo.ANCHOR_TOLERANCE_SECONDS)
+    beatmap_report["manual_anchor_verification"]=exported_anchor_verification
+    decision["exported_manual_anchor_verification"]=exported_anchor_verification
+    if exported_anchor_verification.get("exported_manual_anchor_status")=="export_failed":
+        raise RuntimeError("EXPORTED BEATMAP MANUAL ANCHOR INVARIANT FAILED: "+
+                           str(exported_anchor_verification.get("exported_manual_anchor_conflicts")))
     alignment_report["beatmap_timeline_equivalence"]=timeline_equivalence
     alignment_report["beatmap_evidence_summary"]=beatmap_evidence_report["summary"]
     fc.log(f"ALIGNMENT QUALITY: {alignment_report['severity'].upper()}",indent=1)
@@ -3124,6 +3161,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
         "alignment_report": alignment_report,
         "beatmap": beatmap,
         "beatmap_report": beatmap_report,
+        "material_compatibility_report":material_compatibility_report,
         "beatmap_evidence_report": beatmap_evidence_report,
         "instrument_evidence_report": instrument_evidence_report,
         "regional_source_fusion_report": regional_source_fusion_report,

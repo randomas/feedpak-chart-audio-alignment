@@ -1004,6 +1004,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     method_result_envelope=None
     beatmap=None
     beatmap_report=None
+    material_compatibility_report=None
     beatmap_evidence_report=None
     instrument_evidence_report=None
     regional_source_fusion_report=None
@@ -1057,6 +1058,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         method_result_envelope=gp_data.get("method_result_envelope")
         beatmap=gp_data.get("beatmap")
         beatmap_report=gp_data.get("beatmap_report")
+        material_compatibility_report=gp_data.get("material_compatibility_report")
         beatmap_evidence_report=gp_data.get("beatmap_evidence_report")
         instrument_evidence_report=gp_data.get("instrument_evidence_report")
         regional_source_fusion_report=gp_data.get("regional_source_fusion_report")
@@ -1135,6 +1137,11 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.write_json(beatmap_path,beatmap)
         if not os.path.isfile(beatmap_path): raise RuntimeError(f"Beatmap write failed: {beatmap_path}")
         fc.log(f"Wrote beatmap: {beatmap_path}",indent=1)
+    if material_compatibility_report:
+        material_path=output_path+".material_compatibility.json"
+        fc.write_json(material_path,material_compatibility_report)
+        fc.log(f"Wrote material compatibility report: {material_path}",indent=1)
+
     if beatmap_report:
         beatmap_report_path=output_path+".beatmap_report.json"
         fc.write_json(beatmap_report_path,beatmap_report)
