@@ -104,3 +104,28 @@ def build_material_compatibility_report(*, chart_path, audio_paths=None,
     if payload['status']=='legacy_unverified': payload['warnings'].append('prepared_midi_source_stem_provenance_unverified')
     if payload['status']=='mismatch': payload['warnings'].append('prepared_midi_source_stem_mismatch')
     return payload
+
+def classify_cache_dependency(layer):
+    """Declare whether a cached layer remains valid when anchors/baseline change."""
+    independent={'prepared_stems','parsed_chart','audio_features','prepared_midi','midi_section_role_candidates'}
+    dependent={'baseline_residuals','authority_decision','occurrence_selection','cross_role_fusion','section_materialization','final_warp','final_verification'}
+    if layer in independent:return 'anchor_independent'
+    if layer in dependent:return 'anchor_dependent'
+    return 'unknown'
+
+def build_cache_compatibility(cache_events=None,anchor_fingerprint=None,baseline_fingerprint=None):
+    rows=[]
+    for event in cache_events or []:
+        row=dict(event);layer=str(row.get('layer') or row.get('cache_kind') or 'unknown')
+        dependency=classify_cache_dependency(layer);row['dependency']=dependency
+        if dependency=='anchor_dependent':
+            row['anchor_fingerprint']=anchor_fingerprint;row['baseline_fingerprint']=baseline_fingerprint
+        state=row.get('status') or row.get('reason') or 'legacy_unverified'
+        row['compatibility_state']=('exact_hit' if state in {'exact_cache_hit','cache_hit','hit'} else
+                                    'miss' if 'missing' in state or state=='miss' else
+                                    'mismatch' if 'mismatch' in state else 'legacy_unverified')
+        rows.append(row)
+    return {'schema_version':1,'anchor_fingerprint':anchor_fingerprint,
+            'baseline_fingerprint':baseline_fingerprint,'layers':rows,
+            'status':'mismatch' if any(x['compatibility_state']=='mismatch' for x in rows) else
+                     ('legacy_unverified' if any(x['compatibility_state']=='legacy_unverified' for x in rows) else 'compatible')}

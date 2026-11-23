@@ -39,6 +39,7 @@ import time
 import yaml
 
 import feedpak_common as fc
+import audit_reports as ar
 import keys_metadata as km
 import process_gp_alignment as pga
 import project_config as pc
@@ -860,7 +861,7 @@ def write_project_version(song_folder, document, current_path=None):
 # --------------------------------------------------------------------------
 
 def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name="drums",
-          device="cuda",hf_token=None,skip_vocals=False,skip_gp=False,
+          device="cuda",hf_token=None,skip_vocals=False,skip_gp=False,vocals_mode=None,
           keep_work_dir=False,vocal_layout="merged",timeline_mode="both",
           allow_severe_alignment=False,reuse_vocals=False,vocals_cache=None,
           vocal_batch_size=16,vocal_compute_type=None,vocal_language=None,
@@ -871,6 +872,9 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,prepared_midi_mode="auto",
           package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
+    vocals_mode=(vocals_mode or ("off" if skip_vocals else "optional")).casefold()
+    if vocals_mode not in ("off","optional","required"): raise ValueError("vocals_mode must be off, optional, or required")
+    skip_vocals=(vocals_mode=="off")
     if timeline_mode not in ("tempos","beats","both"): raise ValueError("invalid timeline_mode")
     total_started=time.perf_counter(); pipeline_performance={}
     stage_started=time.perf_counter()
@@ -967,6 +971,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     fc.log(f"Duration: {duration}s (probed from padded {os.path.basename(duration_source)})", indent=1)
 
     stage_started=time.perf_counter()
+    vocals_data=None
     fc.log_step(3, total_steps, "Vocal processing (Script 1)")
     vocal_pitch_file=vocal_pitch_contour_file=lyrics_file=None
     lyric_tracks=[]
@@ -994,6 +999,12 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
         fc.log("--skip-vocals set; skipping audio vocal fallback.", indent=1)
     elif not gp_vocal_production and not vocals_path:
         fc.log(f"WARNING: No stem matching '{vocals_stem_name}' found; reliable vocals omitted.", indent=1)
+
+    vocal_products_present=bool(gp_vocal_production or vocals_data is not None)
+    runtime_failures=[]
+    if vocals_mode=="required" and not vocal_products_present:
+        runtime_failures.append({"contract":"vocals","reason":"required_vocals_unavailable",
+                                 "resolved_stem":original_vocals_path})
 
     pipeline_performance["vocal_processing_seconds"]=time.perf_counter()-stage_started
     stage_started=time.perf_counter()
@@ -1118,7 +1129,21 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     os.makedirs(output_folder, exist_ok=True)
     safe_name = f"{manifest['artist']} - {manifest['title']}{package_name_suffix}.feedpak".replace("/", "_")
     output_path = os.path.join(output_folder, safe_name)
+    runtime_contract=ar.build_runtime_contract(
+        requested={"vocals_mode":vocals_mode,"alignment_mode":alignment_mode,"anchors":anchors_path,
+                   "prepared_midi_mode":prepared_midi_mode,"midi_section_fit_materialization":midi_section_fit_materialization,
+                   "structural_second_pass":bool(structural_second_pass),"force_midi_authority":bool(force_midi_authority)},
+        resolved={"vocals_stem":original_vocals_path,"anchors":anchors_path,"gp_parser":gp_parser},
+        delivered={"vocals":vocal_products_present,"method":(method_result_envelope or {}).get("method_id"),
+                   "feedpak":os.path.basename(output_path)},failures=runtime_failures)
+    fc.write_json(os.path.join(work_dir,"runtime_contract.json"),runtime_contract)
+    ar.require_runtime_contract(runtime_contract)
     package_feedpak(work_dir,manifest,output_path)
+    runtime_contract_path=output_path+".runtime_contract.json"
+    fc.write_json(runtime_contract_path,runtime_contract)
+    if not os.path.isfile(runtime_contract_path):
+        raise RuntimeError(f"Runtime contract write failed: {runtime_contract_path}")
+    fc.log(f"Wrote runtime contract: {runtime_contract_path}",indent=1)
     pipeline_performance["packaging_seconds"]=time.perf_counter()-stage_started
     stage_started=time.perf_counter()
     if phase3d_variants and alignment_proposals_report:
@@ -1309,6 +1334,8 @@ def main():
     parser.add_argument("--allow-wide-monotonic-warp",action="store_true",help="DIAGNOSTIC ONLY: allow 0.70-1.30 chart stretch in forced monotonic-chain comparisons")
     parser.add_argument("--allow-compatible-audio-refinement",action="store_true",help="Allow compatible audio refinement after a forced monotonic chain; disabled by default")
     parser.add_argument("--transcription-investigator",action="store_true",help="Legacy alias: read prepared MIDI evidence")
+    parser.add_argument("--vocals-mode",choices=("off","optional","required"),default=None,
+                        help="Runtime delivery contract for vocal products; legacy --skip-vocals maps to off")
     parser.add_argument("--prepared-midi-mode",choices=("off","auto","diagnostic","force-trusted"),default="auto",
                         help="Continuous MIDI landmark policy for compatible audio methods")
     parser.add_argument("--midi-section-fit",action="store_true",help="DIAGNOSTIC ONLY: write overlapping measure-section MIDI candidate/path/fusion report")

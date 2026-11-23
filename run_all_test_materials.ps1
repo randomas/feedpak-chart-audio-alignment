@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Position = 0)]
     [string]$MaterialsRoot = "",
@@ -29,6 +29,8 @@ param(
     [double]$CheckpointSearchRadius = 1.0,
 
     [switch]$IncludeVocals,
+    [ValidateSet("off", "optional", "required")]
+    [string]$VocalsMode = "off",
     [switch]$ReuseVocals,
     [string]$HFToken = $env:HF_TOKEN,
     [ValidateSet("cuda", "cpu")]
@@ -305,13 +307,14 @@ foreach ($Material in $Materials) {
         "--device", $Device
     )
 
-    if (-not $IncludeVocals) {
+    $arguments += @("--vocals-mode", $VocalsMode)
+    if ($VocalsMode -eq "off") {
         $arguments += "--skip-vocals"
     }
     elseif ($ReuseVocals) {
         $arguments += "--reuse-vocals"
     }
-    if ($IncludeVocals -and -not [string]::IsNullOrWhiteSpace($HFToken)) {
+    if ($VocalsMode -ne "off" -and -not [string]::IsNullOrWhiteSpace($HFToken)) {
         $arguments += @("--hf-token", $HFToken)
     }
 
@@ -424,6 +427,12 @@ $Results | Export-Csv -LiteralPath $summaryCsv -NoTypeInformation -Encoding UTF8
 $Results | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $summaryJson -Encoding UTF8
 Copy-Item -LiteralPath $summaryCsv -Destination (Join-Path $DiagnosticsRoot "test_material_summary.csv") -Force
 Copy-Item -LiteralPath $summaryJson -Destination (Join-Path $DiagnosticsRoot "test_material_summary.json") -Force
+
+$auditScript = Join-Path $ProjectRoot "generate_run_audit.py"
+if (Test-Path -LiteralPath $auditScript -PathType Leaf) {
+    & python $auditScript $RunRoot
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Compact audit generation failed with exit code $LASTEXITCODE" }
+}
 
 $passed = @($Results | Where-Object Status -eq "PASS").Count
 $failed = @($Results | Where-Object Status -eq "FAIL").Count
