@@ -54,6 +54,8 @@ param(
     [switch]$AllowWideMonotonicWarp,
     [switch]$AllowCompatibleAudioRefinement,
     [switch]$LightDiagnostics,
+    [ValidateSet("compatibility-pulse", "split-compatibility-pulse", "split-classic", "duration-aware", "d-experimental", "legacy")]
+    [string]$PianoRenderingPolicy = "compatibility-pulse",
 
     [string[]]$Only = @()
 )
@@ -303,6 +305,7 @@ foreach ($Material in $Materials) {
         "--checkpoint-measures", $CheckpointMeasures.ToString(),
         "--checkpoint-search-radius", $CheckpointSearchRadius.ToString([Globalization.CultureInfo]::InvariantCulture),
         "--timeline-mode", $TimelineMode,
+        "--piano-rendering-policy", $PianoRenderingPolicy,
         "--keep-work-dir",
         "--device", $Device
     )

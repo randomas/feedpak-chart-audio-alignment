@@ -30,7 +30,7 @@ def test_piano_duration_is_d_and_release_precedes_resume():
             {'t': 137.3344, 'notes': [{'midi': 65, 'd': .3852}]}
         ]}]}}}
     ]}
-    notes = playable_keyboard_from_notation(notation)['notes']
+    notes = playable_keyboard_from_notation(notation, piano_rendering_policy="duration-aware")['notes']
     assert notes[0] == {'t': 121.9266, 's': 2, 'f': 12, 'sus': .3852}
     assert 'd' not in notes[0]
     assert notes[0]['t'] + notes[0]['sus'] < notes[1]['t']

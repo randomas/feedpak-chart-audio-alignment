@@ -15,7 +15,7 @@ def test_short_positive_piano_duration_is_preserved():
     notation = {"source_track": "Piano", "measures": [{"staves": {"rh": {"voices": [{"beats": [
         {"t": 1.0, "notes": [{"midi": 60, "d": .0312}]}
     ]}]}}}]}
-    assert pga.playable_keyboard_from_notation(notation)["notes"][0] == {
+    assert pga.playable_keyboard_from_notation(notation, piano_rendering_policy="duration-aware")["notes"][0] == {
         "t": 1.0, "s": 2, "f": 12, "sus": .0312
     }
 

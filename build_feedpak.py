@@ -393,7 +393,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
                   gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-                  piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
+                  piano_duration_quantize_ms=0.0, piano_rendering_policy="compatibility-pulse", force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -424,7 +424,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
             "--checkpoint-measures",str(checkpoint_measures),
             "--checkpoint-search-radius",str(checkpoint_search_radius)]
     if project_config_path: cmd += ["--project-config",project_config_path]
-    cmd += ["--piano-duration-quantize-ms",str(float(piano_duration_quantize_ms or 0.0))]
+    cmd += ["--piano-duration-quantize-ms",str(float(piano_duration_quantize_ms or 0.0)), "--piano-rendering-policy",piano_rendering_policy]
     fc.log("Launching guarded multi-reference GP/audio alignment")
     subprocess.run(cmd,check=True)
 
@@ -624,6 +624,159 @@ def write_arrangement_files(gp_data, work_dir):
     return entries
 
 
+
+def _bpm_at_time(tempos, time_value, fallback=120.0):
+    bpm=float(fallback)
+    for row in sorted(tempos or [],key=lambda x:float(x.get("time",0.0))):
+        if float(row.get("time",0.0)) > float(time_value): break
+        value=float(row.get("bpm") or 0.0)
+        if value > 0.0: bpm=value
+    return max(20.0,min(400.0,bpm))
+
+
+def _merge_piano_notation(notation_by_id):
+    """Merge split piano notation tracks into one grand-staff document."""
+    measures={}
+    for track_id,notation in (notation_by_id or {}).items():
+        for measure in notation.get("measures",[]) or []:
+            idx=int(measure.get("idx",len(measures)+1))
+            target=measures.setdefault(idx,{k:v for k,v in measure.items() if k!="staves"})
+            target.setdefault("idx",idx);target.setdefault("staves",{})
+            for staff_id,staff in (measure.get("staves") or {}).items():
+                sid=staff_id
+                if sid in target["staves"]:
+                    hand=str(notation.get("hand") or track_id).casefold()
+                    sid="lh" if "left" in hand else "rh"
+                target["staves"][sid]=staff
+    return {"version":1,"instrument":"piano",
+            "staves":[{"id":"rh","clef":"G2","label":"Right Hand"},
+                       {"id":"lh","clef":"F4","label":"Left Hand"}],
+            "measures":[measures[k] for k in sorted(measures)]}
+
+
+def write_merged_keys_compatibility(gp_data,work_dir,arrangement_entries):
+    """Write the known-working single keys topology with short sus pulses."""
+    entries=list(arrangement_entries or [])
+    piano=[x for x in entries if x.get("type")=="piano" or str(x.get("id","")).startswith("piano_")]
+    if not piano:return entries
+    tempos=((gp_data.get("song_timeline") or {}).get("tempos") or [])
+    merged=[]
+    for entry in piano:
+        path=os.path.join(work_dir,*str(entry.get("file")).split("/"))
+        if not os.path.isfile(path):continue
+        data=json.load(open(path,"r",encoding="utf-8"))
+        for source in data.get("notes",[]) or []:
+            note={k:v for k,v in source.items() if k not in ("d","sus")}
+            full=float(source.get("sus",source.get("d",0.0)) or 0.0)
+            if full>0.0:
+                pulse=15.0/_bpm_at_time(tempos,float(note.get("t",0.0)))
+                note["sus"]=round(max(0.03,min(full,pulse,0.25)),4)
+            merged.append(note)
+    merged.sort(key=lambda n:(float(n.get("t",0.0)),int(n.get("s",0)),int(n.get("f",0))))
+    keys={"name":"Keys","tuning":[0,0,0,0,0,0],"capo":0,"notes":merged,
+          "chords":[],"anchors":[{"time":0.0,"fret":1,"width":4}],
+          "handshapes":[],"templates":[]}
+    fc.write_json(os.path.join(work_dir,"arrangements","keys.json"),keys)
+    notation=_merge_piano_notation(gp_data.get("notation") or {})
+    fc.write_json(os.path.join(work_dir,"arrangements","notation_keys.json"),notation)
+    for entry in piano:
+        for field in ("file","notation"):
+            rel=entry.get(field)
+            if rel:
+                path=os.path.join(work_dir,*str(rel).split("/"))
+                if os.path.isfile(path):os.remove(path)
+    entries=[x for x in entries if x not in piano]
+    entries.append({"id":"keys","name":"Keys","type":"piano",
+                    "file":"arrangements/keys.json",
+                    "notation":"arrangements/notation_keys.json"})
+    return entries
+
+
+
+
+def _classic_hand(entry, notation):
+    joined=" ".join([str(entry.get("id","")),str(entry.get("name","")),
+                     str(notation.get("configured_hand","")),str(notation.get("hand",""))]).casefold()
+    if any(x in joined for x in ("left","__lh","_lh","(lh)")): return "left","lh","F4","Piano (LH)"
+    if any(x in joined for x in ("right","__rh","_rh","(rh)")): return "right","rh","G2","Piano (RH)"
+    raise RuntimeError("Cannot determine split-classic piano hand for "+repr(entry))
+
+
+def _validate_classic_notation(notation, hand, staff_id):
+    if notation.get("configured_hand")!=hand:
+        raise RuntimeError(f"split-classic configured_hand mismatch: expected {hand!r}")
+    declared=[x.get("id") for x in notation.get("staves",[]) or []]
+    if declared != [staff_id]:
+        raise RuntimeError(f"split-classic declared staves mismatch: expected {[staff_id]!r}, got {declared!r}")
+    wrong=[]
+    for measure in notation.get("measures",[]) or []:
+        ids=set((measure.get("staves") or {}).keys())
+        if ids and ids != {staff_id}: wrong.append({"idx":measure.get("idx"),"staves":sorted(ids)})
+    if wrong:
+        raise RuntimeError("split-classic measure stave mismatch: "+repr(wrong[:5]))
+
+
+def apply_split_classic_contract(work_dir, arrangement_entries):
+    """Recreate the known-working September split piano identity and notation contract."""
+    out=[]; seen=set()
+    for entry in arrangement_entries:
+        if entry.get("type")!="piano":
+            out.append(entry); continue
+        old_play=os.path.join(work_dir,*str(entry["file"]).split("/"))
+        old_notation=os.path.join(work_dir,*str(entry["notation"]).split("/"))
+        notation=json.load(open(old_notation,"r",encoding="utf-8"))
+        hand,staff_id,clef,name=_classic_hand(entry,notation)
+        suffix="lh" if staff_id=="lh" else "rh"
+        new_id=f"piano__{suffix}"
+        if new_id in seen: raise RuntimeError(f"Duplicate split-classic hand: {new_id}")
+        seen.add(new_id)
+        arrangement=json.load(open(old_play,"r",encoding="utf-8"))
+        arrangement["name"]=name
+        for note in arrangement.get("notes",[]) or []:
+            if "sus" in note and "d" not in note: note["d"]=note.pop("sus")
+            elif "sus" in note: note.pop("sus",None)
+        notation["version"]=1;notation["instrument"]="piano"
+        notation["source_track"]=name;notation["configured_hand"]=hand
+        notation["staves"]=[{"id":staff_id,"clef":clef,"label":"Left Hand" if hand=="left" else "Right Hand"}]
+        # Normalize measure stave keys when the source track used a generic or opposite key.
+        for measure in notation.get("measures",[]) or []:
+            staves=measure.get("staves") or {}
+            if staves and set(staves)!={staff_id}:
+                if len(staves)!=1:
+                    raise RuntimeError("split-classic source measure has multiple staves: "+repr(sorted(staves)))
+                measure["staves"]={staff_id:next(iter(staves.values()))}
+        _validate_classic_notation(notation,hand,staff_id)
+        new_play=os.path.join(work_dir,"arrangements",new_id+".json")
+        new_notation=os.path.join(work_dir,"arrangements","notation_"+new_id+".json")
+        fc.write_json(new_play,arrangement);fc.write_json(new_notation,notation)
+        for old,new in ((old_play,new_play),(old_notation,new_notation)):
+            if os.path.abspath(old)!=os.path.abspath(new) and os.path.isfile(old): os.remove(old)
+        out.append({"id":new_id,"name":name,"type":"piano",
+                    "file":fc.to_posix_relpath("arrangements",new_id+".json"),
+                    "notation":fc.to_posix_relpath("arrangements","notation_"+new_id+".json"),
+                    "tuning":arrangement.get("tuning",[0,0,0,0,0,0]),"capo":arrangement.get("capo",0)})
+    if seen and seen!={"piano__lh","piano__rh"}:
+        raise RuntimeError("split-classic requires both hands; found "+repr(sorted(seen)))
+    return out
+
+
+def apply_split_keys_compatibility(gp_data,work_dir,arrangement_entries):
+    tempos=((gp_data.get("song_timeline") or {}).get("tempos") or [])
+    for entry in arrangement_entries:
+        if entry.get("type")!="piano":
+            continue
+        path=os.path.join(work_dir,*str(entry.get("file")).split("/"))
+        if not os.path.isfile(path):
+            continue
+        data=json.load(open(path,"r",encoding="utf-8"))
+        for n in data.get("notes",[]) or []:
+            full=float(n.get("sus",n.get("d",0.0)) or 0.0)
+            bpm=_bpm_at_time(tempos,float(n.get("t",0.0)))
+            pulse=max(0.03,min(full,15.0/bpm,0.25)) if full>0 else 0.0
+            n.pop("d",None); n["sus"]=round(pulse,4)
+        fc.write_json(path,data)
+    return arrangement_entries
+
 def write_notation_files(gp_data, work_dir, arrangement_entries=None):
     """Write notation and attach it to the matching playable arrangement.
 
@@ -817,7 +970,7 @@ def load_project_defaults(path):
             "checkpoint_search_radius":alignment.get("checkpoint_search_radius"),
             "allow_severe_alignment":alignment.get("allow_severe"),
             "timeline_mode":timeline.get("mode"),"keep_work_dir":build.get("keep_work_dir"),
-            "piano_duration_quantize_ms":build.get("piano_duration_quantize_ms")}
+            "piano_duration_quantize_ms":build.get("piano_duration_quantize_ms"), "piano_rendering_policy":build.get("piano_rendering_policy")}
 
 
 def project_document(args):
@@ -834,7 +987,7 @@ def project_document(args):
                          "allow_severe":args.allow_severe_alignment},
             "timeline":{"mode":args.timeline_mode},
             "build":{"keep_work_dir":args.keep_work_dir,
-                     "piano_duration_quantize_ms":args.piano_duration_quantize_ms}}
+                     "piano_duration_quantize_ms":args.piano_duration_quantize_ms, "piano_rendering_policy":args.piano_rendering_policy}}
 
 
 def write_project_version(song_folder, document, current_path=None):
@@ -869,7 +1022,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
           gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-          piano_duration_quantize_ms=0.0,force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,prepared_midi_mode="auto",
+          piano_duration_quantize_ms=0.0,piano_rendering_policy="compatibility-pulse",force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,prepared_midi_mode="auto",
           package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     vocals_mode=(vocals_mode or ("off" if skip_vocals else "optional")).casefold()
@@ -1042,6 +1195,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                       checkpoint_search_radius=checkpoint_search_radius,project_config_path=metadata_path if gp_path else None,
                       gp_parser=gp_parser,score_json_path=score_json_path,alphatab_extractor=alphatab_extractor,node_executable=node_executable,
                       piano_duration_quantize_ms=piano_duration_quantize_ms,
+                      piano_rendering_policy=piano_rendering_policy,
                       force_continuous_anchor_warp=force_continuous_anchor_warp,
                       structural_second_pass=structural_second_pass,transcription_investigator=transcription_investigator,force_midi_authority=force_midi_authority,force_monotonic_chain=force_monotonic_chain,
                       allow_wide_monotonic_warp=allow_wide_monotonic_warp,
@@ -1057,7 +1211,14 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
             vocal_pitch_contour_file=None
             lyric_tracks=[]
         arrangements += write_arrangement_files(gp_data, work_dir)
-        arrangements = write_notation_files(gp_data, work_dir, arrangements)
+        if piano_rendering_policy=="compatibility-pulse":
+            arrangements=write_merged_keys_compatibility(gp_data,work_dir,arrangements)
+        else:
+            arrangements = write_notation_files(gp_data, work_dir, arrangements)
+            if piano_rendering_policy=="split-compatibility-pulse":
+                arrangements=apply_split_keys_compatibility(gp_data,work_dir,arrangements)
+            elif piano_rendering_policy=="split-classic":
+                arrangements=apply_split_classic_contract(work_dir,arrangements)
         drum_tab_file = write_drum_tab(gp_data, work_dir)
         if drum_tab_file:
             arrangements.append({"id": "drums", "name": "Drums", "type": "drums",
@@ -1131,10 +1292,14 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
     output_path = os.path.join(output_folder, safe_name)
     runtime_contract=ar.build_runtime_contract(
         requested={"vocals_mode":vocals_mode,"alignment_mode":alignment_mode,"anchors":anchors_path,
+                   "piano_rendering_policy":piano_rendering_policy,
                    "prepared_midi_mode":prepared_midi_mode,"midi_section_fit_materialization":midi_section_fit_materialization,
                    "structural_second_pass":bool(structural_second_pass),"force_midi_authority":bool(force_midi_authority)},
         resolved={"vocals_stem":original_vocals_path,"anchors":anchors_path,"gp_parser":gp_parser},
         delivered={"vocals":vocal_products_present,"method":(method_result_envelope or {}).get("method_id"),
+                   "piano_rendering_policy":piano_rendering_policy,
+                   "piano_duration_field":"d" if piano_rendering_policy in ("split-classic","d-experimental","legacy") else "sus",
+                   "piano_arrangement_topology":"merged-keys" if piano_rendering_policy=="compatibility-pulse" else "split-hands",
                    "feedpak":os.path.basename(output_path)},failures=runtime_failures)
     fc.write_json(os.path.join(work_dir,"runtime_contract.json"),runtime_contract)
     ar.require_runtime_contract(runtime_contract)
@@ -1363,6 +1528,10 @@ def main():
     parser.add_argument("--piano-duration-quantize-ms",type=float,
                         default=float(defaults.get("piano_duration_quantize_ms") or 0.0),
                         help="Quantize exported piano durations to this millisecond grid; 0 disables")
+    parser.add_argument("--piano-rendering-policy",
+                        choices=("compatibility-pulse","split-compatibility-pulse","split-classic","duration-aware","d-experimental","legacy"),
+                        default=defaults.get("piano_rendering_policy") or "compatibility-pulse",
+                        help="Playable piano policy; compatibility-pulse is the stable merged 2D/3D contract")
     args=parser.parse_args()
 
     # Explicit CLI values have already overridden project-derived parser defaults.
@@ -1416,7 +1585,7 @@ def main():
           bass_alignment_stem=args.bass_alignment_stem,piano_alignment_stem=args.piano_alignment_stem,
           guitar_alignment_stem=args.guitar_alignment_stem,gp_parser=args.gp_parser,score_json_path=args.score_json,
           alphatab_extractor=args.alphatab_extractor,node_executable=args.node_executable,
-          piano_duration_quantize_ms=args.piano_duration_quantize_ms,phase3d_variants=args.phase3d_variants,
+          piano_duration_quantize_ms=args.piano_duration_quantize_ms,piano_rendering_policy=args.piano_rendering_policy,phase3d_variants=args.phase3d_variants,
           phase3d_safe_candidates=args.phase3d_safe_candidates,phase3d_structural_candidates=args.phase3d_structural_candidates,
           structural_second_pass=args.structural_second_pass,transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority,force_monotonic_chain=args.force_monotonic_chain,
           allow_wide_monotonic_warp=args.allow_wide_monotonic_warp,

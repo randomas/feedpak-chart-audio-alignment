@@ -12,6 +12,6 @@ def test_piano_fixed_anchor():
     notation = {"source_track": "Piano (RH)", "measures": [{"staves": {"rh": {"voices": [{"beats": [
         {"t": 2.0, "notes": [{"midi": 60, "d": 0.5}]}
     ]}]}}}]}
-    out = pga.playable_keyboard_from_notation(notation)
+    out = pga.playable_keyboard_from_notation(notation, piano_rendering_policy="duration-aware")
     assert out["anchors"] == [{"time": 0.0, "fret": 1, "width": 4}]
     assert out["notes"] == [{"t": 2.0, "s": 2, "f": 12, "sus": 0.5}]

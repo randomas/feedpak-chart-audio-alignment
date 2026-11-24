@@ -10,13 +10,13 @@ def notation():
 
 
 def test_disabled_is_exact_and_uses_sus():
-    out = p.playable_keyboard_from_notation(notation(), 0)
+    out = p.playable_keyboard_from_notation(notation(), 0, "duration-aware")
     assert [n["sus"] for n in out["notes"]] == [0.0312, 0.0316, 0.0504]
     assert all("d" not in n for n in out["notes"])
 
 
 def test_one_ms_quantizes_only_duration():
-    out = p.playable_keyboard_from_notation(notation(), 1)
+    out = p.playable_keyboard_from_notation(notation(), 1, "duration-aware")
     assert [n["t"] for n in out["notes"]] == [1.0, 2.0, 3.0]
     assert [n["sus"] for n in out["notes"]] == [0.031, 0.032, 0.05]
     d = out["piano_duration_diagnostics"]

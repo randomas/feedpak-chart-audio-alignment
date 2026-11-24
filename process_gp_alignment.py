@@ -1368,7 +1368,11 @@ def _piano_duration_diagnostics(before, after, quantum_ms):
             "unique_before_count":len(a),"unique_after_count":len(b),
             "unique_before_seconds":a,"unique_after_seconds":b}
 
-def playable_keyboard_from_notation(notation, piano_duration_quantize_ms=0.0):
+def playable_keyboard_from_notation(notation, piano_duration_quantize_ms=0.0,
+                                      piano_rendering_policy="compatibility-pulse"):
+    allowed=("compatibility-pulse", "split-compatibility-pulse", "split-classic", "duration-aware", "d-experimental", "legacy")
+    if piano_rendering_policy not in allowed:
+        raise ValueError(f"piano_rendering_policy must be one of {allowed}")
     """Flatten one configured GP piano track into an RB3-compatible keys lane."""
     notes = []
     skipped_out_of_range = 0
@@ -1395,7 +1399,8 @@ def playable_keyboard_from_notation(notation, piano_duration_quantize_ms=0.0):
                         # ``sus``. Preserve every positive piano release and do
                         # not apply the guitar sustain threshold here.
                         if duration > 0.0:
-                            note["sus"] = round(duration, 4)
+                            duration_field = "d" if piano_rendering_policy in ("split-classic","d-experimental","legacy") else "sus"
+                            note[duration_field] = round(duration, 4)
                         notes.append(note)
     notes.sort(key=lambda n: (n["t"], n["s"], n["f"]))
     if skipped_out_of_range:
@@ -1416,7 +1421,11 @@ def playable_keyboard_from_notation(notation, piano_duration_quantize_ms=0.0):
         "anchors": [{"time": 0.0, "fret": 1, "width": 4}],
         "handshapes": [],
         "templates": [],
-        "piano_duration_diagnostics": _piano_duration_diagnostics(durations_before, durations_after, piano_duration_quantize_ms),
+        "piano_duration_diagnostics": {
+            **_piano_duration_diagnostics(durations_before, durations_after, piano_duration_quantize_ms),
+            "rendering_policy": piano_rendering_policy,
+            "playable_duration_field": "d" if piano_rendering_policy in ("split-classic","d-experimental","legacy") else "sus",
+        },
     }
 
 def shift_and_warp_notation(notation, offset, warp_fn):
@@ -2074,7 +2083,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0, force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
+            piano_duration_quantize_ms=0.0, piano_rendering_policy="compatibility-pulse", force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
     prepared_midi_mode,prepared_midi_compatible,prepared_midi_reason=mo.validate_prepared_midi_mode(prepared_midi_mode,alignment_mode)
@@ -3133,7 +3142,8 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
     for track_id, notation in notation_tracks.items():
         warped_notation[track_id] = shift_and_warp_notation(notation, chart_offset, warp_fn)
         arrangements_out[track_id] = playable_keyboard_from_notation(
-            warped_notation[track_id], piano_duration_quantize_ms=piano_duration_quantize_ms)
+            warped_notation[track_id], piano_duration_quantize_ms=piano_duration_quantize_ms,
+            piano_rendering_policy=piano_rendering_policy)
         piano_diag=arrangements_out[track_id].pop("piano_duration_diagnostics")
         alignment_report.setdefault("piano_duration_quantization", {})[track_id]=piano_diag
         fc.log(f"Piano duration quantization {track_id}: {piano_diag['unique_before_count']} -> {piano_diag['unique_after_count']} unique durations (quantum={piano_diag['quantum_ms']}ms)",indent=2)
@@ -3247,6 +3257,10 @@ def main():
     parser.add_argument("--project-config",default=None)
     parser.add_argument("--piano-duration-quantize-ms",type=float,default=0.0,
                         help="Quantize exported piano note durations to this millisecond grid; 0 disables")
+    parser.add_argument("--piano-rendering-policy",
+                        choices=("compatibility-pulse","split-compatibility-pulse","split-classic","duration-aware","d-experimental","legacy"),
+                        default="compatibility-pulse",
+                        help="Playable piano policy; compatibility-pulse merges hands and caps sus to a local 16th-note pulse")
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)
     parser.add_argument("--count-in-offset", type=float, default=0.0,
@@ -3266,6 +3280,7 @@ def main():
                    checkpoint_search_radius=args.checkpoint_search_radius, project_config_path=args.project_config,
                    gp_parser=args.gp_parser, score_json_path=args.score_json, alphatab_extractor=args.alphatab_extractor, node_executable=args.node_executable,
                    piano_duration_quantize_ms=args.piano_duration_quantize_ms,
+                   piano_rendering_policy=args.piano_rendering_policy,
                    force_continuous_anchor_warp=args.force_continuous_anchor_warp,
                    structural_second_pass=args.structural_second_pass,
                    transcription_investigator=args.transcription_investigator,force_midi_authority=args.force_midi_authority,force_monotonic_chain=args.force_monotonic_chain,
