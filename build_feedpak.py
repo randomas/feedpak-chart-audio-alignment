@@ -393,7 +393,7 @@ def run_gp_script(gp_path,drums_path,out_path,sr=22050,count_in_offset=0.0,
                   auto_chunk_measures=16,alignment_mode="dtw",
                   checkpoint_measures=4,checkpoint_search_radius=1.0,project_config_path=None,
                   gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-                  piano_duration_quantize_ms=0.0, piano_rendering_policy="compatibility-pulse", force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
+                  piano_duration_quantize_ms=0.0, piano_rendering_policy="split-classic", force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
     cmd=[sys.executable,os.path.join(SCRIPT_DIR,"process_gp_alignment.py"),gp_path,"--gp-parser",gp_parser,"--node-executable",node_executable]
     if score_json_path: cmd += ["--score-json",score_json_path]
     if alphatab_extractor: cmd += ["--alphatab-extractor",alphatab_extractor]
@@ -586,6 +586,43 @@ def write_gp_vocals(gp_data,work_dir):
         fc.write_json(os.path.join(work_dir,"gp_vocal_diagnostics.json"),data.get("diagnostics",{}))
         d=data.get("diagnostics",{}); fc.log(f"GP vocal output: {d.get('bars_written',0)} bar(s) written, {d.get('bars_skipped',0)} skipped",indent=1)
     return ("lyrics.json" if lyrics else None,"vocal_pitch.json" if pitch else None)
+
+PIANO_GENERATED_ARTIFACTS = (
+    "keys.json", "notation_keys.json",
+    "piano_left_hand.json", "piano_right_hand.json",
+    "notation_piano_left_hand.json", "notation_piano_right_hand.json",
+    "piano__lh.json", "piano__rh.json",
+    "notation_piano__lh.json", "notation_piano__rh.json",
+)
+
+def clear_generated_piano_artifacts(work_dir):
+    """Remove mutually exclusive piano products before generating the selected policy."""
+    arrangements_dir=os.path.join(work_dir,"arrangements")
+    removed=[]
+    for name in PIANO_GENERATED_ARTIFACTS:
+        path=os.path.join(arrangements_dir,name)
+        if os.path.isfile(path):
+            os.remove(path);removed.append(name)
+    if removed:
+        fc.log("Cleared stale piano artifacts: "+", ".join(sorted(removed)),indent=1)
+    return removed
+
+def validate_packaged_arrangement_inventory(work_dir, entries):
+    """Fail if unreferenced generated piano JSON would leak into the FeedPak."""
+    referenced=set()
+    for entry in entries or []:
+        for field in ("file","notation"):
+            value=entry.get(field)
+            if value and str(value).startswith("arrangements/"):
+                referenced.add(os.path.basename(str(value)))
+    leaked=[]
+    arrangements_dir=os.path.join(work_dir,"arrangements")
+    for name in PIANO_GENERATED_ARTIFACTS:
+        if os.path.isfile(os.path.join(arrangements_dir,name)) and name not in referenced:
+            leaked.append(name)
+    if leaked:
+        raise RuntimeError("Unreferenced stale piano artifacts remain before packaging: "+repr(sorted(leaked)))
+    return {"referenced":sorted(referenced),"stale":[]}
 
 def write_arrangement_files(gp_data, work_dir):
     """
@@ -1022,7 +1059,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
           checkpoint_measures=4,checkpoint_search_radius=1.0,song_json_path=None,
           bass_alignment_stem=None,piano_alignment_stem=None,guitar_alignment_stem=None,
           gp_parser="gp5",score_json_path=None,alphatab_extractor=None,node_executable="node",
-          piano_duration_quantize_ms=0.0,piano_rendering_policy="compatibility-pulse",force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,prepared_midi_mode="auto",
+          piano_duration_quantize_ms=0.0,piano_rendering_policy="split-classic",force_continuous_anchor_warp=False,structural_second_pass=False,transcription_investigator=False,force_midi_authority=False,force_monotonic_chain=False,allow_wide_monotonic_warp=False,allow_compatible_audio_refinement=False,midi_section_fit=False,force_midi_section_fit=False,midi_section_fit_materialization=None,prepared_midi_mode="auto",
           package_name_suffix="",phase3d_variants=False,phase3d_safe_candidates=2,phase3d_structural_candidates=1):
     if vocal_layout not in ("merged","separated","both"): raise ValueError("invalid vocal_layout")
     vocals_mode=(vocals_mode or ("off" if skip_vocals else "optional")).casefold()
@@ -1077,6 +1114,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
 
     work_dir = os.path.join(song_folder, "_feedpak_build")
     os.makedirs(os.path.join(work_dir, "arrangements"), exist_ok=True)
+    clear_generated_piano_artifacts(work_dir)
     pipeline_performance["inspection_and_discovery_seconds"]=time.perf_counter()-stage_started
 
     stage_started=time.perf_counter()
@@ -1225,6 +1263,7 @@ def build(song_folder, output_folder, vocals_stem_name="vocals", drums_stem_name
                                   "drum_tab": fc.to_posix_relpath(drum_tab_file)})
         keys_file = write_keys(gp_data, work_dir)
         song_timeline_file=write_song_timeline(gp_data,work_dir)
+        validate_packaged_arrangement_inventory(work_dir,arrangements)
         embed_legacy_timeline_in_first_arrangement(gp_data,work_dir,arrangements)
         alignment_report=gp_data.get("alignment_report")
         method_result_envelope=gp_data.get("method_result_envelope")
@@ -1530,7 +1569,7 @@ def main():
                         help="Quantize exported piano durations to this millisecond grid; 0 disables")
     parser.add_argument("--piano-rendering-policy",
                         choices=("compatibility-pulse","split-compatibility-pulse","split-classic","duration-aware","d-experimental","legacy"),
-                        default=defaults.get("piano_rendering_policy") or "compatibility-pulse",
+                        default=defaults.get("piano_rendering_policy") or "split-classic",
                         help="Playable piano policy; compatibility-pulse is the stable merged 2D/3D contract")
     args=parser.parse_args()
 

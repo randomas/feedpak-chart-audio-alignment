@@ -1369,7 +1369,7 @@ def _piano_duration_diagnostics(before, after, quantum_ms):
             "unique_before_seconds":a,"unique_after_seconds":b}
 
 def playable_keyboard_from_notation(notation, piano_duration_quantize_ms=0.0,
-                                      piano_rendering_policy="compatibility-pulse"):
+                                      piano_rendering_policy="split-classic"):
     allowed=("compatibility-pulse", "split-compatibility-pulse", "split-classic", "duration-aware", "d-experimental", "legacy")
     if piano_rendering_policy not in allowed:
         raise ValueError(f"piano_rendering_policy must be one of {allowed}")
@@ -2083,7 +2083,7 @@ def process(gp_path, drums_audio_path=None, bass_audio_path=None, piano_audio_pa
             auto_chunk_measures=16, alignment_mode="dtw",
             checkpoint_measures=4, checkpoint_search_radius=1.0, project_config_path=None,
             gp_parser="gp5", score_json_path=None, alphatab_extractor=None, node_executable="node",
-            piano_duration_quantize_ms=0.0, piano_rendering_policy="compatibility-pulse", force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
+            piano_duration_quantize_ms=0.0, piano_rendering_policy="split-classic", force_continuous_anchor_warp=False, structural_second_pass=False, transcription_investigator=False, force_midi_authority=False, force_monotonic_chain=False, allow_wide_monotonic_warp=False, allow_compatible_audio_refinement=False, midi_section_fit=False, force_midi_section_fit=False, midi_section_fit_materialization=None, prepared_midi_mode="auto"):
     if gp_parser not in ("gp5", "alphatab"):
         raise ValueError("gp_parser must be 'gp5' or 'alphatab'")
     prepared_midi_mode,prepared_midi_compatible,prepared_midi_reason=mo.validate_prepared_midi_mode(prepared_midi_mode,alignment_mode)
@@ -3259,7 +3259,7 @@ def main():
                         help="Quantize exported piano note durations to this millisecond grid; 0 disables")
     parser.add_argument("--piano-rendering-policy",
                         choices=("compatibility-pulse","split-compatibility-pulse","split-classic","duration-aware","d-experimental","legacy"),
-                        default="compatibility-pulse",
+                        default="split-classic",
                         help="Playable piano policy; compatibility-pulse merges hands and caps sus to a local 16th-note pulse")
     parser.add_argument("--out", default="intermediate_arrangements.json")
     parser.add_argument("--sr", type=int, default=22050)

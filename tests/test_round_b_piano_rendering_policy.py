@@ -10,8 +10,8 @@ def notation():
     ]}]}}}]}
 
 
-def test_compatibility_pulse_is_default_and_uses_sus():
-    out=p.playable_keyboard_from_notation(notation())
+def test_compatibility_pulse_uses_sus_when_explicit():
+    out=p.playable_keyboard_from_notation(notation(),piano_rendering_policy="compatibility-pulse")
     assert out['notes'][0]=={'t':1.0,'s':2,'f':12,'sus':0.0312}
     assert all('d' not in n for n in out['notes'])
     assert out['piano_duration_diagnostics']['rendering_policy']=='compatibility-pulse'

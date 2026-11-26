@@ -55,7 +55,7 @@ param(
     [switch]$AllowCompatibleAudioRefinement,
     [switch]$LightDiagnostics,
     [ValidateSet("compatibility-pulse", "split-compatibility-pulse", "split-classic", "duration-aware", "d-experimental", "legacy")]
-    [string]$PianoRenderingPolicy = "compatibility-pulse",
+    [string]$PianoRenderingPolicy = "split-classic",
 
     [string[]]$Only = @()
 )
